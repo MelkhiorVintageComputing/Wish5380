@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MIT
+//
+// Wishbone B4 classic bus functional models.
+//
+//   WbMem  - slave.  Models the shared memory the MAC DMAs into, with
+//            configurable wait states, an optional error window and a full
+//            access log for the scoreboard.
+//   WbHost - master.  Models the host CPU poking the control registers.
+//            Its accessors are blocking: they pump the simulation until the
+//            transfer completes, so tests read like driver code.
+//
+// Both attach to the negative edge of the bus clock: they see the values the
+// DUT drove at the preceding rising edge and set up whatever the DUT will
+// sample at the next one.
+//
+// Wishbone is word addressed, so what travels on ADR is the index of a 32-bit
+// word and SEL alone says which bytes are meant.  The models convert at the
+// pin: their interfaces, the access log and everything a test writes are in
+// byte addresses, which is how the chip and its drivers think.
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "util.h"
+#include "sim.h"
+
+namespace wtb {
+
+// Signals of a Wishbone slave interface, as seen by a slave model.
+struct WbSlavePorts {
+  uint8_t* cyc = nullptr;
+  uint8_t* stb = nullptr;
+  uint8_t* we = nullptr;
+  uint8_t* sel = nullptr;
+  uint32_t* adr = nullptr;    // word address as driven by the master
+  uint32_t* dat_w = nullptr;  // master -> slave
+  uint32_t* dat_r = nullptr;  // slave -> master (driven by the model)
+  uint8_t* ack = nullptr;     // driven by the model
+  uint8_t* err = nullptr;     // driven by the model
+};
+
+// Signals of a Wishbone master interface, as seen by a master model.
+struct WbMasterPorts {
+  uint8_t* cyc = nullptr;  // driven by the model
+  uint8_t* stb = nullptr;  // driven by the model
+  uint8_t* we = nullptr;   // driven by the model
+  uint8_t* sel = nullptr;  // driven by the model
+  uint32_t* adr = nullptr; // word address, driven by the model
+  uint32_t* dat_w = nullptr;  // master -> slave, driven by the model
+  uint32_t* dat_r = nullptr;  // slave -> master
+  uint8_t* ack = nullptr;
+  uint8_t* err = nullptr;
+};
+
+class WbMem {
+ public:
+  struct Access {
+    u64 time_ps;
+    bool write;
+    uint32_t adr;     // byte address, converted from the word address on ADR
+    uint32_t data;
+    uint8_t sel;
+  };
+
+  WbMem(Sim& sim, Sim::Clock* clk, WbSlavePorts ports, size_t size_bytes,
+        uint32_t base = 0);
+  // The same slave over storage somebody else owns.
+  WbMem(Sim& sim, Sim::Clock* clk, WbSlavePorts ports, uint8_t* data,
+        size_t size_bytes, uint32_t base);
+
+  // The same slave over storage that can only be reached through calls.  The
+  // co-simulation points this at the guest's physical memory: an emulator will
+  // not hand that out as a flat pointer, because it has holes in it - the PC's
+  // VGA aperture sits at 640K and a mapping from zero stops there - and where
+  // the guest puts the chip's buffers is the guest's business.
+  using MemRead = void (*)(void* opaque, uint32_t addr, uint8_t* buf,
+                           uint32_t len);
+  using MemWrite = void (*)(void* opaque, uint32_t addr, const uint8_t* buf,
+                            uint32_t len);
+  WbMem(Sim& sim, Sim::Clock* clk, WbSlavePorts ports, MemRead rd, MemWrite wr,
+        void* opaque, uint32_t base, size_t size_bytes);
+
+  // ---- backdoor access, little endian like the chip sees memory -----------
+  uint8_t rd8(uint32_t a) const;
+  uint16_t rd16(uint32_t a) const;
+  uint32_t rd24(uint32_t a) const;
+  uint32_t rd32(uint32_t a) const;
+  void wr8(uint32_t a, uint8_t v);
+  void wr16(uint32_t a, uint16_t v);
+  void wr24(uint32_t a, uint32_t v);
+  void wr32(uint32_t a, uint32_t v);
+  void write_block(uint32_t a, const Bytes& b);
+  Bytes read_block(uint32_t a, size_t n) const;
+  void clear(uint8_t pattern = 0);
+
+  uint32_t base() const { return base_; }
+  size_t size() const { return size_; }
+  bool contains(uint32_t a, size_t n = 1) const {
+    return a >= base_ && (uint64_t(a) + n) <= (uint64_t(base_) + size_);
+  }
+
+  // ---- configuration ------------------------------------------------------
+  void set_wait_states(int n) { wait_states_ = n; }
+  // Accesses inside [lo, hi) answer with ERR instead of ACK.
+  void set_error_window(uint32_t lo, uint32_t hi) {
+    err_lo_ = lo;
+    err_hi_ = hi;
+  }
+
+  // ---- observation --------------------------------------------------------
+  const std::vector<Access>& log() const { return log_; }
+  // Forgets the log and the counters, so everything below is "since here".
+  void clear_log() {
+    log_.clear();
+    reads_ = 0;
+    writes_ = 0;
+  }
+  size_t reads() const { return reads_; }
+  size_t writes() const { return writes_; }
+  bool oob_seen() const { return oob_seen_; }
+  uint32_t oob_addr() const { return oob_addr_; }
+  // Bus cycles seen since the last clear_log(), useful to assert the core is
+  // quiet when it should be.
+  size_t accesses() const { return reads_ + writes_; }
+
+ private:
+  void tick();
+
+  void attach(Sim::Clock* clk);
+
+  Sim& sim_;
+  WbSlavePorts p_;
+  std::vector<uint8_t> owned_;   // empty when the storage belongs to someone else
+  uint8_t* data_ = nullptr;
+  MemRead cb_rd_ = nullptr;      // set instead of data_ when reached by call
+  MemWrite cb_wr_ = nullptr;
+  void* cb_opaque_ = nullptr;
+  size_t size_ = 0;
+  uint32_t base_;
+  int wait_states_ = 0;
+  int wait_cnt_ = 0;
+  uint32_t err_lo_ = 1, err_hi_ = 0;  // empty window
+  std::vector<Access> log_;
+  size_t reads_ = 0, writes_ = 0;
+  bool oob_seen_ = false;
+  uint32_t oob_addr_ = 0;
+};
+
+class WbHost {
+ public:
+  WbHost(Sim& sim, Sim::Clock* clk, WbMasterPorts ports);
+
+  void write32(uint32_t adr, uint32_t data, uint8_t sel = 0xf);
+  // sel picks byte lanes on reads too, so a sixteen-bit access can be modelled
+  // as one - which matters for a device whose two ports share a word and whose
+  // drivers reach them separately.
+  uint32_t read32(uint32_t adr, uint8_t sel = 0xf);
+
+  bool last_error() const { return err_; }
+  bool last_timeout() const { return timeout_; }
+  u64 timeout_ps = 10 * US;
+
+ private:
+  void tick();
+  void run_transaction();
+  void deassert();
+
+  enum class St { Idle, Start, Wait };
+
+  Sim& sim_;
+  WbMasterPorts p_;
+  St st_ = St::Idle;
+  uint32_t adr_ = 0, wdata_ = 0, rdata_ = 0;
+  uint8_t sel_ = 0xf;
+  bool write_ = false;
+  bool err_ = false;
+  bool timeout_ = false;
+};
+
+}  // namespace wtb
