@@ -85,19 +85,20 @@ failures and do not break the build.
 
 ## Documentation
 
-* [`doc/interface.md`](doc/interface.md) - the register map, the Wishbone
-  apertures and the internal SCSI bus: the contract between the RTL and the
-  testbench.
+[`doc/README.md`](doc/README.md) is the index, and says which document answers
+which question.  The two to start from:
+
 * [`doc/NCR5380_design_manual_Mar86.pdf`](doc/NCR5380_design_manual_Mar86.pdf) -
-  the datasheet, which is the authority on bit positions and register
-  behaviour.
-* [`doc/sd.md`](doc/sd.md) - the SD card behind the block interface: coming
-  up, the two capacity layouts, and what CRC is checked.
-* [`doc/target.md`](doc/target.md) - the disk on the other end: the command
-  set, the three rules that are easy to get wrong, and what it deliberately
-  does not do.
-* [`doc/drivers`](doc/drivers/README.md) - drivers for the real chip, used as
-  the reference for software-visible sequencing.
+  the datasheet, and the authority on every bit of every register.
+* [`doc/interface.md`](doc/interface.md) - the contract between `src/` and
+  `tb/`: the register port, the Wishbone slave's three windows, the internal
+  SCSI bus, and the delays a clockless part leaves a clocked replica to count.
+
+Then [`doc/target.md`](doc/target.md) for the disk, [`doc/sd.md`](doc/sd.md)
+for the card behind it, [`doc/drivers`](doc/drivers/README.md) for the vintage
+drivers and which of them is the authority on what, and
+[`cosim/`](cosim/README.md) for an unmodified Linux booting off the whole
+thing.
 
 ## Layout
 
