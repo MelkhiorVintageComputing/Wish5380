@@ -173,10 +173,27 @@ one.  It is the only place the register file needs to see the bus at all, and
 
 ## The block back end
 
-`scsi_targ` reaches storage through a block interface and never talks to a
-card directly, so the SD 4-bit layer can replace the SPI one without the SCSI
-side noticing.  512-byte blocks, which is both the SD card's unit and the
-sector size every vintage driver expects.
+`scsi_targ` reaches storage through a 512-byte sector buffer and four signals -
+start, direction, block address, done - and never talks to a card itself.  The
+back end fills the buffer before a READ and drains it after a WRITE, through
+its own port on the same dual-ported memory; the two sides never touch it at
+the same time, so no arbitration is needed and none is implemented.
+
+512-byte blocks, which is both the SD card's unit and the sector size every
+vintage driver expects.
+
+That interface is what lets `blk_sd` replace `tb/cpp/disk.h` without the SCSI
+side noticing, and what lets the SD 4-bit layer later replace the SPI one
+without the block side noticing.  `doc/target.md` sets out the rest of the
+target's contract.
+
+## The fabric has three ports
+
+Two devices and a spare.  The spare is what the testbench drives to stand in
+for another device on the bus, and is tied to zero in the real top level: a
+device driving nothing is a device that is not there, which is exactly what an
+open-collector bus means by it.  A second target means widening this and
+nothing else.
 
 ## What is not settled yet
 

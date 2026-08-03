@@ -10,7 +10,9 @@
 #include <memory>
 #include <string>
 
+#include "disk.h"
 #include "ncr5380.h"
+#include "sci_driver.h"
 #include "sim.h"
 #include "util.h"
 #include "wb.h"
@@ -33,6 +35,14 @@ namespace wtb {
 
 struct EnvConfig {
   u64 sys_period_ps = u64(SYS_PERIOD_PS);
+  // The card behind the target, in 512-byte blocks.  Two thousand and
+  // forty-eight is one mebibyte, which is enough to exercise multi-block
+  // transfers and small enough that the model is free.
+  uint32_t disk_blocks = 2048;
+  // The SCSI ID the target answers to, and the one the driver arbitrates
+  // with.  A host adapter is conventionally 7 and Apple's internal drive 0.
+  uint8_t target_id = 0;
+  uint8_t host_id = 7;
 };
 
 class Env {
@@ -49,6 +59,8 @@ class Env {
 
   Vtb_top* dut() { return dut_.get(); }
   Sim& sim() { return *sim_; }
+  Disk& disk() { return *disk_; }
+  SciDriver& drv() { return *drv_; }
   Sim::Clock* sysclk() { return sysclk_; }
   const EnvConfig& cfg() const { return cfg_; }
   const std::string& name() const { return name_; }
@@ -132,6 +144,8 @@ class Env {
   void sample_strobes();
   uint8_t strobes_ = 0;
   Peer peer_;
+  std::unique_ptr<Disk> disk_;
+  std::unique_ptr<SciDriver> drv_;
 };
 
 }  // namespace wtb

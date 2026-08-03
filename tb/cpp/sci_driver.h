@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+//
+// A SCSI initiator driver, in software, driving the chip's registers.
+//
+// It follows `doc/drivers/Linux/NCR5380.c` step for step, because the point of
+// the whole project is that a driver written for the real part works against
+// this one.  `NCR5380_select` becomes `select()`, `NCR5380_transfer_pio`
+// becomes `pio()`, and `NCR5380_information_transfer`'s phase loop becomes
+// `execute()`.  Where the driver waits, this waits, and for the same reason.
+//
+// Everything is programmed I/O.  The chip's DMA mode automates the handshake
+// but not the byte count, so a driver still has to poll; pseudo-DMA belongs
+// with `wb_5380`, which is what gives it an aperture to poll against.
+//
+// The accessors block: they pump the simulation until the chip answers, so a
+// test reads like the driver it is imitating.  Never call one from inside a
+// clock callback.
+
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <string>
+
+#include "ncr5380.h"
+#include "sim.h"
+#include "util.h"
+
+namespace wtb {
+
+// How the driver reaches the chip.  A function pair rather than a pointer to
+// the environment, so the driver knows nothing about Verilator and can later
+// be pointed at a Wishbone front end instead.
+struct RegPort {
+  std::function<void(uint8_t, uint8_t)> write;
+  std::function<uint8_t(uint8_t)> read;
+};
+
+class SciDriver {
+ public:
+  SciDriver(Sim& sim, RegPort port, uint8_t host_id = 7);
+
+  // ---- the pieces ---------------------------------------------------------
+
+  // Pulses RST and waits out the bus clear delay, as `do_reset` does.
+  void reset_bus();
+
+  // Arbitrate, then select the target with ATN asserted so the first phase is
+  // MESSAGE OUT.  False if arbitration was lost or nothing answered.
+  bool select(uint8_t target);
+
+  // One byte at a time in the given phase, stopping early if the target
+  // changes phase.  Returns how many bytes moved.  `in` may be null for an
+  // output phase and `out` null for an input one.
+  size_t pio(uint8_t phase, const uint8_t* out, uint8_t* in, size_t n);
+
+  // ---- a whole command ----------------------------------------------------
+
+  struct Result {
+    bool ok = false;          // the command ran to COMMAND COMPLETE
+    uint8_t status = 0xff;
+    uint8_t message = 0xff;
+    Bytes data;               // whatever came back in DATA IN
+  };
+
+  Result execute(uint8_t target, const Bytes& cdb,
+                 const Bytes& data_out = Bytes(), size_t max_in = 0,
+                 uint8_t lun = 0);
+
+  const std::string& last_error() const { return err_; }
+
+  // ---- the driver's own waits ---------------------------------------------
+  //
+  // The selection timeout is the one deliberate departure.  The standard, and
+  // Linux, allow 250 ms; this allows one, which is fifty thousand clocks
+  // against the twenty-odd the target needs.  A shorter timeout can only make
+  // a test stricter, never hide a fault, and it keeps a failing test from
+  // simulating a quarter of a second of nothing.
+  u64 t_select = 1 * MS;
+  u64 t_req = 1 * MS;
+  u64 t_arb = sci::T_ARB_DELAY_PS;      // 2.2 us: the chip does not do it
+  u64 t_bus_settle = sci::T_BUS_SETTLE_PS;
+
+ private:
+  void w(uint8_t reg, uint8_t val) { port_.write(reg, val); }
+  uint8_t r(uint8_t reg) { return port_.read(reg); }
+  void delay(u64 ps) { sim_.run_ps(ps); }
+  bool poll(uint8_t reg, uint8_t mask, uint8_t val, u64 timeout,
+            const char* what);
+
+  Sim& sim_;
+  RegPort port_;
+  uint8_t host_id_;
+  uint8_t id_mask_;
+  std::string err_;
+};
+
+}  // namespace wtb

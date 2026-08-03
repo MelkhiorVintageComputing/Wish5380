@@ -72,6 +72,28 @@ void Env::bind_models() {
   d->rg_busy_err_i = 0;
   d->rg_atn_i = 0;
   d->rg_ack_i = 0;
+
+  // The card behind the target.
+  DiskPorts dp;
+  dp.start = &d->tg_blk_start_o;
+  dp.we = &d->tg_blk_we_o;
+  dp.lba = &d->tg_blk_lba_o;
+  dp.done = &d->tg_blk_done_i;
+  dp.err = &d->tg_blk_err_i;
+  dp.ready = &d->tg_blk_ready_i;
+  dp.count = &d->tg_blk_count_i;
+  dp.buf_we = &d->tg_bbuf_we_i;
+  dp.buf_addr = &d->tg_bbuf_addr_i;
+  dp.buf_wdata = &d->tg_bbuf_wdata_i;
+  dp.buf_rdata = &d->tg_bbuf_rdata_o;
+  disk_.reset(new Disk(*sim_, sysclk_, dp, cfg_.disk_blocks));
+
+  // The driver, reaching the chip the way a real one does.
+  RegPort rp;
+  rp.write = [this](uint8_t a, uint8_t v) { chip_write(a, v); };
+  rp.read = [this](uint8_t a) { return chip_read(a); };
+  drv_.reset(new SciDriver(*sim_, rp, cfg_.host_id));
+
   sim_->eval();
 }
 

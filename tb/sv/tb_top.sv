@@ -41,6 +41,19 @@ module tb_top #(
   input  logic [7:0] pr_data_i,
   input  logic       pr_dbp_i,
 
+  // ---- the target's block back end, modelled by the testbench --------------
+  output logic        tg_blk_start_o,
+  output logic        tg_blk_we_o,
+  output logic [31:0] tg_blk_lba_o,
+  input  logic        tg_blk_done_i,
+  input  logic        tg_blk_err_i,
+  input  logic        tg_blk_ready_i,
+  input  logic [31:0] tg_blk_count_i,
+  input  logic        tg_bbuf_we_i,
+  input  logic [8:0]  tg_bbuf_addr_i,
+  input  logic [7:0]  tg_bbuf_wdata_i,
+  output logic [7:0]  tg_bbuf_rdata_o,
+
   // ---- the bus as everybody sees it ----------------------------------------
   output logic       bus_rst_o,
   output logic       bus_bsy_o,
@@ -93,7 +106,7 @@ module tb_top #(
   output logic       rg_sdir_o
 );
 
-  scsi_t chip_drive, peer_drive, bus;
+  scsi_t chip_drive, targ_drive, peer_drive, bus;
 
   always_comb begin
     peer_drive.rst  = pr_rst_i;
@@ -139,9 +152,31 @@ module tb_top #(
     .bus_i   (bus)
   );
 
+  scsi_targ #(
+    .CLK_PERIOD_PS (CLK_PERIOD_PS),
+    .TARGET_ID     (0)
+  ) u_targ (
+    .clk_i        (clk_i),
+    .rst_i        (rst_i),
+    .drive_o      (targ_drive),
+    .bus_i        (bus),
+    .blk_start_o  (tg_blk_start_o),
+    .blk_we_o     (tg_blk_we_o),
+    .blk_lba_o    (tg_blk_lba_o),
+    .blk_done_i   (tg_blk_done_i),
+    .blk_err_i    (tg_blk_err_i),
+    .blk_ready_i  (tg_blk_ready_i),
+    .blk_count_i  (tg_blk_count_i),
+    .bbuf_we_i    (tg_bbuf_we_i),
+    .bbuf_addr_i  (tg_bbuf_addr_i),
+    .bbuf_wdata_i (tg_bbuf_wdata_i),
+    .bbuf_rdata_o (tg_bbuf_rdata_o)
+  );
+
   scsi_fabric u_fabric (
     .a_i   (chip_drive),
-    .b_i   (peer_drive),
+    .b_i   (targ_drive),
+    .c_i   (peer_drive),
     .bus_o (bus)
   );
 

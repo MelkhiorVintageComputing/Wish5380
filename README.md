@@ -22,9 +22,11 @@ there is a card slot.
 
 ## Status
 
-The chip itself is done: registers, bus, arbitration, the automated
-handshake and every interrupt source.  Nothing is connected to it yet - the
-Wishbone front end, the target and the SD back end are still to write.
+A driver can now find the disk and read and write it.  The chip is done, the
+target answers the command set a vintage driver needs, and the two talk to
+each other over the fabric; what is missing is the Wishbone front end that
+would let a real machine reach the registers, and the SD card behind the
+block interface.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
@@ -35,13 +37,15 @@ Wishbone front end, the target and the SD back end are still to write.
 | the DMA handshake, both roles, both directions   | done, tested  |
 | interrupts: selection, EOP, reset, parity, phase mismatch, loss of BSY | done, tested |
 | internal SCSI fabric (`scsi_fabric`)             | done, tested  |
+| SCSI target: phases and handshake (`scsi_targ`)  | done, tested  |
+| SCSI-1 command set, and the sense it reports     | done, tested  |
+| block back end interface, and a model of one     | done, tested  |
+| driver model, following `NCR5380.c` (`sci_driver`) | done, tested |
 | Wishbone front end and pseudo-DMA (`wb_5380`)    | not started   |
-| SCSI target and command set (`scsi_targ`)        | not started   |
 | SD card back end (`blk_sd`, `sd_spi`)            | not started   |
-| driver model and system tests                    | not started   |
 | co-simulation against a real driver              | not started   |
 
-44 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
+67 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
 delays are derived from the clock rather than written down, so the regression
 checks whichever clock it was built for.
 
@@ -70,6 +74,9 @@ failures and do not break the build.
 * [`doc/NCR5380_design_manual_Mar86.pdf`](doc/NCR5380_design_manual_Mar86.pdf) -
   the datasheet, which is the authority on bit positions and register
   behaviour.
+* [`doc/target.md`](doc/target.md) - the disk on the other end: the command
+  set, the three rules that are easy to get wrong, and what it deliberately
+  does not do.
 * [`doc/drivers`](doc/drivers/README.md) - drivers for the real chip, used as
   the reference for software-visible sequencing.
 
