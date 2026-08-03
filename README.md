@@ -22,7 +22,9 @@ there is a card slot.
 
 ## Status
 
-The design is complete and an unmodified Linux boots off it.  A driver
+The design is complete.  An unmodified Linux and an unmodified NetBSD both
+boot off it, one moving every byte with the CPU and the other with a DMA
+controller.  A driver
 reaches the Wishbone slave through the three windows a Macintosh expects,
 arbitrates and selects, and reads and writes blocks - either a byte at a time
 in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
@@ -68,9 +70,17 @@ rather than a nominal one.
 Beyond the regression, two guests drive the design in the two ways the chip can
 be driven.  An unmodified i386 Linux probes it with its own `g_NCR5380`,
 attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
-files, all in programmed I/O.  A Sun-3/60 boot PROM drives the same core
-through an Am9516 DMA controller instead: it selects the target and reads a
-block, and the bytes cross by DRQ and DACK without the CPU touching them.
+files, all in programmed I/O.  And an unmodified NetBSD/sun3 boots off it on an
+emulated Sun-3/60, where the bytes move by real bus-master DMA instead: the
+3/60 PROM reads the disk label, NetBSD's own two-stage bootloader loads a
+1.9 MB kernel through the chip's DMA port, and NetBSD's own `si` driver then
+arbitrates, selects and attaches the disk -
+
+```
+[   1.0000000] si0 at obio0 addr 0x140000 ipl 2: options=0xf
+[   3.1400030] sd0 at scsibus0 target 0 lun 0: <DOLBEAU, WISH5380 SD CARD, 0001> disk fixed
+```
+
 See [`cosim/`](cosim/README.md).
 
 ## Building and testing
@@ -106,9 +116,9 @@ which question.  The two to start from:
 Then [`doc/target.md`](doc/target.md) for the disk, [`doc/sd.md`](doc/sd.md)
 for the card behind it, [`doc/drivers`](doc/drivers/README.md) for the vintage
 drivers and which of them is the authority on what, and
-[`cosim/`](cosim/README.md) for the two guests - an unmodified Linux booting
-off the whole thing, and a Sun-3 PROM reading a block through a real DMA
-controller.
+[`cosim/`](cosim/README.md) for the two guests - an unmodified Linux and an
+unmodified NetBSD, one driving the chip byte by byte and the other through a
+real DMA controller.
 
 ## Layout
 
