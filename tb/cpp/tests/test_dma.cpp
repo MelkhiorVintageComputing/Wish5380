@@ -324,3 +324,50 @@ TEST(dma_and_programmed_io_agree) {
   CHECK_EQ(fast.data, slow.data);
   CHECK_EQ(fast.data, env.disk().read_block(51));
 }
+
+// ---------------------------------------------------------------------------
+// The end of a transfer, without the End of Process interrupt
+// ---------------------------------------------------------------------------
+//
+// A driver that does not enable ENABLE EOP INTERRUPT has only one thing left
+// to tell it a DMA transfer is over: the interrupt the chip raises when the
+// target changes phase.  The Sun 3/60 PROM is such a driver - it writes the
+// Mode Register with DMA MODE alone and then waits for the board's SBC_IP
+// bit, which is this chip's interrupt output - so if the phase mismatch does
+// not interrupt, a real machine waits for ever.
+//
+// This is the same transfer as `dma_a_block_reads_back_through_a_real_engine`
+// with that one bit taken out, which is the only difference that matters.
+
+TEST(dma_a_transfer_ends_by_interrupting_without_the_eop_enable) {
+  env.power_on_reset();
+  env.disk().fill_pattern(23, 0xd11e);
+
+  CHECK_DRV(env.drv().select(env.cfg().target_id));
+  uint8_t identify = 0x80;
+  CHECK_EQ(env.drv().pio(sci::PH_MSG_OUT, &identify, nullptr, 1), size_t(1));
+  Bytes cdb{0x08, 0, 0, 23, 1, 0};
+  CHECK_EQ(env.drv().pio(sci::PH_COMMAND, cdb.data(), nullptr, cdb.size()),
+           cdb.size());
+  CHECK(env.sim().run_until(
+      [&]() {
+        return (env.chip_read(sci::R_CSB) & sci::CSB_REQ) &&
+               sci::csb_to_phase(env.chip_read(sci::R_CSB)) == sci::PH_DATA_IN;
+      },
+      5 * MS));
+
+  env.chip_write(sci::R_TCR, sci::PH_DATA_IN);
+  env.chip_write(sci::R_MR, sci::MR_DMA);      // and *not* MR_EOP_INTR
+  env.chip_write(sci::R_ICR, 0);
+  env.chip_write(sci::R_SDIR, 0);
+
+  Env::Dma d = env.dma_in(512);
+  CHECK_EQ(d.moved, size_t(512));
+
+  // The target now leaves DATA IN for STATUS.  Nothing else has to be done to
+  // the chip: the phase mismatch is what raises the interrupt (p. 22), and it
+  // has no enable bit.
+  CHECK_MSG(env.sim().run_until([&]() { return env.dut()->dut_irq_o != 0; },
+                                20 * MS),
+            "the transfer ended and the chip never interrupted");
+}

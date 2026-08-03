@@ -1,6 +1,6 @@
-From 034a18c110821345882e2cb53e476b9a47aa1c32 Mon Sep 17 00:00:00 2001
+From 14afd590d969b8ce061366204c026647509944fe Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
-Date: Mon, 3 Aug 2026 21:03:03 +0200
+Date: Mon, 3 Aug 2026 22:23:20 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
 
 The 3/60's SCSI is three things in one 32-byte register block: an NCR
@@ -25,9 +25,9 @@ Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 791 +++++++++++++++++++++++++++++++++++++++++++
- hw/scsi/trace-events |   7 +
- 4 files changed, 806 insertions(+)
+ hw/scsi/sun3-si.c    | 826 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/trace-events |   8 +
+ 4 files changed, 842 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -58,10 +58,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..e83576617e
+index 0000000000..5ad63552f2
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,791 @@
+@@ -0,0 +1,826 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -209,9 +209,19 @@ index 0000000000..e83576617e
 +#define TIMER_PERIOD_NS     (500 * 1000)
 +#define MAX_CATCH_UP_NS     (2 * 1000 * 1000)
 +
-+/* A transfer moves at most this many bytes per pump, so a runaway cannot wedge
-+ * the whole emulator.  NetBSD caps a request at 0xE000. */
-+#define PUMP_LIMIT          0x20000
++/*
++ * How long the controller will wait for the chip to ask for the next byte
++ * before giving up and letting the emulator get on with something else.
++ *
++ * It has to wait rather than sample.  A real UDC holds the bus and answers
++ * DREQ when it comes; if this only looked at DRQ once per guest register
++ * access, a transfer would advance about one byte per poll and 8 kilobytes
++ * would take seconds.  The wait resets on every byte moved, so the budget is
++ * "how long a gap between bytes is still a live transfer" - and the longest
++ * real gap is the SD card fetching the next block, about a millisecond.
++ */
++#define DRQ_WAIT_NS         (4 * 1000 * 1000)
++#define DRQ_STEP_NS         100
 +
 +struct Sun3SiState {
 +    SysBusDevice parent_obj;
@@ -245,6 +255,7 @@ index 0000000000..e83576617e
 +    uint32_t dma_addr;      /* 24-bit DVMA byte address */
 +    uint32_t head;          /* the first four bytes of the transfer, traced */
 +    unsigned head_n;
++    unsigned stalled;       /* timer ticks with a transfer making no progress */
 +    bool     dma_running;
 +
 +    int64_t last_ns;
@@ -322,15 +333,27 @@ index 0000000000..e83576617e
 + */
 +static void sun3_si_pump(Sun3SiState *s)
 +{
-+    unsigned moved = 0;
++    uint64_t waited = 0;
 +
 +    if (!s->dma_running) {
 +        return;
 +    }
 +
-+    while (s->fifo_count > 0 && moved < PUMP_LIMIT && s->f_drq(s->dev)) {
++    while (s->fifo_count > 0) {
 +        bool last = (s->fifo_count == 1);
 +        uint8_t byte;
++
++        while (!s->f_drq(s->dev)) {
++            /* The chip has nothing to hand over yet.  If it has interrupted,
++             * the transfer is over as far as it is concerned - a phase
++             * mismatch, END OF DMA - and no further request will come. */
++            if (waited >= DRQ_WAIT_NS || s->f_irq(s->dev)) {
++                return;
++            }
++            s->f_run_ns(s->dev, DRQ_STEP_NS);
++            waited += DRQ_STEP_NS;
++        }
++        waited = 0;
 +
 +        if (last) {
 +            s->f_set_eop(s->dev, 1);
@@ -372,7 +395,6 @@ index 0000000000..e83576617e
 +        if (s->udc_count > 0 && (s->fifo_count & 1) == 0) {
 +            s->udc_count--;
 +        }
-+        moved++;
 +    }
 +
 +    if (s->fifo_count == 0 || (s->csr & SI_CSR_DMA_BUS_ERR)) {
@@ -694,9 +716,22 @@ index 0000000000..e83576617e
 +static void sun3_si_tick(void *opaque)
 +{
 +    Sun3SiState *s = opaque;
++    uint16_t before = s->fifo_count;
 +
 +    sun3_si_catch_up(s);
 +    sun3_si_pump(s);
++
++    /* A transfer that stops moving is the failure worth naming: the guest
++     * sees only DMA ACTIVE staying set for ever.  Say what the chip thinks is
++     * going on, which is the first question anyone asks. */
++    if (s->dma_running && s->fifo_count == before) {
++        if (++s->stalled == 200) {
++            trace_sun3_si_stalled(s->fifo_count, s->f_read(s->dev, 4),
++                                  s->f_read(s->dev, 5), s->f_drq(s->dev));
++        }
++    } else {
++        s->stalled = 0;
++    }
 +    sun3_si_update_irq(s);
 +    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
 +}
@@ -854,10 +889,10 @@ index 0000000000..e83576617e
 +
 +type_init(sun3_si_register_types)
 diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
-index a8ac1e7f1d..70a68bc409 100644
+index a8ac1e7f1d..707502ce7f 100644
 --- a/hw/scsi/trace-events
 +++ b/hw/scsi/trace-events
-@@ -392,3 +392,10 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
+@@ -392,3 +392,11 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
  scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
  scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
  scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
@@ -867,6 +902,7 @@ index a8ac1e7f1d..70a68bc409 100644
 +sun3_si_reg_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%02"PRIx64" size %u <- 0x%04"PRIx64
 +sun3_si_udc_cmd(uint8_t cmd) "command 0x%02x"
 +sun3_si_chain(uint32_t at, uint16_t rsel, uint32_t addr, uint16_t count) "table at 0x%06x rsel 0x%04x -> addr 0x%06x count %u words"
++sun3_si_stalled(uint16_t resid, uint8_t csb, uint8_t bsr, int drq) "stalled with %u bytes left: csb 0x%02x bsr 0x%02x drq %d"
 +sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
 -- 
 2.39.5
