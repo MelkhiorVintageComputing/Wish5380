@@ -22,11 +22,11 @@ there is a card slot.
 
 ## Status
 
-A machine can now reach the whole thing.  The Wishbone slave presents the
-three windows a Macintosh expects, a driver arbitrates and selects through
-them, and blocks move either a byte at a time in programmed I/O or through
-the pseudo-DMA aperture the Mac uses for speed.  What is missing is the SD
-card behind the block interface, and co-simulation against a real driver.
+The design is complete.  A driver reaches the Wishbone slave through the
+three windows a Macintosh expects, arbitrates and selects, and reads and
+writes blocks - either a byte at a time in programmed I/O or through the
+pseudo-DMA aperture the Mac uses for speed - and those blocks come off an SD
+card in its slot.  What remains is co-simulation against a real driver.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
@@ -44,10 +44,11 @@ card behind the block interface, and co-simulation against a real driver.
 | Wishbone slave and the Mac's three windows (`wb_5380`) | done, tested |
 | pseudo-DMA, with the bus error the Mac relies on | done, tested  |
 | the deliverable top level (`wish5380_wb`)        | done, tested  |
-| SD card back end (`blk_sd`, `sd_spi`)            | not started   |
+| SD card in SPI mode (`blk_sd`, `sd_spi`)         | done, tested  |
+| the whole design with a card in it (`wish5380_sd`) | done, tested |
 | co-simulation against a real driver              | not started   |
 
-82 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
+95 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
 delays are derived from the clock rather than written down, so the regression
 checks whichever clock it was built for.
 
@@ -76,6 +77,8 @@ failures and do not break the build.
 * [`doc/NCR5380_design_manual_Mar86.pdf`](doc/NCR5380_design_manual_Mar86.pdf) -
   the datasheet, which is the authority on bit positions and register
   behaviour.
+* [`doc/sd.md`](doc/sd.md) - the SD card behind the block interface: coming
+  up, the two capacity layouts, and what CRC is checked.
 * [`doc/target.md`](doc/target.md) - the disk on the other end: the command
   set, the three rules that are easy to get wrong, and what it deliberately
   does not do.

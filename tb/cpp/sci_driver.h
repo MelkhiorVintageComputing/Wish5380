@@ -94,7 +94,13 @@ class SciDriver {
   // a test stricter, never hide a fault, and it keeps a failing test from
   // simulating a quarter of a second of nothing.
   u64 t_select = 1 * MS;
-  u64 t_req = 1 * MS;
+  // Linux allows a whole second for REQ.  Twenty milliseconds is far stricter
+  // and still twenty times the longest legitimate wait here, which is a block
+  // fetched from an SD card clocked off a slow system clock.  It was one
+  // millisecond until that case turned up, and one millisecond was a
+  // testbench that ran out of patience before the hardware did - the opposite
+  // of the fault a timeout is meant to catch, and worth remembering.
+  u64 t_req = 20 * MS;
   u64 t_arb = sci::T_ARB_DELAY_PS;      // 2.2 us: the chip does not do it
   u64 t_bus_settle = sci::T_BUS_SETTLE_PS;
 

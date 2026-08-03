@@ -83,15 +83,22 @@ expectations from the RTL.
 ### RTL (`src/`)
 
 ```
-wish5380_wb                  the deliverable: WB B4 slave, one clock, irq_o
-├── wb_5380                  machine glue: three windows, byte lanes, pseudo-DMA
-├── wish5380                 the part
-│   ├── sci_regs             the eight registers and the port they hide behind
-│   └── sci_bus              arbitration, selection, handshake, interrupts
-├── scsi_fabric              the wired-OR joining everything on the bus
-└── scsi_targ                a direct-access device; see doc/target.md
-    └── blk_sd -> sd_spi     the SD card behind it
+wish5380_sd                  the whole thing: WB B4 slave and a card slot
+├── wish5380_wb              WB B4 slave, one clock, irq_o, a block port
+│   ├── wb_5380              machine glue: three windows, lanes, pseudo-DMA
+│   ├── wish5380             the part
+│   │   ├── sci_regs         the eight registers and the port they hide behind
+│   │   └── sci_bus          arbitration, selection, handshake, interrupts
+│   ├── scsi_fabric          the wired-OR joining everything on the bus
+│   └── scsi_targ            a direct-access device; see doc/target.md
+└── blk_sd -> sd_spi         the SD card;  see doc/sd.md
 ```
+
+The two tops are kept apart because the block interface between them is the
+seam that makes the rest testable.  `tb_top` instantiates **both**: the
+regression drives `wish5380_wb` against a software disk, and only the `sd_`
+tests pay for a card that has to be initialised at 400 kHz before it will say
+anything.  Those tests take longer than the whole of the rest of the suite.
 
 `wish5380_wb` is what `tb_top` instantiates, so **every test reaches the chip
 the way a machine does** - through the Wishbone slave and its register window.
@@ -160,6 +167,13 @@ choice had to be argued instead:
   `movew` there is its decoder's business.  A fault says so, where serving one
   lane and dropping the rest would not.  `doc/interface.md` records it.
 
+And on the card's side, two more (`doc/sd.md`):
+
+* **A version 1 card is addressed by byte offset and a version 2 card by block
+  number.**  Below four gibibytes either is legal and real ones of both exist.
+* **The two CSD layouts state the size in quite different ways.**  Reading one
+  as the other gives a disk of the right shape and the wrong size.
+
 And on the target's side, three of the same kind:
 
 * **READ CAPACITY reports the last addressable block, not the count.**
@@ -207,6 +221,11 @@ selection timeout of 1 ms where the standard allows 250; a *shorter* timeout
 can only make a test stricter, and it keeps a failing test from simulating a
 quarter of a second of nothing.
 
+`sd_card` is deliberately stricter than a real card has to be: it checks the
+CRC7 on CMD0 and CMD8, computes a real CRC16 over every block it sends, and
+holds the line low after a write.  A lax model would let a controller with the
+wrong constants pass and fail against silicon.
+
 `disk` models the block back end rather than an SD card, on purpose.  A card
 that has to be initialised and clocked out a bit at a time would bury a SCSI
 failure in a hundred thousand clocks of unrelated traffic.  Its latency is
@@ -226,8 +245,9 @@ Prefixes are meaningful and ordered by trust: `infra_` checks the testbench
 itself, `layout_` checks our constants against the datasheet and both driver
 headers, `unit_` checks RTL leaves against software models, `reg_` the
 register file, `bus_` the SCSI engine, `wb_` the machine glue and its three
-windows, `sd_` the card back end, `sys_` the whole thing the way a driver
-drives it - arbitrate, select, command, data, status, message, bus free.  If an `infra_` test breaks, no `sys_`
+windows, `sys_` the whole thing the way a driver drives it - arbitrate,
+select, command, data, status, message, bus free - and `sd_` that same stack
+again with a real card underneath it.  If an `infra_` test breaks, no `sys_`
 result means anything.
 
 `TEST(name)` must pass.  `TEST_PENDING(name, "reason")` runs, is expected to
@@ -274,11 +294,17 @@ Every source file carries `SPDX-License-Identifier: MIT`.  The files under
 * Verilator treats a packed struct as one signal, so a module whose struct
   output depends on its struct input - which `sci_bus` is, because an
   initiator only drives the data lines when the phase matches - trips
-  UNOPTFLAT even though no field depends on itself.  That is one of four
+  UNOPTFLAT even though no field depends on itself.  That is one of five
   suppressions in the RTL; the others are UNUSEDPARAM on the constants
-  package and two UNUSEDSIGNAL in `scsi_targ`, where a target genuinely never
-  reads back the signals it drives and ignores the reserved fields of a
-  command block.  All four are narrow and on a declaration.
+  package, two UNUSEDSIGNAL in `scsi_targ` - a target never reads back the
+  signals it drives, and ignores the reserved fields of a command block - and
+  one in `blk_sd`, for the reserved fields of the card's own registers.  All
+  five are narrow and on a declaration.
+* A mutation test on a parameterised module has to change the parameter at the
+  level that *sets* it.  Changing `wb_5380`'s default proves nothing, because
+  `wish5380_wb` overrides it.  And a mutation that leaves a signal unused
+  fails the build rather than the test, which looks like a passing mutation
+  if only the summary line is read.
 * Icarus prints `sorry: constant selects in always_* processes ...` for the
   field-by-field assembly of `csb_o`.  It concerns sensitivity-list
   construction in an `always_comb`, is harmless, and does not fail the run;

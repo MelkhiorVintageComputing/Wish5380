@@ -13,6 +13,7 @@
 #include "disk.h"
 #include "ncr5380.h"
 #include "sci_driver.h"
+#include "sd_card.h"
 #include "sim.h"
 #include "util.h"
 #include "wb.h"
@@ -51,6 +52,11 @@ struct EnvConfig {
   uint32_t reg_stride = 16;
   uint32_t hsk_base = 0x100;   // pseudo-DMA that waits for DRQ
   uint32_t dma_base = 0x200;   // pseudo-DMA that does not
+
+  // The card behind the second instance.  A multiple of 1024 blocks, because
+  // a version 2 card states its size in half-megabytes and cannot describe
+  // anything else.
+  uint32_t sd_blocks = 4096;   // two mebibytes
 };
 
 class Env {
@@ -70,6 +76,24 @@ class Env {
   Disk& disk() { return *disk_; }
   SciDriver& drv() { return *drv_; }
   WbHost& host() { return *host_; }
+
+  // The second instance: the same design with a real card behind it, which is
+  // what the sd_ tests drive.  Everything else uses the fast disk.
+  WbHost& sd_host() { return *sd_host_; }
+  SciDriver& sd_drv() { return *sd_drv_; }
+  SdCard& card() { return *card_; }
+  // Register and pseudo-DMA access to that instance.
+  void sd_chip_write(uint8_t adr, uint8_t data);
+  uint8_t sd_chip_read(uint8_t adr);
+  // Polls TEST UNIT READY until the card has finished initialising, the way a
+  // driver waits for a drive to spin up.  False if it never does.
+  //
+  // Thirty milliseconds, because a card takes a good five: one to power up,
+  // and the rest clocked out at 400 kHz because that is all it will accept
+  // until it is up.  A driver waits far longer than this - Linux allows a
+  // drive tens of seconds to spin - so the budget is the test's patience and
+  // not the driver's.
+  bool wait_card_ready(u64 timeout_ps = 30 * MS);
   Sim::Clock* sysclk() { return sysclk_; }
   const EnvConfig& cfg() const { return cfg_; }
   const std::string& name() const { return name_; }
@@ -177,6 +201,9 @@ class Env {
   std::unique_ptr<Disk> disk_;
   std::unique_ptr<SciDriver> drv_;
   std::unique_ptr<WbHost> host_;
+  std::unique_ptr<WbHost> sd_host_;
+  std::unique_ptr<SciDriver> sd_drv_;
+  std::unique_ptr<SdCard> card_;
 };
 
 }  // namespace wtb

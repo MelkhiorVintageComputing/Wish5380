@@ -115,7 +115,61 @@ void Env::bind_models() {
   };
   drv_.reset(new SciDriver(*sim_, rp, cfg_.host_id));
 
+  // The second instance, and the card in its slot.
+  WbMasterPorts sp;
+  sp.cyc = &d->sdb_cyc_i;
+  sp.stb = &d->sdb_stb_i;
+  sp.we = &d->sdb_we_i;
+  sp.sel = &d->sdb_sel_i;
+  sp.adr = &d->sdb_adr_i;
+  sp.dat_w = &d->sdb_dat_i;
+  sp.dat_r = &d->sdb_dat_o;
+  sp.ack = &d->sdb_ack_o;
+  sp.err = &d->sdb_err_o;
+  sd_host_.reset(new WbHost(*sim_, sysclk_, sp));
+  sd_host_->timeout_ps = 200 * US;
+
+  SdPorts cp;
+  cp.sclk = &d->sd_clk_o;
+  cp.cs_n = &d->sd_cs_n_o;
+  cp.mosi = &d->sd_mosi_o;
+  cp.miso = &d->sd_miso_i;
+  card_.reset(new SdCard(*sim_, sysclk_, cp, cfg_.sd_blocks));
+
+  RegPort sp2;
+  sp2.write = [this](uint8_t a, uint8_t v) { sd_chip_write(a, v); };
+  sp2.read = [this](uint8_t a) { return sd_chip_read(a); };
+  sp2.pdma_read = [](uint8_t*, size_t) { return false; };
+  sp2.pdma_write = [](const uint8_t*, size_t) { return false; };
+  sd_drv_.reset(new SciDriver(*sim_, sp2, cfg_.host_id));
+
   sim_->eval();
+}
+
+void Env::sd_chip_write(uint8_t adr, uint8_t data) {
+  uint32_t ba = cfg_.reg_base + uint32_t(adr & 7) * cfg_.reg_stride;
+  uint8_t lane = ba & 3;
+  sd_host_->write32(ba, uint32_t(data) << (8 * lane), uint8_t(1u << lane));
+}
+
+uint8_t Env::sd_chip_read(uint8_t adr) {
+  uint32_t ba = cfg_.reg_base + uint32_t(adr & 7) * cfg_.reg_stride;
+  uint8_t lane = ba & 3;
+  uint32_t v = sd_host_->read32(ba, uint8_t(1u << lane));
+  return uint8_t((v >> (8 * lane)) & 0xff);
+}
+
+bool Env::wait_card_ready(u64 timeout_ps) {
+  u64 t0 = sim_->time_ps();
+  while (sim_->time_ps() - t0 < timeout_ps) {
+    SciDriver::Result r =
+        sd_drv_->execute(cfg_.target_id, Bytes{0x00, 0, 0, 0, 0, 0});
+    if (r.ok && r.status == 0x00) return true;
+    // Twenty microseconds a poll: a whole SCSI command costs about twelve, so
+    // polling any harder spends more time asking than waiting.
+    tick(1000);
+  }
+  return false;
 }
 
 Env::~Env() {

@@ -74,6 +74,30 @@ module tb_top #(
   output logic [7:0] bus_data_o,
   output logic       bus_dbp_o,
 
+  // ---- the same design again, with a real card behind it -------------------
+  //
+  // A second instance, because the block interface is the seam that makes the
+  // rest testable: the regression exercises SCSI against a software disk and
+  // the SD layer against a software card, and only the sd_ tests pay for both
+  // at once.
+  input  logic        sdb_cyc_i,
+  input  logic        sdb_stb_i,
+  input  logic        sdb_we_i,
+  input  logic [3:0]  sdb_sel_i,
+  input  logic [29:0] sdb_adr_i,
+  input  logic [31:0] sdb_dat_i,
+  output logic [31:0] sdb_dat_o,
+  output logic        sdb_ack_o,
+  output logic        sdb_err_o,
+  output logic        sd_irq_o,
+  output logic        sd_drq_o,
+  output logic        sd_bus_bsy_o,
+
+  output logic sd_clk_o,
+  output logic sd_cs_n_o,
+  output logic sd_mosi_o,
+  input  logic sd_miso_i,
+
   // ---- sci_regs, on its own ------------------------------------------------
   input  logic       rg_sclr_i,
   input  logic       rg_stb_i,
@@ -171,6 +195,41 @@ module tb_top #(
     .bbuf_rdata_o (tg_bbuf_rdata_o),
     .bus_o        (bus),
     .peer_i       (peer_drive)
+  );
+
+  // The second instance's bus is watched only for BSY, which is enough for a
+  // test to see that a command is in progress; the sd_ tests are about the
+  // card behind it, and the SCSI side is covered against the fast disk.
+  /* verilator lint_off UNUSEDSIGNAL */
+  scsi_t sd_bus;
+  /* verilator lint_on UNUSEDSIGNAL */
+  scsi_t sd_peer;
+  assign sd_peer = '0;
+  assign sd_bus_bsy_o = sd_bus.bsy;
+
+  wish5380_sd #(
+    .CLK_PERIOD_PS (CLK_PERIOD_PS)
+  ) u_sd (
+    .clk_i     (clk_i),
+    .rst_i     (rst_i),
+    .wb_cyc_i  (sdb_cyc_i),
+    .wb_stb_i  (sdb_stb_i),
+    .wb_we_i   (sdb_we_i),
+    .wb_sel_i  (sdb_sel_i),
+    .wb_adr_i  (sdb_adr_i),
+    .wb_dat_i  (sdb_dat_i),
+    .wb_dat_o  (sdb_dat_o),
+    .wb_ack_o  (sdb_ack_o),
+    .wb_err_o  (sdb_err_o),
+    .irq_o     (sd_irq_o),
+    .drq_o     (sd_drq_o),
+    .eop_i     (1'b0),
+    .sd_clk_o  (sd_clk_o),
+    .sd_cs_n_o (sd_cs_n_o),
+    .sd_mosi_o (sd_mosi_o),
+    .sd_miso_i (sd_miso_i),
+    .bus_o     (sd_bus),
+    .peer_i    (sd_peer)
   );
 
   sci_regs u_regs (

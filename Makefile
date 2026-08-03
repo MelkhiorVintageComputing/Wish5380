@@ -48,7 +48,10 @@ RTL       := $(RTL_DIR)/wish5380_pkg.sv \
              $(RTL_DIR)/scsi_targ.sv \
              $(RTL_DIR)/wish5380.sv \
              $(RTL_DIR)/wb_5380.sv \
-             $(RTL_DIR)/wish5380_wb.sv
+             $(RTL_DIR)/wish5380_wb.sv \
+             $(RTL_DIR)/sd_spi.sv \
+             $(RTL_DIR)/blk_sd.sv \
+             $(RTL_DIR)/wish5380_sd.sv
 TB_SV     := $(TB_SV_DIR)/tb_top.sv
 CPP_SRCS  := $(wildcard $(TB_CPP)/*.cpp) $(wildcard $(TB_CPP)/tests/*.cpp)
 CPP_HDRS  := $(wildcard $(TB_CPP)/*.h)
@@ -56,7 +59,7 @@ CPP_HDRS  := $(wildcard $(TB_CPP)/*.h)
 # Modules Yosys elaborates one at a time, as a third opinion after Verilator
 # and Icarus.  Kept explicit so a module that stops elaborating is noticed.
 SYNTH_TOPS := sci_regs sci_bus scsi_fabric scsi_targ wish5380 \
-              wb_5380 wish5380_wb
+              wb_5380 wish5380_wb sd_spi blk_sd wish5380_sd
 
 # Tests to run, empty means all.  Pass extra runner flags in FLAGS.
 T     ?=
@@ -89,7 +92,7 @@ list: $(BIN)
 
 lint:
 	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
-	  --top-module wish5380_wb $(RTL)
+	  --top-module wish5380_sd $(RTL)
 	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
 	  --top-module $(TOP) $(RTL) $(TB_SV)
 

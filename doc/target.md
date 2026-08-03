@@ -92,10 +92,13 @@ back end fills the buffer before a READ and drains it after a WRITE, through
 its own port on the same dual-ported memory; the two sides never touch it at
 the same time.
 
-That is what lets `blk_sd` replace `tb/cpp/disk.h` without the SCSI side
-noticing, and it is why the regression does not have to simulate an SD card to
-test SCSI.  A card that has to be initialised and clocked out a bit at a time
-would bury a SCSI failure in a hundred thousand clocks of unrelated traffic.
+That is what lets `blk_sd` stand where `tb/cpp/disk.h` stands without the SCSI
+side noticing, and it is why the regression does not have to simulate an SD
+card to test SCSI.  A card that has to be initialised and clocked out a bit at
+a time buries a SCSI failure in a hundred thousand clocks of unrelated
+traffic - the `sd_` tests take longer than the whole of the rest of the suite.
 
 The model's latency is adjustable and is not zero by default, because a back
 end that answers instantly hides a target that forgets to wait for one.
+
+`doc/sd.md` describes what is on the other side of that seam.
