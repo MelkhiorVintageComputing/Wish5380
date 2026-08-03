@@ -14,15 +14,17 @@
 // arbitration they read BSY back out of the Current SCSI Bus Status Register
 // and it is true because this chip is the one asserting it.
 //
-// Three ports: the chip, the SD-backed target, and one spare.  The spare is
+// Four ports: the chip, two SD-backed targets, and one spare.  The spare is
 // what the testbench drives to stand in for another device, and is tied to
 // zero in the real top level - a device driving nothing is a device that is
-// not there, which is exactly what an open-collector bus means by it.
+// not there, which is exactly what an open-collector bus means by it, and it
+// is how the second target is switched off when a board carries one drive.
 
 module scsi_fabric (
   input  scsi_t a_i,
   input  scsi_t b_i,
   input  scsi_t c_i,
+  input  scsi_t d_i,
   output scsi_t bus_o
 );
 
@@ -32,6 +34,6 @@ module scsi_fabric (
   // ENABLE PARITY CHECKING set: with one device driving - the only case the
   // protocol allows during an information transfer - the OR is that device's
   // bit unchanged.
-  assign bus_o = a_i | b_i | c_i;
+  assign bus_o = a_i | b_i | c_i | d_i;
 
 endmodule

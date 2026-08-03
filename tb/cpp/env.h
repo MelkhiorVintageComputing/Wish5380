@@ -49,6 +49,10 @@ struct EnvConfig {
   // The SCSI ID the target answers to, and the one the driver arbitrates
   // with.  A host adapter is conventionally 7 and Apple's internal drive 0.
   uint8_t target_id = 0;
+  // The second drive on the bus.  A SCSI bus with one device never exercises
+  // the ID decode against anything that could get it wrong: the only other
+  // outcome is silence.
+  uint8_t target1_id = 1;
   uint8_t host_id = 7;
 
   // Where the three windows sit inside the slave, stated here independently
@@ -80,6 +84,7 @@ class Env {
   Vtb_top* dut() { return dut_.get(); }
   Sim& sim() { return *sim_; }
   Disk& disk() { return *disk_; }
+  Disk& disk1() { return *disk1_; }
   SciDriver& drv() { return *drv_; }
   WbHost& host() { return *host_; }
 
@@ -88,6 +93,7 @@ class Env {
   WbHost& sd_host() { return *sd_host_; }
   SciDriver& sd_drv() { return *sd_drv_; }
   SdCard& card() { return *card_; }
+  SdCard& card1() { return *card1_; }
   // Register and pseudo-DMA access to that instance.
   void sd_chip_write(uint8_t adr, uint8_t data);
   uint8_t sd_chip_read(uint8_t adr);
@@ -205,11 +211,13 @@ class Env {
   uint8_t strobes_ = 0;
   Peer peer_;
   std::unique_ptr<Disk> disk_;
+  std::unique_ptr<Disk> disk1_;
   std::unique_ptr<SciDriver> drv_;
   std::unique_ptr<WbHost> host_;
   std::unique_ptr<WbHost> sd_host_;
   std::unique_ptr<SciDriver> sd_drv_;
   std::unique_ptr<SdCard> card_;
+  std::unique_ptr<SdCard> card1_;
 };
 
 }  // namespace wtb

@@ -52,6 +52,19 @@ module tb_top #(
   input  logic [7:0]  tg_bbuf_wdata_i,
   output logic [7:0]  tg_bbuf_rdata_o,
 
+  // ...and the same again for the second drive on the bus.
+  output logic        tg1_blk_start_o,
+  output logic        tg1_blk_we_o,
+  output logic [31:0] tg1_blk_lba_o,
+  input  logic        tg1_blk_done_i,
+  input  logic        tg1_blk_err_i,
+  input  logic        tg1_blk_ready_i,
+  input  logic [31:0] tg1_blk_count_i,
+  input  logic        tg1_bbuf_we_i,
+  input  logic [8:0]  tg1_bbuf_addr_i,
+  input  logic [7:0]  tg1_bbuf_wdata_i,
+  output logic [7:0]  tg1_bbuf_rdata_o,
+
   // ---- the peer device on the fabric, driven by the testbench --------------
   input  logic       pr_rst_i,
   input  logic       pr_bsy_i,
@@ -101,6 +114,10 @@ module tb_top #(
   output logic sd_cs_n_o,
   output logic sd_mosi_o,
   input  logic sd_miso_i,
+  output logic sd1_clk_o,
+  output logic sd1_cs_n_o,
+  output logic sd1_mosi_o,
+  input  logic sd1_miso_i,
 
   // ---- sci_regs, on its own ------------------------------------------------
   input  logic       rg_sclr_i,
@@ -198,6 +215,17 @@ module tb_top #(
     .bbuf_addr_i  (tg_bbuf_addr_i),
     .bbuf_wdata_i (tg_bbuf_wdata_i),
     .bbuf_rdata_o (tg_bbuf_rdata_o),
+    .blk1_start_o  (tg1_blk_start_o),
+    .blk1_we_o     (tg1_blk_we_o),
+    .blk1_lba_o    (tg1_blk_lba_o),
+    .blk1_done_i   (tg1_blk_done_i),
+    .blk1_err_i    (tg1_blk_err_i),
+    .blk1_ready_i  (tg1_blk_ready_i),
+    .blk1_count_i  (tg1_blk_count_i),
+    .bbuf1_we_i    (tg1_bbuf_we_i),
+    .bbuf1_addr_i  (tg1_bbuf_addr_i),
+    .bbuf1_wdata_i (tg1_bbuf_wdata_i),
+    .bbuf1_rdata_o (tg1_bbuf_rdata_o),
     .bus_o        (bus),
     .peer_i       (peer_drive)
   );
@@ -234,6 +262,10 @@ module tb_top #(
     .sd_cs_n_o (sd_cs_n_o),
     .sd_mosi_o (sd_mosi_o),
     .sd_miso_i (sd_miso_i),
+    .sd1_clk_o  (sd1_clk_o),
+    .sd1_cs_n_o (sd1_cs_n_o),
+    .sd1_mosi_o (sd1_mosi_o),
+    .sd1_miso_i (sd1_miso_i),
     .bus_o     (sd_bus),
     .peer_i    (sd_peer)
   );

@@ -101,8 +101,8 @@ wish5380_sd                  the whole thing: WB B4 slave and a card slot
 │   │   ├── sci_regs         the eight registers and the port they hide behind
 │   │   └── sci_bus          arbitration, selection, handshake, interrupts
 │   ├── scsi_fabric          the wired-OR joining everything on the bus
-│   └── scsi_targ            a direct-access device; see doc/target.md
-└── blk_sd -> sd_spi         the SD card;  see doc/sd.md
+│   └── scsi_targ  x TARGETS two direct-access devices; see doc/target.md
+└── blk_sd -> sd_spi   x2    one SD card each;  see doc/sd.md
 ```
 
 The two tops are kept apart because the block interface between them is the
@@ -254,7 +254,8 @@ leaf means adding its ports here.
 
 Prefixes are meaningful and ordered by trust: `infra_` checks the testbench
 itself, `layout_` checks our constants against the datasheet and both driver
-headers, `unit_` checks RTL leaves against software models, `reg_` the
+headers, `two_` checks what only two drives on the bus can check, `unit_` checks RTL
+leaves against software models, `reg_` the
 register file, `bus_` the SCSI engine, `wb_` the machine glue and its three
 windows, `sys_` the whole thing the way a driver drives it - arbitrate,
 select, command, data, status, message, bus free - and `sd_` that same stack

@@ -100,6 +100,20 @@ void Env::bind_models() {
   dp.buf_rdata = &d->tg_bbuf_rdata_o;
   disk_.reset(new Disk(*sim_, sysclk_, dp, cfg_.disk_blocks));
 
+  DiskPorts dp1;
+  dp1.start = &d->tg1_blk_start_o;
+  dp1.we = &d->tg1_blk_we_o;
+  dp1.lba = &d->tg1_blk_lba_o;
+  dp1.done = &d->tg1_blk_done_i;
+  dp1.err = &d->tg1_blk_err_i;
+  dp1.ready = &d->tg1_blk_ready_i;
+  dp1.count = &d->tg1_blk_count_i;
+  dp1.buf_we = &d->tg1_bbuf_we_i;
+  dp1.buf_addr = &d->tg1_bbuf_addr_i;
+  dp1.buf_wdata = &d->tg1_bbuf_wdata_i;
+  dp1.buf_rdata = &d->tg1_bbuf_rdata_o;
+  disk1_.reset(new Disk(*sim_, sysclk_, dp1, cfg_.disk_blocks));
+
   // The driver, reaching the chip the way a real one does.
   RegPort rp;
   rp.write = [this](uint8_t a, uint8_t v) { chip_write(a, v); };
@@ -135,6 +149,13 @@ void Env::bind_models() {
   cp.mosi = &d->sd_mosi_o;
   cp.miso = &d->sd_miso_i;
   card_.reset(new SdCard(*sim_, sysclk_, cp, cfg_.sd_blocks));
+
+  SdPorts cp1;
+  cp1.sclk = &d->sd1_clk_o;
+  cp1.cs_n = &d->sd1_cs_n_o;
+  cp1.mosi = &d->sd1_mosi_o;
+  cp1.miso = &d->sd1_miso_i;
+  card1_.reset(new SdCard(*sim_, sysclk_, cp1, cfg_.sd_blocks));
 
   RegPort sp2;
   sp2.write = [this](uint8_t a, uint8_t v) { sd_chip_write(a, v); };

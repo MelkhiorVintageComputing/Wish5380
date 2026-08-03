@@ -81,8 +81,28 @@ put it for initiators that send no message at all.
 * **It does not check incoming parity.**  The fabric carries the bit and the
   chip checks it in the other direction; a target that rejected a bad byte
   would need an ABORTED COMMAND path that nothing exercises yet.
-* **It supports one logical unit and one initiator.**  The fabric has a third
-  port for a second device, and it is what the testbench drives.
+* **It supports one logical unit and one initiator.**  The fabric's fourth
+  port is the testbench's, for standing another device on the bus.
+
+## Two of them
+
+`TARGETS` on `wish5380_wb` is one or two, and two is the default.  Each drive
+has its own ID, its own block back end and its own card slot; a board that
+carries one leaves the second out entirely rather than wiring an empty slot to
+it, because a device driving nothing is a device that is not there.
+
+The second drive is not decoration.  A SCSI bus with one device never
+exercises the ID decode against anything that could get it wrong: a target
+that answered every selection and one that answered only its own both pass
+every test that has one drive to talk to, because the only other outcome is
+silence.  `test_two.cpp` is what tells them apart, and mutating the decode -
+both drives on the same ID, or a target that answers any non-zero selection -
+fails five or six of its tests.
+
+Note that a second *target* does not exercise arbitration.  Arbitration is
+between initiators, and a target arbitrates only to reselect; nothing here
+disconnects, so nothing here reselects.  What two drives exercise is
+selection, the ID decode, and a wired-OR with three devices on it.
 
 ## The block back end
 

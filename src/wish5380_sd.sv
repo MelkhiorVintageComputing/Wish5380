@@ -19,8 +19,10 @@ module wish5380_sd #(
   parameter int PDMA_SIZE = 'h100,
   parameter int DRQ_TIMEOUT_NS = 16000,
 
-  // The disk.  See `scsi_targ`.
+  // The disks.  See `scsi_targ` and `wish5380_wb`.
+  parameter int TARGETS = 2,
   parameter int TARGET_ID = 0,
+  parameter int TARGET1_ID = 1,
   parameter logic [63:0]  VENDOR   = "DOLBEAU ",
   parameter logic [127:0] PRODUCT  = "WISH5380 SD CARD",
   parameter logic [31:0]  REVISION = "0001"
@@ -44,11 +46,22 @@ module wish5380_sd #(
   output logic drq_o,
   input  logic eop_i,
 
-  // ---- the card slot ------------------------------------------------------
+  // ---- the card slots -----------------------------------------------------
+  //
+  // One per drive.  The second is not driven at all when TARGETS is one, so a
+  // board that carries a single slot leaves those pins unbonded.
   output logic sd_clk_o,
   output logic sd_cs_n_o,
   output logic sd_mosi_o,
   input  logic sd_miso_i,
+
+  output logic sd1_clk_o,
+  output logic sd1_cs_n_o,
+  output logic sd1_mosi_o,
+  // Nobody reads it when there is no second drive to read it for.
+  /* verilator lint_off UNUSEDSIGNAL */
+  input  logic sd1_miso_i,
+  /* verilator lint_on UNUSEDSIGNAL */
 
   // ---- the private SCSI bus, for debug -----------------------------------
   output scsi_t bus_o,
@@ -61,8 +74,21 @@ module wish5380_sd #(
   logic [8:0]  bbuf_addr;
   logic [7:0]  bbuf_wdata, bbuf_rdata;
 
+  // The second drive's wires exist whether or not there is a second drive on
+  // the end of them; with TARGETS of one the target block ties its side low
+  // and nothing reads them back.
+  /* verilator lint_off UNUSEDSIGNAL */
+  logic        blk1_start, blk1_we, blk1_done, blk1_err, blk1_ready;
+  logic [31:0] blk1_lba, blk1_count;
+  logic        bbuf1_we;
+  logic [8:0]  bbuf1_addr;
+  logic [7:0]  bbuf1_wdata, bbuf1_rdata;
+  /* verilator lint_on UNUSEDSIGNAL */
+
   wish5380_wb #(
     .CLK_PERIOD_PS  (CLK_PERIOD_PS),
+    .TARGETS        (TARGETS),
+    .TARGET1_ID     (TARGET1_ID),
     .REG_STRIDE     (REG_STRIDE),
     .REG_BASE       (REG_BASE),
     .HSK_BASE       (HSK_BASE),
@@ -99,6 +125,17 @@ module wish5380_sd #(
     .bbuf_addr_i  (bbuf_addr),
     .bbuf_wdata_i (bbuf_wdata),
     .bbuf_rdata_o (bbuf_rdata),
+    .blk1_start_o  (blk1_start),
+    .blk1_we_o     (blk1_we),
+    .blk1_lba_o    (blk1_lba),
+    .blk1_done_i   (blk1_done),
+    .blk1_err_i    (blk1_err),
+    .blk1_ready_i  (blk1_ready),
+    .blk1_count_i  (blk1_count),
+    .bbuf1_we_i    (bbuf1_we),
+    .bbuf1_addr_i  (bbuf1_addr),
+    .bbuf1_wdata_i (bbuf1_wdata),
+    .bbuf1_rdata_o (bbuf1_rdata),
     .bus_o        (bus_o),
     .peer_i       (peer_i)
   );
@@ -124,5 +161,42 @@ module wish5380_sd #(
     .sd_mosi_o   (sd_mosi_o),
     .sd_miso_i   (sd_miso_i)
   );
+
+  generate
+    if (TARGETS > 1) begin : g_sd1
+      blk_sd #(
+        .CLK_PERIOD_PS (CLK_PERIOD_PS)
+      ) u_sd1 (
+        .clk_i       (clk_i),
+        .rst_i       (rst_i),
+        .start_i     (blk1_start),
+        .we_i        (blk1_we),
+        .lba_i       (blk1_lba),
+        .done_o      (blk1_done),
+        .err_o       (blk1_err),
+        .ready_o     (blk1_ready),
+        .count_o     (blk1_count),
+        .buf_we_o    (bbuf1_we),
+        .buf_addr_o  (bbuf1_addr),
+        .buf_wdata_o (bbuf1_wdata),
+        .buf_rdata_i (bbuf1_rdata),
+        .sd_clk_o    (sd1_clk_o),
+        .sd_cs_n_o   (sd1_cs_n_o),
+        .sd_mosi_o   (sd1_mosi_o),
+        .sd_miso_i   (sd1_miso_i)
+      );
+    end else begin : g_no_sd1
+      assign blk1_done  = 1'b0;
+      assign blk1_err   = 1'b0;
+      assign blk1_ready = 1'b0;
+      assign blk1_count = '0;
+      assign bbuf1_we    = 1'b0;
+      assign bbuf1_addr  = '0;
+      assign bbuf1_wdata = '0;
+      assign sd1_clk_o   = 1'b0;
+      assign sd1_cs_n_o  = 1'b1;
+      assign sd1_mosi_o  = 1'b1;
+    end
+  endgenerate
 
 endmodule

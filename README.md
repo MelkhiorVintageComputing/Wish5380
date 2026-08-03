@@ -26,7 +26,7 @@ The design is complete and an unmodified Linux boots off it.  A driver
 reaches the Wishbone slave through the three windows a Macintosh expects,
 arbitrates and selects, and reads and writes blocks - either a byte at a time
 in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
-and those blocks come off an SD card in its slot.
+and those blocks come off SD cards in the board's two slots.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
@@ -38,6 +38,7 @@ and those blocks come off an SD card in its slot.
 | interrupts: selection, EOP, reset, parity, phase mismatch, loss of BSY | done, tested |
 | internal SCSI fabric (`scsi_fabric`)             | done, tested  |
 | SCSI target: phases and handshake (`scsi_targ`)  | done, tested  |
+| two drives on the bus, each with its own card    | done, tested  |
 | SCSI-1 command set, and the sense it reports     | done, tested  |
 | block back end interface, and a model of one     | done, tested  |
 | driver model, following `NCR5380.c` (`sci_driver`) | done, tested |
@@ -48,7 +49,7 @@ and those blocks come off an SD card in its slot.
 | the whole design with a card in it (`wish5380_sd`) | done, tested |
 | co-simulation against Linux's own driver         | done, running |
 
-95 tests pass on each of two boards - the Macintosh, with its registers
+103 tests pass on each of two boards - the Macintosh, with its registers
 sixteen bytes apart, and a generic ISA card with them one byte apart - and at
 7.8 MHz, 50 MHz and 125 MHz.  Nothing is pending.  The part's delays are
 derived from the clock rather than written down, and the register spacing is

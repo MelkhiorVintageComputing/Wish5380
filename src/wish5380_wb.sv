@@ -32,8 +32,13 @@ module wish5380_wb #(
   parameter int PDMA_SIZE = 'h100,
   parameter int DRQ_TIMEOUT_NS = 16000,
 
-  // The disk.  See `scsi_targ`.
+  // How many drives are on the bus, one or two, and what they answer to.
+  // Two is the interesting case: a SCSI bus with one device never exercises
+  // the ID decode against anything that could get it wrong, because the only
+  // other outcome is silence.
+  parameter int TARGETS = 2,
   parameter int TARGET_ID = 0,
+  parameter int TARGET1_ID = 1,
   parameter logic [63:0]  VENDOR   = "DOLBEAU ",
   parameter logic [127:0] PRODUCT  = "WISH5380 SD CARD",
   parameter logic [31:0]  REVISION = "0001"
@@ -57,7 +62,9 @@ module wish5380_wb #(
   output logic drq_o,
   input  logic eop_i,
 
-  // ---- the block back end behind the target ------------------------------
+  // ---- the block back end behind each target -----------------------------
+  //
+  // The second set is driven low and ignored when TARGETS is one.
   output logic        blk_start_o,
   output logic        blk_we_o,
   output logic [31:0] blk_lba_o,
@@ -70,6 +77,21 @@ module wish5380_wb #(
   input  logic [7:0]  bbuf_wdata_i,
   output logic [7:0]  bbuf_rdata_o,
 
+  // Nothing reads these when there is no second target to read them for.
+  /* verilator lint_off UNUSEDSIGNAL */
+  output logic        blk1_start_o,
+  output logic        blk1_we_o,
+  output logic [31:0] blk1_lba_o,
+  input  logic        blk1_done_i,
+  input  logic        blk1_err_i,
+  input  logic        blk1_ready_i,
+  input  logic [31:0] blk1_count_i,
+  input  logic        bbuf1_we_i,
+  input  logic [8:0]  bbuf1_addr_i,
+  input  logic [7:0]  bbuf1_wdata_i,
+  output logic [7:0]  bbuf1_rdata_o,
+  /* verilator lint_on UNUSEDSIGNAL */
+
   // ---- the private SCSI bus, for debug -----------------------------------
   output scsi_t bus_o,
   input  scsi_t peer_i
@@ -80,7 +102,7 @@ module wish5380_wb #(
   logic [7:0] wdata, rdata;
   logic       drq;
 
-  scsi_t chip_drive, targ_drive, bus;
+  scsi_t chip_drive, targ_drive, targ1_drive, bus;
 
   assign drq_o = drq;
   assign bus_o = bus;
@@ -156,10 +178,49 @@ module wish5380_wb #(
     .bbuf_rdata_o (bbuf_rdata_o)
   );
 
+  // The second drive.  A board that carries one leaves it out entirely rather
+  // than wiring an empty slot to it: a device driving nothing is a device that
+  // is not there, and a target that is not there is silence, which is what an
+  // initiator selecting an absent ID is meant to hear.
+  generate
+    if (TARGETS > 1) begin : g_targ1
+      scsi_targ #(
+        .CLK_PERIOD_PS (CLK_PERIOD_PS),
+        .TARGET_ID     (TARGET1_ID),
+        .VENDOR        (VENDOR),
+        .PRODUCT       (PRODUCT),
+        .REVISION      (REVISION)
+      ) u_targ1 (
+        .clk_i        (clk_i),
+        .rst_i        (rst_i),
+        .drive_o      (targ1_drive),
+        .bus_i        (bus),
+        .blk_start_o  (blk1_start_o),
+        .blk_we_o     (blk1_we_o),
+        .blk_lba_o    (blk1_lba_o),
+        .blk_done_i   (blk1_done_i),
+        .blk_err_i    (blk1_err_i),
+        .blk_ready_i  (blk1_ready_i),
+        .blk_count_i  (blk1_count_i),
+        .bbuf_we_i    (bbuf1_we_i),
+        .bbuf_addr_i  (bbuf1_addr_i),
+        .bbuf_wdata_i (bbuf1_wdata_i),
+        .bbuf_rdata_o (bbuf1_rdata_o)
+      );
+    end else begin : g_no_targ1
+      assign targ1_drive  = '0;
+      assign blk1_start_o = 1'b0;
+      assign blk1_we_o    = 1'b0;
+      assign blk1_lba_o   = '0;
+      assign bbuf1_rdata_o = '0;
+    end
+  endgenerate
+
   scsi_fabric u_fabric (
     .a_i   (chip_drive),
     .b_i   (targ_drive),
-    .c_i   (peer_i),
+    .c_i   (targ1_drive),
+    .d_i   (peer_i),
     .bus_o (bus)
   );
 

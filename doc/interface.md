@@ -213,10 +213,12 @@ nothing else.
   on hardware either, and an integrator will want it on a logic analyser.  Tie
   `peer_i` to zero and leave `bus_o` unconnected in a real design.
 
-## What is not settled yet
+## Nothing is open
 
-* How many targets the fabric carries.  One is enough to boot; a second would
-  exercise arbitration properly.
+The fabric carries four devices: the chip, two drives, and one port the
+testbench drives.  `TARGETS` chooses whether the second drive is built, and
+two is the default - `doc/target.md` says why one is not enough to test with,
+and why "arbitration" was the wrong word for what a second drive exercises.
 
 The second configuration is settled: `make test-all` runs the whole suite
 against both boards, `BOARD=mac` and `BOARD=isa`, the way the sibling project
