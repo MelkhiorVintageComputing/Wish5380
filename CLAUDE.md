@@ -20,7 +20,7 @@ machine the co-simulation actually boots is an i386 Linux, because every Mac
 emulator needs a ROM a script cannot fetch; `cosim/README.md` argues that at
 length, and it is the question everyone asks first.
 
-The design is complete.  All 103 tests pass on both boards at three clock
+The design is complete.  All 114 tests pass on both boards at three clock
 rates, and an unmodified Linux mounts a filesystem off it.
 
 ### Where answers come from
