@@ -28,37 +28,41 @@ arbitrates and selects, and reads and writes blocks - either a byte at a time
 in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
 and those blocks come off SD cards in the board's two slots.
 
-| block                                            | state         |
-|--------------------------------------------------|---------------|
-| constants, checked against both driver headers   | done, tested  |
-| the eight registers (`sci_regs`)                 | done, tested  |
-| bus driving and the status windows (`sci_bus`)   | done, tested  |
-| arbitration, AIP and LOST ARBITRATION            | done, tested  |
-| the DMA handshake, both roles, both directions   | done, tested  |
-| interrupts: selection, EOP, reset, parity, phase mismatch, loss of BSY | done, tested |
-| internal SCSI fabric (`scsi_fabric`)             | done, tested  |
-| SCSI target: phases and handshake (`scsi_targ`)  | done, tested  |
-| two drives on the bus, each with its own card    | done, tested  |
-| SCSI-1 command set, and the sense it reports     | done, tested  |
-| block back end interface, and a model of one     | done, tested  |
-| driver model, following `NCR5380.c` (`sci_driver`) | done, tested |
-| Wishbone slave and the Mac's three windows (`wb_5380`) | done, tested |
-| pseudo-DMA, with the bus error the Mac relies on | done, tested  |
-| the deliverable top level (`wish5380_wb`)        | done, tested  |
-| SD card in SPI mode (`blk_sd`, `sd_spi`)         | done, tested  |
-| the whole design with a card in it (`wish5380_sd`) | done, tested |
-| co-simulation against Linux's own driver         | done, running |
+Everything the chip does in hardware is there: arbitration with AIP and LOST
+ARBITRATION, the REQ/ACK handshake it automates in DMA mode in both roles and
+both directions, and all six of its interrupt sources - selection and
+reselection, end of process, SCSI reset, parity, bus phase mismatch and loss
+of BSY.
 
-103 tests pass on each of two boards - the Macintosh, with its registers
-sixteen bytes apart, and a generic ISA card with them one byte apart - and at
-7.8 MHz, 50 MHz and 125 MHz.  Nothing is pending.  The part's delays are
-derived from the clock rather than written down, and the register spacing is
-an elaboration parameter, so the regression checks whichever build it was
-given.
+| block               | what it is                                           | tested by              |
+|---------------------|------------------------------------------------------|------------------------|
+| `wish5380_sd`       | the whole thing: a Wishbone slave and two card slots  | `sd_` (13)             |
+| `wish5380_wb`       | the same, for a board with some other back end        | `sys_` (23)            |
+| `wb_5380`           | machine glue: three windows, byte lanes, pseudo-DMA   | `wb_` (15)             |
+| `wish5380`          | the part itself                                       | `sys_`, `bus_`         |
+| `sci_regs`          | the eight registers and the port they hide behind     | `reg_` (10)            |
+| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22)            |
+| `scsi_fabric`       | the wired-OR joining everything on the bus            | `two_` (8), `bus_`     |
+| `scsi_targ`         | a direct-access device, one per drive                 | `sys_`, `two_`, `sd_`  |
+| `blk_sd`, `sd_spi`  | an SD card in SPI mode                                | `sd_`                  |
 
-An i386 Linux, unmodified, probes the design with its own `g_NCR5380`,
-attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
-files - see [`cosim/`](cosim/README.md).
+A prefix is counted once, against the block it is mostly about; the others
+beside it reach the same block through something else.  Two more prefixes are
+about the testbench rather than the design: `layout_` (7) pins the constants
+to the datasheet and to both driver headers, and `infra_` (5) checks the
+clock, the reset and the accessors everything else stands on - if one of those
+fails, no other result means anything.
+
+All 103 pass, with none pending, in six builds: two boards - the Macintosh,
+with its registers sixteen bytes apart, and a generic ISA card with them one
+byte apart - at each of 7.8 MHz, 50 MHz and 125 MHz.  The part's delays are
+derived from the clock rather than written down and the register spacing is an
+elaboration parameter, so the regression checks whichever build it was given
+rather than a nominal one.
+
+Beyond the regression, an unmodified i386 Linux probes the design with its own
+`g_NCR5380`, attaches `sda`, mounts an ext2 root filesystem off it and reads
+and writes files - see [`cosim/`](cosim/README.md).
 
 ## Building and testing
 
