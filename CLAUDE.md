@@ -278,6 +278,7 @@ Prefixes are meaningful and ordered by trust:
 | `layout_`| our constants, against the datasheet and both driver headers |
 | `reg_`   | the register file, on its own |
 | `bus_`   | the SCSI engine |
+| `dma_`   | the same chip driven by a real DMA controller: one DACK per DRQ, and EOP on the last byte |
 | `wb_`    | the machine glue and its three windows |
 | `sys_`   | the whole thing the way a driver drives it - arbitrate, select, command, data, status, message, bus free |
 | `two_`   | what only two drives on the bus can check: the ID decode, and a wired-OR with three devices on it |

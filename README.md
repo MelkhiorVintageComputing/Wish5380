@@ -41,10 +41,15 @@ of BSY.
 | `wb_5380`           | machine glue: three windows, byte lanes, pseudo-DMA   | `wb_` (15)             |
 | `wish5380`          | the part itself                                       | `sys_`, `bus_`         |
 | `sci_regs`          | the eight registers and the port they hide behind     | `reg_` (10)            |
-| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22)            |
+| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22), `dma_` (10) |
 | `scsi_fabric`       | the wired-OR joining everything on the bus            | `two_` (8), `bus_`     |
 | `scsi_targ`         | a direct-access device, one per drive                 | `sys_`, `two_`, `sd_`  |
 | `blk_sd`, `sd_spi`  | an SD card in SPI mode                                | `sd_`                  |
+
+`dma_` is the chip driven by a *real* DMA controller rather than by the Mac's
+pseudo-DMA aperture, which is the CPU pretending to be one: a CPU has no End
+of Process pin, so EOP and everything downstream of it is unreachable that
+way and is on the path a Sun 3/60 takes.
 
 A prefix is counted once, against the block it is mostly about; the others
 beside it reach the same block through something else.  Two more prefixes are

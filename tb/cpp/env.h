@@ -155,6 +155,27 @@ class Env {
   Pdma pdma_read(size_t n, bool handshake = true);
   Pdma pdma_write(const Bytes& b, bool handshake = true);
 
+  // ---- a real DMA controller ---------------------------------------------
+  //
+  // One DACK cycle per DRQ, and End of Process asserted with the last byte.
+  // That last part is what separates a DMA engine from the Mac's pseudo-DMA:
+  // a CPU moving bytes through an aperture has no EOP pin to assert, so the
+  // chip's whole EOP path - END OF DMA, and the interrupt that goes with it -
+  // is unreachable that way.  A Sun-3's Am9516 does assert it.
+  //
+  // `moved` is how many bytes crossed before DRQ stopped coming, so a
+  // transfer the target cut short is visible rather than a timeout.
+  struct Dma {
+    Bytes data;
+    size_t moved = 0;
+    bool timed_out = false;
+  };
+  Dma dma_in(size_t n, bool eop_on_last = true);
+  Dma dma_out(const Bytes& data, bool eop_on_last = true);
+  // How long to wait for each DRQ.  A target that changes phase simply stops
+  // asking, which is the normal way a transfer ends.
+  u64 dma_drq_timeout_ps = 2 * MS;
+
   // A raw access, for the tests that are about the decode rather than about
   // what is behind it.  Returns whether the slave answered with ERR.
   bool wb_err_on_read(uint32_t byte_adr, uint8_t sel);

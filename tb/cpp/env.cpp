@@ -329,6 +329,58 @@ Env::Pdma Env::pdma_write(const Bytes& b, bool handshake) {
   return out;
 }
 
+// The DACK cycle goes through the window that does not wait for DRQ: the
+// engine has already satisfied itself there is a byte, which is exactly what
+// a DMA controller that watched the DRQ pin knows.
+Env::Dma Env::dma_in(size_t n, bool eop_on_last) {
+  Dma out;
+  for (size_t i = 0; i < n; i++) {
+    if (!sim_->run_until([this]() { return dut_->dut_drq_o != 0; },
+                         dma_drq_timeout_ps)) {
+      out.timed_out = (i == 0);
+      break;
+    }
+    bool last = eop_on_last && (i + 1 == n);
+    if (last) {
+      dut_->dut_eop_i = 1;
+      sim_->eval();
+    }
+    Pdma p = pdma_read(1, /*handshake=*/false);
+    if (last) {
+      dut_->dut_eop_i = 0;
+      sim_->eval();
+    }
+    if (p.error || p.data.empty()) break;
+    out.data.push_back(p.data[0]);
+    out.moved++;
+  }
+  return out;
+}
+
+Env::Dma Env::dma_out(const Bytes& data, bool eop_on_last) {
+  Dma out;
+  for (size_t i = 0; i < data.size(); i++) {
+    if (!sim_->run_until([this]() { return dut_->dut_drq_o != 0; },
+                         dma_drq_timeout_ps)) {
+      out.timed_out = (i == 0);
+      break;
+    }
+    bool last = eop_on_last && (i + 1 == data.size());
+    if (last) {
+      dut_->dut_eop_i = 1;
+      sim_->eval();
+    }
+    Pdma p = pdma_write(Bytes{data[i]}, /*handshake=*/false);
+    if (last) {
+      dut_->dut_eop_i = 0;
+      sim_->eval();
+    }
+    if (p.error) break;
+    out.moved++;
+  }
+  return out;
+}
+
 bool Env::wb_err_on_read(uint32_t byte_adr, uint8_t sel) {
   (void)host_->read32(byte_adr, sel);
   return host_->last_error() || host_->last_timeout();
