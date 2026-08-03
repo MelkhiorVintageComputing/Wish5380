@@ -6,10 +6,12 @@
 // so one binary covers both levels and there is no second build to keep in
 // step.  Adding a unit-tested leaf means adding its ports here.
 //
-// The chip is joined to the fabric together with a peer device the testbench
-// drives signal by signal.  That closes the loop the real bus closes: the
-// chip reads back the OR of what everybody is driving, including itself, and
-// both reference drivers depend on seeing their own BSY.
+// The device under test is the whole product, `wish5380_wb`, so every test
+// reaches the chip the way a machine does - through the Wishbone slave and its
+// register window.  The private SCSI bus comes out of the design as a debug
+// port, which is what lets a test watch the fabric and stand a second device
+// on it: the chip reads back the OR of what everybody is driving, including
+// itself, and both reference drivers depend on seeing their own BSY.
 
 module tb_top #(
   parameter int CLK_PERIOD_PS = 20000
@@ -17,29 +19,21 @@ module tb_top #(
   input  logic clk_i,
   input  logic rst_i,
 
-  // ---- the chip ------------------------------------------------------------
-  input  logic       dut_stb_i,
-  input  logic       dut_we_i,
-  input  logic       dut_dack_i,
-  input  logic [2:0] dut_adr_i,
-  input  logic [7:0] dut_dat_i,
-  output logic [7:0] dut_dat_o,
-  input  logic       dut_eop_i,
-  output logic       dut_drq_o,
-  output logic       dut_irq_o,
+  // ---- the Wishbone slave, driven by the host model ------------------------
+  input  logic        wbs_cyc_i,
+  input  logic        wbs_stb_i,
+  input  logic        wbs_we_i,
+  input  logic [3:0]  wbs_sel_i,
+  input  logic [29:0] wbs_adr_i,
+  input  logic [31:0] wbs_dat_i,
+  output logic [31:0] wbs_dat_o,
+  output logic        wbs_ack_o,
+  output logic        wbs_err_o,
 
-  // ---- the peer device on the fabric, driven by the testbench --------------
-  input  logic       pr_rst_i,
-  input  logic       pr_bsy_i,
-  input  logic       pr_sel_i,
-  input  logic       pr_req_i,
-  input  logic       pr_ack_i,
-  input  logic       pr_atn_i,
-  input  logic       pr_msg_i,
-  input  logic       pr_cd_i,
-  input  logic       pr_io_i,
-  input  logic [7:0] pr_data_i,
-  input  logic       pr_dbp_i,
+  // ---- the part's own pins -------------------------------------------------
+  output logic dut_irq_o,
+  output logic dut_drq_o,
+  input  logic dut_eop_i,
 
   // ---- the target's block back end, modelled by the testbench --------------
   output logic        tg_blk_start_o,
@@ -53,6 +47,19 @@ module tb_top #(
   input  logic [8:0]  tg_bbuf_addr_i,
   input  logic [7:0]  tg_bbuf_wdata_i,
   output logic [7:0]  tg_bbuf_rdata_o,
+
+  // ---- the peer device on the fabric, driven by the testbench --------------
+  input  logic       pr_rst_i,
+  input  logic       pr_bsy_i,
+  input  logic       pr_sel_i,
+  input  logic       pr_req_i,
+  input  logic       pr_ack_i,
+  input  logic       pr_atn_i,
+  input  logic       pr_msg_i,
+  input  logic       pr_cd_i,
+  input  logic       pr_io_i,
+  input  logic [7:0] pr_data_i,
+  input  logic       pr_dbp_i,
 
   // ---- the bus as everybody sees it ----------------------------------------
   output logic       bus_rst_o,
@@ -106,7 +113,7 @@ module tb_top #(
   output logic       rg_sdir_o
 );
 
-  scsi_t chip_drive, targ_drive, peer_drive, bus;
+  scsi_t peer_drive, bus;
 
   always_comb begin
     peer_drive.rst  = pr_rst_i;
@@ -134,32 +141,23 @@ module tb_top #(
   assign bus_data_o = bus.data;
   assign bus_dbp_o  = bus.dbp;
 
-  wish5380 #(
+  wish5380_wb #(
     .CLK_PERIOD_PS (CLK_PERIOD_PS)
   ) u_dut (
-    .clk_i   (clk_i),
-    .rst_i   (rst_i),
-    .stb_i   (dut_stb_i),
-    .we_i    (dut_we_i),
-    .dack_i  (dut_dack_i),
-    .adr_i   (dut_adr_i),
-    .dat_i   (dut_dat_i),
-    .dat_o   (dut_dat_o),
-    .eop_i   (dut_eop_i),
-    .drq_o   (dut_drq_o),
-    .irq_o   (dut_irq_o),
-    .drive_o (chip_drive),
-    .bus_i   (bus)
-  );
-
-  scsi_targ #(
-    .CLK_PERIOD_PS (CLK_PERIOD_PS),
-    .TARGET_ID     (0)
-  ) u_targ (
     .clk_i        (clk_i),
     .rst_i        (rst_i),
-    .drive_o      (targ_drive),
-    .bus_i        (bus),
+    .wb_cyc_i     (wbs_cyc_i),
+    .wb_stb_i     (wbs_stb_i),
+    .wb_we_i      (wbs_we_i),
+    .wb_sel_i     (wbs_sel_i),
+    .wb_adr_i     (wbs_adr_i),
+    .wb_dat_i     (wbs_dat_i),
+    .wb_dat_o     (wbs_dat_o),
+    .wb_ack_o     (wbs_ack_o),
+    .wb_err_o     (wbs_err_o),
+    .irq_o        (dut_irq_o),
+    .drq_o        (dut_drq_o),
+    .eop_i        (dut_eop_i),
     .blk_start_o  (tg_blk_start_o),
     .blk_we_o     (tg_blk_we_o),
     .blk_lba_o    (tg_blk_lba_o),
@@ -170,14 +168,9 @@ module tb_top #(
     .bbuf_we_i    (tg_bbuf_we_i),
     .bbuf_addr_i  (tg_bbuf_addr_i),
     .bbuf_wdata_i (tg_bbuf_wdata_i),
-    .bbuf_rdata_o (tg_bbuf_rdata_o)
-  );
-
-  scsi_fabric u_fabric (
-    .a_i   (chip_drive),
-    .b_i   (targ_drive),
-    .c_i   (peer_drive),
-    .bus_o (bus)
+    .bbuf_rdata_o (tg_bbuf_rdata_o),
+    .bus_o        (bus),
+    .peer_i       (peer_drive)
   );
 
   sci_regs u_regs (

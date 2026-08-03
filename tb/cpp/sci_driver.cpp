@@ -2,6 +2,8 @@
 
 #include "sci_driver.h"
 
+#include <algorithm>
+
 namespace wtb {
 
 SciDriver::SciDriver(Sim& sim, RegPort port, uint8_t host_id)
@@ -137,6 +139,50 @@ size_t SciDriver::pio(uint8_t phase, const uint8_t* out, uint8_t* in,
   return i;
 }
 
+size_t SciDriver::pdma(uint8_t phase, const uint8_t* out, uint8_t* in,
+                       size_t n) {
+  const bool is_in = (phase & sci::TCR_IO) != 0;
+
+  // NCR5380_transfer_dma: the phase into the Target Command Register, then
+  // DMA mode with MONITOR BUSY so an unexpected disconnection is noticed.
+  w(sci::R_TCR, phase);
+  w(sci::R_MR, uint8_t(sci::MR_DMA | sci::MR_MON_BSY));
+  if (is_in) {
+    w(sci::R_ICR, 0);
+    w(sci::R_SDIR, 0);
+  } else {
+    w(sci::R_ICR, sci::ICR_DATA);
+    w(sci::R_SDS, 0);
+  }
+
+  size_t done = 0;
+  while (done < n) {
+    size_t chunk = std::min(pdma_width, n - done);
+    if (chunk == 3) chunk = 2;   // a bus cycle moves one, two or four
+
+    // macscsi_wait_for_drq, which gives up on a phase change or an interrupt
+    // rather than waiting for a byte that is never coming.
+    uint8_t basr = r(sci::R_BSR);
+    if (!(basr & sci::BSR_PHASE_MATCH)) break;
+    if (basr & sci::BSR_IRQ) break;
+
+    bool ok = is_in ? port_.pdma_read(in + done, chunk)
+                    : port_.pdma_write(out + done, chunk);
+    if (!ok) {
+      err_ = "the pseudo-DMA window bus errored after " +
+             std::to_string(done) + " bytes";
+      break;
+    }
+    done += chunk;
+  }
+
+  // "A DMA operation may be halted at any time simply by resetting the DMA
+  // MODE bit" (p. 25), which is how both drivers end a transfer.
+  w(sci::R_MR, 0);
+  w(sci::R_ICR, 0);
+  return done;
+}
+
 SciDriver::Result SciDriver::execute(uint8_t target, const Bytes& cdb,
                                      const Bytes& data_out, size_t max_in,
                                      uint8_t lun) {
@@ -189,8 +235,11 @@ SciDriver::Result SciDriver::execute(uint8_t target, const Bytes& cdb,
           err_ = "the target asked for data the test did not supply";
           return res;
         }
-        out_pos += pio(sci::PH_DATA_OUT, data_out.data() + out_pos, nullptr,
-                       left);
+        out_pos += use_pdma
+                       ? pdma(sci::PH_DATA_OUT, data_out.data() + out_pos,
+                              nullptr, left)
+                       : pio(sci::PH_DATA_OUT, data_out.data() + out_pos,
+                             nullptr, left);
         break;
       }
 
@@ -205,7 +254,9 @@ SciDriver::Result SciDriver::execute(uint8_t target, const Bytes& cdb,
           return res;
         }
         Bytes chunk(left);
-        size_t got = pio(sci::PH_DATA_IN, nullptr, chunk.data(), left);
+        size_t got = use_pdma
+                         ? pdma(sci::PH_DATA_IN, nullptr, chunk.data(), left)
+                         : pio(sci::PH_DATA_IN, nullptr, chunk.data(), left);
         res.data.insert(res.data.end(), chunk.begin(), chunk.begin() + got);
         break;
       }

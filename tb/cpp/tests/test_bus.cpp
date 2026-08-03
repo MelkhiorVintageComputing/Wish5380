@@ -374,9 +374,21 @@ TEST(bus_loss_of_busy_takes_the_bus_away) {
   CHECK_EQ(uint8_t(env.chip_read(sci::R_MR) & sci::MR_DMA), 0);
   CHECK_EQ(env.bus_csb(), 0);
 
-  // Reading register 7 empties the latch, along with the interrupt (p. 17).
+  // BUSY ERROR is a *level*-sensitive latch: "set whenever the MONITOR BUSY
+  // bit is true and BSY is false" (p. 16).  Reading register 7 empties it and
+  // the condition immediately fills it again, so acknowledging alone achieves
+  // nothing.
+  (void)env.chip_read(sci::R_RPI);
+  CHECK_MSG(env.chip_read(sci::R_BSR) & sci::BSR_BUSY_ERR,
+            "the latch cleared while BSY was still false and MONITOR BUSY set");
+
+  // Which is why NCR5380_intr writes the Mode Register before it reads
+  // register 7: clearing MONITOR BUSY disarms the condition, and only then
+  // does the acknowledge stick.
+  env.chip_write(sci::R_MR, 0);
   (void)env.chip_read(sci::R_RPI);
   CHECK_EQ(uint8_t(env.chip_read(sci::R_BSR) & sci::BSR_BUSY_ERR), 0);
+  CHECK_EQ(env.dut()->dut_irq_o, 0);
 }
 
 TEST(bus_phase_mismatch_interrupts_in_dma_mode) {

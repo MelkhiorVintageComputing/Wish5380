@@ -43,6 +43,14 @@ struct EnvConfig {
   // with.  A host adapter is conventionally 7 and Apple's internal drive 0.
   uint8_t target_id = 0;
   uint8_t host_id = 7;
+
+  // Where the three windows sit inside the slave, stated here independently
+  // of `wb_5380`'s parameters so the two have to be kept in step by hand.
+  // Sixteen bytes between registers is the Mac's `(reg) << 4`.
+  uint32_t reg_base = 0x000;
+  uint32_t reg_stride = 16;
+  uint32_t hsk_base = 0x100;   // pseudo-DMA that waits for DRQ
+  uint32_t dma_base = 0x200;   // pseudo-DMA that does not
 };
 
 class Env {
@@ -61,6 +69,7 @@ class Env {
   Sim& sim() { return *sim_; }
   Disk& disk() { return *disk_; }
   SciDriver& drv() { return *drv_; }
+  WbHost& host() { return *host_; }
   Sim::Clock* sysclk() { return sysclk_; }
   const EnvConfig& cfg() const { return cfg_; }
   const std::string& name() const { return name_; }
@@ -85,14 +94,35 @@ class Env {
   enum Strobe : uint8_t { S_RPI = 1, S_SDS = 2, S_SDTR = 4, S_SDIR = 8 };
   uint8_t last_strobes() const { return strobes_; }
 
-  // ---- the whole chip ----------------------------------------------------
+  // ---- the whole product, through its Wishbone slave ----------------------
   //
-  // The same four accessors against `wish5380` rather than the bare register
-  // file, so a test can drive the part the way a driver does.
+  // A register access is one byte in the register window, which is how every
+  // driver reaches the chip.  These are what the driver model is built on.
   void chip_write(uint8_t adr, uint8_t data);
   uint8_t chip_read(uint8_t adr);
+  // A byte through the pseudo-DMA window that does not wait for DRQ, which is
+  // what a DACK cycle used to be before there was a bus to put it on.
   void chip_write_dack(uint8_t data);
   uint8_t chip_read_dack();
+
+  // ---- the pseudo-DMA windows --------------------------------------------
+  //
+  // `n` is 1, 2 or 4 bytes in one Wishbone cycle, which is a `moveb`, a
+  // `movew` or a `movel` on the machine's side.  The Mac's driver only ever
+  // uses the first two.  `error` is the bus error the handshaking window
+  // raises when the chip does not produce a byte in time - a normal outcome
+  // that `mac_scsi.c` catches with an exception fixup table, not a fault.
+  struct Pdma {
+    Bytes data;
+    bool error = false;
+  };
+  Pdma pdma_read(size_t n, bool handshake = true);
+  Pdma pdma_write(const Bytes& b, bool handshake = true);
+
+  // A raw access, for the tests that are about the decode rather than about
+  // what is behind it.  Returns whether the slave answered with ERR.
+  bool wb_err_on_read(uint32_t byte_adr, uint8_t sel);
+  bool wb_err_on_write(uint32_t byte_adr, uint8_t sel, uint32_t data);
 
   // ---- the peer device on the fabric -------------------------------------
   //
@@ -146,6 +176,7 @@ class Env {
   Peer peer_;
   std::unique_ptr<Disk> disk_;
   std::unique_ptr<SciDriver> drv_;
+  std::unique_ptr<WbHost> host_;
 };
 
 }  // namespace wtb

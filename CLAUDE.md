@@ -83,8 +83,8 @@ expectations from the RTL.
 ### RTL (`src/`)
 
 ```
-wish5380_wb                  Wishbone B4 slave, one clock, irq_o
-├── wb_5380                  machine glue: apertures, byte lanes, pseudo-DMA
+wish5380_wb                  the deliverable: WB B4 slave, one clock, irq_o
+├── wb_5380                  machine glue: three windows, byte lanes, pseudo-DMA
 ├── wish5380                 the part
 │   ├── sci_regs             the eight registers and the port they hide behind
 │   └── sci_bus              arbitration, selection, handshake, interrupts
@@ -92,6 +92,12 @@ wish5380_wb                  Wishbone B4 slave, one clock, irq_o
 └── scsi_targ                a direct-access device; see doc/target.md
     └── blk_sd -> sd_spi     the SD card behind it
 ```
+
+`wish5380_wb` is what `tb_top` instantiates, so **every test reaches the chip
+the way a machine does** - through the Wishbone slave and its register window.
+There is no back door, and adding one would be a mistake: the first bug the
+Wishbone path found was a test that only passed because a direct register
+accessor was faster than a real bus cycle.
 
 `doc/target.md` is the target's own contract: its command set, the three rules
 that are easy to get subtly wrong, and what it deliberately does not do.
@@ -131,6 +137,12 @@ do not "fix" them:
 * **Setting the Mode Register's DMA bit is refused while BSY is false**
   (p. 14).  It is the only write the chip does not take, and the one place
   the register file has to see the bus.
+* **BUSY ERROR is a level-sensitive latch**, "set whenever the MONITOR BUSY
+  bit is true and BSY is false" (p. 16).  Reading register 7 empties it and
+  the condition immediately fills it again, which is why `NCR5380_intr`
+  writes the Mode Register *before* it reads register 7.  Acknowledging alone
+  achieves nothing, and a replica that let the acknowledge stick would make a
+  driver that got the order wrong appear to work.
 * **Arbitration is lost only to another device's SEL** (p. 12).  A driver
   asserts SEL itself while still arbitrating - Linux writes
   `ICR_ASSERT_SEL | ICR_ASSERT_BSY` and clears the Mode Register afterwards -
@@ -139,6 +151,14 @@ do not "fix" them:
   ARBITRATION and nothing else; comparing IDs against the data bus is the
   driver's job, which is why Linux reads Current SCSI Data and tests it
   against `id_higher_mask`.
+
+One on the glue's side, where there is no silicon to be faithful to and the
+choice had to be argued instead:
+
+* **A wide access to the register window answers `ERR_O`.**  Every driver
+  reaches a register with a byte access; what a board would really do with a
+  `movew` there is its decoder's business.  A fault says so, where serving one
+  lane and dropping the rest would not.  `doc/interface.md` records it.
 
 And on the target's side, three of the same kind:
 
@@ -205,9 +225,9 @@ leaf means adding its ports here.
 Prefixes are meaningful and ordered by trust: `infra_` checks the testbench
 itself, `layout_` checks our constants against the datasheet and both driver
 headers, `unit_` checks RTL leaves against software models, `reg_` the
-register file, `bus_` the SCSI engine, `sd_` the card back end, `sys_` the
-whole thing the way a driver drives it - arbitrate, select, command, data,
-status, message, bus free.  If an `infra_` test breaks, no `sys_`
+register file, `bus_` the SCSI engine, `wb_` the machine glue and its three
+windows, `sd_` the card back end, `sys_` the whole thing the way a driver
+drives it - arbitrate, select, command, data, status, message, bus free.  If an `infra_` test breaks, no `sys_`
 result means anything.
 
 `TEST(name)` must pass.  `TEST_PENDING(name, "reason")` runs, is expected to

@@ -34,6 +34,11 @@ namespace wtb {
 struct RegPort {
   std::function<void(uint8_t, uint8_t)> write;
   std::function<uint8_t(uint8_t)> read;
+  // The pseudo-DMA window, `n` bytes in one bus cycle.  False means the bus
+  // errored - which on the Mac is how the hardware says the chip did not
+  // produce a byte in time, and is a normal outcome rather than a fault.
+  std::function<bool(uint8_t*, size_t)> pdma_read;
+  std::function<bool(const uint8_t*, size_t)> pdma_write;
 };
 
 class SciDriver {
@@ -54,6 +59,12 @@ class SciDriver {
   // output phase and `out` null for an input one.
   size_t pio(uint8_t phase, const uint8_t* out, uint8_t* in, size_t n);
 
+  // The same, through the pseudo-DMA window: the chip automates the REQ/ACK
+  // handshake and the aperture waits for DRQ, so the host moves bytes with
+  // ordinary loads and stores.  This is `NCR5380_transfer_dma` followed by
+  // `macscsi_pdma_recv` or `macscsi_pdma_send`.
+  size_t pdma(uint8_t phase, const uint8_t* out, uint8_t* in, size_t n);
+
   // ---- a whole command ----------------------------------------------------
 
   struct Result {
@@ -66,6 +77,12 @@ class SciDriver {
   Result execute(uint8_t target, const Bytes& cdb,
                  const Bytes& data_out = Bytes(), size_t max_in = 0,
                  uint8_t lun = 0);
+
+  // Whether the data phases go through the pseudo-DMA window, and how many
+  // bytes each bus cycle moves.  Two is the Mac's `movew`, which is the
+  // widest access its driver makes.
+  bool use_pdma = false;
+  size_t pdma_width = 2;
 
   const std::string& last_error() const { return err_; }
 

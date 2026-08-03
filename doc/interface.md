@@ -195,12 +195,29 @@ device driving nothing is a device that is not there, which is exactly what an
 open-collector bus means by it.  A second target means widening this and
 nothing else.
 
+## Three questions, now answered
+
+* **A wide access to the register window answers `ERR_O`.**  A register is one
+  byte and every driver reaches it with one; what real hardware would do with
+  a `movew` there is a property of the board's decoder rather than of the
+  chip, so there is nothing to be faithful to.  A fault says so where quietly
+  serving one lane and dropping the rest would not.
+* **`DRQ` and `EOP` are brought out of `wish5380_wb`**, because they are the
+  part's own pins and a board with a real DMA controller in front of the chip
+  needs both.  The Mac drives neither: its pseudo-DMA uses the DRQ that
+  `wb_5380` already watches internally, and it has no End of Process at all.
+  `READY` is not brought out, because it belongs to block mode DMA, which
+  nothing here uses.
+* **The private SCSI bus is brought out too**, as `bus_o` to watch and
+  `peer_i` to drive.  An interconnect that cannot be seen cannot be debugged
+  on hardware either, and an integrator will want it on a logic analyser.  Tie
+  `peer_i` to zero and leave `bus_o` unconnected in a real design.
+
 ## What is not settled yet
 
-* Whether `wb_5380` should let a 16- or 32-bit access to the register window
-  through at all, or answer `ERR_O`.  The Mac only ever does byte accesses
-  there; the question is what a *wrong* driver should see.
 * How many targets the fabric carries.  One is enough to boot; a second would
   exercise arbitration properly.
-* Whether the part's DRQ, EOP and READY pins are brought out of `wish5380_wb`
-  for a real external DMA controller, or stay inside for `wb_5380` alone.
+* Whether a build for a machine other than the Mac - a generic ISA card, with
+  `REG_STRIDE` of one and no pseudo-DMA window - should be a second
+  configuration the regression runs, the way the sibling project runs its
+  whole suite against both MII and GMII.

@@ -22,11 +22,11 @@ there is a card slot.
 
 ## Status
 
-A driver can now find the disk and read and write it.  The chip is done, the
-target answers the command set a vintage driver needs, and the two talk to
-each other over the fabric; what is missing is the Wishbone front end that
-would let a real machine reach the registers, and the SD card behind the
-block interface.
+A machine can now reach the whole thing.  The Wishbone slave presents the
+three windows a Macintosh expects, a driver arbitrates and selects through
+them, and blocks move either a byte at a time in programmed I/O or through
+the pseudo-DMA aperture the Mac uses for speed.  What is missing is the SD
+card behind the block interface, and co-simulation against a real driver.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
@@ -41,11 +41,13 @@ block interface.
 | SCSI-1 command set, and the sense it reports     | done, tested  |
 | block back end interface, and a model of one     | done, tested  |
 | driver model, following `NCR5380.c` (`sci_driver`) | done, tested |
-| Wishbone front end and pseudo-DMA (`wb_5380`)    | not started   |
+| Wishbone slave and the Mac's three windows (`wb_5380`) | done, tested |
+| pseudo-DMA, with the bus error the Mac relies on | done, tested  |
+| the deliverable top level (`wish5380_wb`)        | done, tested  |
 | SD card back end (`blk_sd`, `sd_spi`)            | not started   |
 | co-simulation against a real driver              | not started   |
 
-67 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
+82 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
 delays are derived from the clock rather than written down, so the regression
 checks whichever clock it was built for.
 

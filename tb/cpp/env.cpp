@@ -40,11 +40,6 @@ void Env::bind_models() {
   Vtb_top* d = dut_.get();
 
   d->rst_i = 1;
-  d->dut_stb_i = 0;
-  d->dut_we_i = 0;
-  d->dut_dack_i = 0;
-  d->dut_adr_i = 0;
-  d->dut_dat_i = 0;
   d->dut_eop_i = 0;
   drive_peer(Peer());
   // The leaf register file is given a connected bus by default: most of the
@@ -73,6 +68,23 @@ void Env::bind_models() {
   d->rg_atn_i = 0;
   d->rg_ack_i = 0;
 
+  // The host CPU, poking the slave.
+  WbMasterPorts mp;
+  mp.cyc = &d->wbs_cyc_i;
+  mp.stb = &d->wbs_stb_i;
+  mp.we = &d->wbs_we_i;
+  mp.sel = &d->wbs_sel_i;
+  mp.adr = &d->wbs_adr_i;
+  mp.dat_w = &d->wbs_dat_i;
+  mp.dat_r = &d->wbs_dat_o;
+  mp.ack = &d->wbs_ack_o;
+  mp.err = &d->wbs_err_o;
+  host_.reset(new WbHost(*sim_, sysclk_, mp));
+  // The host model's timeout is a bus watchdog and not a driver's wait, so it
+  // has to sit above the slave's own worst case: the handshaking window will
+  // hold a cycle for its whole DRQ timeout before answering with ERR.
+  host_->timeout_ps = 200 * US;
+
   // The card behind the target.
   DiskPorts dp;
   dp.start = &d->tg_blk_start_o;
@@ -92,6 +104,15 @@ void Env::bind_models() {
   RegPort rp;
   rp.write = [this](uint8_t a, uint8_t v) { chip_write(a, v); };
   rp.read = [this](uint8_t a) { return chip_read(a); };
+  rp.pdma_read = [this](uint8_t* buf, size_t n) {
+    Pdma p = pdma_read(n, /*handshake=*/true);
+    if (p.error) return false;
+    for (size_t i = 0; i < n && i < p.data.size(); i++) buf[i] = p.data[i];
+    return true;
+  };
+  rp.pdma_write = [this](const uint8_t* buf, size_t n) {
+    return !pdma_write(Bytes(buf, buf + n), /*handshake=*/true).error;
+  };
   drv_.reset(new SciDriver(*sim_, rp, cfg_.host_id));
 
   sim_->eval();
@@ -184,54 +205,63 @@ void Env::reg_write_dack(uint8_t data) {
 // The whole chip.
 // ---------------------------------------------------------------------------
 
+// Byte address of register `adr`, and which lane of its word it lands in.
+// The lane is the low two bits of the byte address, which is the Wishbone
+// little-endian convention `wb_5380` decodes against.
 void Env::chip_write(uint8_t adr, uint8_t data) {
-  dut_->dut_stb_i = 1;
-  dut_->dut_we_i = 1;
-  dut_->dut_dack_i = 0;
-  dut_->dut_adr_i = adr & 7;
-  dut_->dut_dat_i = data;
-  settle(*sim_, sysclk_);
-  dut_->dut_stb_i = 0;
-  dut_->dut_we_i = 0;
-  sim_->eval();
+  uint32_t ba = cfg_.reg_base + uint32_t(adr & 7) * cfg_.reg_stride;
+  uint8_t lane = ba & 3;
+  host_->write32(ba, uint32_t(data) << (8 * lane), uint8_t(1u << lane));
 }
 
 uint8_t Env::chip_read(uint8_t adr) {
-  dut_->dut_stb_i = 1;
-  dut_->dut_we_i = 0;
-  dut_->dut_dack_i = 0;
-  dut_->dut_adr_i = adr & 7;
-  sim_->eval();
-  uint8_t v = dut_->dut_dat_o;
-  settle(*sim_, sysclk_);
-  dut_->dut_stb_i = 0;
-  sim_->eval();
-  return v;
+  uint32_t ba = cfg_.reg_base + uint32_t(adr & 7) * cfg_.reg_stride;
+  uint8_t lane = ba & 3;
+  uint32_t v = host_->read32(ba, uint8_t(1u << lane));
+  return uint8_t((v >> (8 * lane)) & 0xff);
 }
 
 void Env::chip_write_dack(uint8_t data) {
-  dut_->dut_stb_i = 1;
-  dut_->dut_we_i = 1;
-  dut_->dut_dack_i = 1;
-  dut_->dut_dat_i = data;
-  settle(*sim_, sysclk_);
-  dut_->dut_stb_i = 0;
-  dut_->dut_we_i = 0;
-  dut_->dut_dack_i = 0;
-  sim_->eval();
+  Pdma p = pdma_write(Bytes{data}, /*handshake=*/false);
+  (void)p;
 }
 
 uint8_t Env::chip_read_dack() {
-  dut_->dut_stb_i = 1;
-  dut_->dut_we_i = 0;
-  dut_->dut_dack_i = 1;
-  sim_->eval();
-  uint8_t v = dut_->dut_dat_o;
-  settle(*sim_, sysclk_);
-  dut_->dut_stb_i = 0;
-  dut_->dut_dack_i = 0;
-  sim_->eval();
-  return v;
+  Pdma p = pdma_read(1, /*handshake=*/false);
+  return p.data.empty() ? 0 : p.data[0];
+}
+
+Env::Pdma Env::pdma_read(size_t n, bool handshake) {
+  Pdma out;
+  uint32_t ba = handshake ? cfg_.hsk_base : cfg_.dma_base;
+  uint8_t sel = uint8_t((1u << n) - 1);
+  uint32_t v = host_->read32(ba, sel);
+  out.error = host_->last_error() || host_->last_timeout();
+  if (!out.error) {
+    for (size_t i = 0; i < n; i++) out.data.push_back(uint8_t(v >> (8 * i)));
+  }
+  return out;
+}
+
+Env::Pdma Env::pdma_write(const Bytes& b, bool handshake) {
+  Pdma out;
+  uint32_t ba = handshake ? cfg_.hsk_base : cfg_.dma_base;
+  uint8_t sel = uint8_t((1u << b.size()) - 1);
+  uint32_t v = 0;
+  for (size_t i = 0; i < b.size(); i++) v |= uint32_t(b[i]) << (8 * i);
+  host_->write32(ba, v, sel);
+  out.error = host_->last_error() || host_->last_timeout();
+  return out;
+}
+
+bool Env::wb_err_on_read(uint32_t byte_adr, uint8_t sel) {
+  (void)host_->read32(byte_adr, sel);
+  return host_->last_error() || host_->last_timeout();
+}
+
+bool Env::wb_err_on_write(uint32_t byte_adr, uint8_t sel, uint32_t data) {
+  host_->write32(byte_adr, data, sel);
+  return host_->last_error() || host_->last_timeout();
 }
 
 // ---------------------------------------------------------------------------
