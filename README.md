@@ -48,9 +48,12 @@ and those blocks come off an SD card in its slot.
 | the whole design with a card in it (`wish5380_sd`) | done, tested |
 | co-simulation against Linux's own driver         | done, running |
 
-95 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
-delays are derived from the clock rather than written down, so the regression
-checks whichever clock it was built for.
+95 tests pass on each of two boards - the Macintosh, with its registers
+sixteen bytes apart, and a generic ISA card with them one byte apart - and at
+7.8 MHz, 50 MHz and 125 MHz.  Nothing is pending.  The part's delays are
+derived from the clock rather than written down, and the register spacing is
+an elaboration parameter, so the regression checks whichever build it was
+given.
 
 An i386 Linux, unmodified, probes the design with its own `g_NCR5380`,
 attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
@@ -62,7 +65,9 @@ Needs Verilator (5.x), a C++ compiler and GNU make; Icarus Verilog and Yosys
 are optional extra checks.
 
 ```sh
-make test               # build and run the whole regression
+make test               # build and run the whole regression (the Macintosh)
+make test BOARD=isa     # the same tests against a generic ISA card
+make test-all           # both boards, which is what CI runs
 make test T=reg         # just the tests whose name contains "reg"
 make wave T=<test>      # run with tracing, waveform in build/waves/
 make lint               # Verilator lint, -Wall, must stay clean

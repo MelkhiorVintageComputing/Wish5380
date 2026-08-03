@@ -217,7 +217,11 @@ nothing else.
 
 * How many targets the fabric carries.  One is enough to boot; a second would
   exercise arbitration properly.
-* Whether a build for a machine other than the Mac - a generic ISA card, with
-  `REG_STRIDE` of one and no pseudo-DMA window - should be a second
-  configuration the regression runs, the way the sibling project runs its
-  whole suite against both MII and GMII.
+
+The second configuration is settled: `make test-all` runs the whole suite
+against both boards, `BOARD=mac` and `BOARD=isa`, the way the sibling project
+runs its against both MII and GMII.  The two differ in `REG_STRIDE` alone,
+which is what changes the decode.  The pseudo-DMA windows stay addressable in
+the ISA build even though no generic-ISA driver looks there - Linux's own boot
+line says `NO_PSEUDO_DMA` - because taking them away would only take away
+coverage.

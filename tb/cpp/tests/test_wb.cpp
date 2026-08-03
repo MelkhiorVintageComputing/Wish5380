@@ -45,28 +45,47 @@ void withdraw(Env& env) {
   env.tick(3);
 }
 
+// The byte address of a register, and a byte written straight to one, with
+// the lane arithmetic written out rather than borrowed from the accessor -
+// which is the whole point of the tests below.
+uint32_t reg_at(Env& env, uint8_t reg) {
+  return env.cfg().reg_base + uint32_t(reg) * env.cfg().reg_stride;
+}
+
+void raw_write(Env& env, uint32_t byte_adr, uint8_t v) {
+  uint8_t lane = byte_adr & 3;
+  env.host().write32(byte_adr, uint32_t(v) << (8 * lane), uint8_t(1u << lane));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // The register window
 // ---------------------------------------------------------------------------
 
-TEST(wb_registers_are_sixteen_bytes_apart) {
+TEST(wb_registers_are_a_stride_apart) {
   env.power_on_reset();
   // `#define NCR5380_read(reg) in_8(hostdata->io + ((reg) << 4))`, mac_scsi.c
-  // line 38.  The Mode Register is register 2, so byte offset 0x20.
+  // line 38, is the Mac's stride of sixteen; `inb(base + reg)` in
+  // g_NCR5380.c is the generic ISA card's stride of one.  The Mode Register
+  // is register 2 either way.
+  //
   // The pattern is the four Mode bits that only enable things.  DMA MODE is
   // refused with no target connected, MONITOR BUSY would interrupt on an
   // empty bus and ARBITRATE would start arbitrating; this test is about
   // where the register lives, not about any of that.
-  env.host().write32(env.cfg().reg_base + 0x20, 0x000000b8, 0x1);
+  raw_write(env, reg_at(env, sci::R_MR), 0xb8);
   CHECK_EQ(env.chip_read(sci::R_MR), 0xb8);
 
-  // ...and the fifteen bytes after it are not the Mode Register.  A stride
-  // that had collapsed to one would put the Target Command Register here.
-  CHECK_MSG(env.wb_err_on_write(env.cfg().reg_base + 0x21, 0x2, 0x00003000),
-            "a byte inside a register's stride was decoded as a register");
-  CHECK_EQ(env.chip_read(sci::R_MR), 0xb8);
+  // ...and the bytes between one register and the next are not registers.
+  // Only a board with a stride to speak of has any: on a generic ISA card
+  // the byte after the Mode Register is the Target Command Register, and
+  // rightly so.
+  if (env.cfg().reg_stride > 1) {
+    CHECK_MSG(env.wb_err_on_write(reg_at(env, sci::R_MR) + 1, 0x2, 0x00003000),
+              "a byte inside a register's stride was decoded as a register");
+    CHECK_EQ(env.chip_read(sci::R_MR), 0xb8);
+  }
 }
 
 TEST(wb_each_of_the_eight_registers_has_its_own_address) {
@@ -79,10 +98,10 @@ TEST(wb_each_of_the_eight_registers_has_its_own_address) {
   // MONITOR BUSY interrupts on a bus with nothing on it, and DMA MODE is
   // refused outright - so the value here is the four bits that only enable
   // things: BLOCK MODE, parity checking, and the two interrupt enables.
-  env.host().write32(env.cfg().reg_base + 2 * 16, 0x000000b8, 0x1);  // Mode
-  env.host().write32(env.cfg().reg_base + 3 * 16, 0x0000000f, 0x1);  // Target
-  env.host().write32(env.cfg().reg_base + 4 * 16, 0x00000055, 0x1);  // Sel Enb
-  env.host().write32(env.cfg().reg_base + 1 * 16, 0x00000012, 0x1);  // Init Cmd
+  raw_write(env, reg_at(env, sci::R_MR), 0xb8);   // Mode
+  raw_write(env, reg_at(env, sci::R_TCR), 0x0f);  // Target Command
+  raw_write(env, reg_at(env, sci::R_SER), 0x55);  // Select Enable
+  raw_write(env, reg_at(env, sci::R_ICR), 0x12);  // Initiator Command
   CHECK_EQ(env.chip_read(sci::R_MR), 0xb8);
   CHECK_EQ(env.chip_read(sci::R_TCR), 0x0f);
   CHECK_EQ(env.chip_read(sci::R_ICR), 0x12);
@@ -96,7 +115,7 @@ TEST(wb_a_wide_access_to_the_register_window_is_a_bus_error) {
   // and a fault says so where quietly serving one lane would not.
   CHECK(env.wb_err_on_read(env.cfg().reg_base, 0x3));
   CHECK(env.wb_err_on_read(env.cfg().reg_base, 0xf));
-  CHECK(env.wb_err_on_write(env.cfg().reg_base + 0x20, 0x3, 0));
+  CHECK(env.wb_err_on_write(env.cfg().reg_base, 0xc, 0));
 
   // The chip was not touched by any of them.
   CHECK_EQ(env.chip_read(sci::R_MR), 0);
@@ -104,6 +123,9 @@ TEST(wb_a_wide_access_to_the_register_window_is_a_bus_error) {
 
 TEST(wb_an_address_in_no_window_is_a_bus_error) {
   env.power_on_reset();
+  // The byte just past the last register, whichever board this is: 0x80 with
+  // the Mac's stride, 0x08 with a generic ISA card's.
+  CHECK(env.wb_err_on_read(reg_at(env, 8), 0x1));
   // Between the register window and the first pseudo-DMA one.
   CHECK(env.wb_err_on_read(0x80, 0x1));
   // Past the last one.

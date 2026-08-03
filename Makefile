@@ -18,6 +18,25 @@ YOSYS     ?= yosys
 TOP       := tb_top
 BUILD     := build
 
+# BOARD selects the machine glue the whole build is configured for:
+#   make test              the Macintosh, registers sixteen bytes apart
+#   make test BOARD=isa    a generic ISA card, registers one byte apart
+#
+# The two are separate builds because the spacing is an elaboration parameter,
+# and it is the one thing that changes the decode: with a stride of one the
+# register window is eight bytes rather than a hundred and twenty-eight, and
+# the byte a register lands in is the low two bits of its own address rather
+# than always zero.  Linux's g_NCR5380 drives the second with `board=0`, which
+# is what the co-simulation boots against.
+BOARD     ?= mac
+ifeq ($(BOARD),mac)
+REG_STRIDE := 16
+else ifeq ($(BOARD),isa)
+REG_STRIDE := 1
+else
+$(error BOARD must be mac or isa)
+endif
+
 # The system clock the core is built for, in picoseconds.  The NCR 5380 is a
 # clockless part (p. 18): its bus free filter, bus settle delay and bus clear
 # delay come out of gate propagation in the silicon.  A clocked replica has to
@@ -34,7 +53,7 @@ BUS_FREE_TICKS   := $(shell expr 400000 / $(SYS_PERIOD_PS) + 1)
 BUS_SETTLE_TICKS := $(shell expr 400000 / $(SYS_PERIOD_PS) + 1)
 BUS_CLEAR_TICKS  := $(shell expr 800000 / $(SYS_PERIOD_PS) + 1)
 
-OBJDIR    := $(BUILD)/obj_dir
+OBJDIR    := $(BUILD)/obj_dir_$(BOARD)
 BIN       := $(OBJDIR)/wish5380_tb
 
 RTL_DIR   := src
@@ -68,11 +87,12 @@ FLAGS ?=
 VFLAGS := --cc --exe --build --trace -Wall \
           --top-module $(TOP) \
           -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
+          -GREG_STRIDE=$(REG_STRIDE) \
           -Mdir $(OBJDIR) \
           -o wish5380_tb \
-          -CFLAGS "-I$(CURDIR)/$(TB_CPP) -DSYS_PERIOD_PS=$(SYS_PERIOD_PS) -O2 -Wall -Wno-unused-parameter"
+          -CFLAGS "-I$(CURDIR)/$(TB_CPP) -DSYS_PERIOD_PS=$(SYS_PERIOD_PS) -DREG_STRIDE=$(REG_STRIDE) -O2 -Wall -Wno-unused-parameter"
 
-.PHONY: all test wave lint lint-icarus synth list clean
+.PHONY: all test test-all wave lint lint-icarus synth list clean
 
 all: $(BIN)
 
@@ -82,6 +102,11 @@ $(BIN): $(RTL) $(TB_SV) $(CPP_SRCS) $(CPP_HDRS) Makefile
 
 test: $(BIN)
 	$(BIN) $(FLAGS) $(T)
+
+# Both boards, which is what CI runs.
+test-all:
+	$(MAKE) test BOARD=mac
+	$(MAKE) test BOARD=isa
 
 wave: $(BIN)
 	$(BIN) --trace $(FLAGS) $(T)
@@ -93,8 +118,10 @@ list: $(BIN)
 lint:
 	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
 	  --top-module wish5380_sd $(RTL)
-	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
-	  --top-module $(TOP) $(RTL) $(TB_SV)
+	$(VERILATOR) --lint-only -Wall -GREG_STRIDE=16 \
+	  -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) --top-module $(TOP) $(RTL) $(TB_SV)
+	$(VERILATOR) --lint-only -Wall -GREG_STRIDE=1 \
+	  -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) --top-module $(TOP) $(RTL) $(TB_SV)
 
 lint-icarus:
 	$(IVERILOG) -g2012 -t null -o /dev/null $(RTL) $(TB_SV)

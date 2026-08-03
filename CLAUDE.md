@@ -48,7 +48,9 @@ be wrong.
 
 ```sh
 make                    # build the testbench
-make test               # build and run the whole regression
+make test               # build and run the whole regression (the Macintosh)
+make test BOARD=isa     # the same tests against a generic ISA card
+make test-all           # both boards, which is what CI runs
 make test T=reg         # only tests whose name contains "reg"
 make test FLAGS=-v      # show test notes and why pending tests failed
 make wave T=<test>      # run with tracing -> build/waves/<test>.vcd
@@ -59,8 +61,17 @@ make synth              # Yosys elaboration check of every module
 make clean
 ```
 
-`make test` must stay green.  Green means 0 failed; pending tests are expected
-failures and do not break the build.
+`make test` must stay green on **both boards**.  Green means 0 failed; pending
+tests are expected failures and do not break the build.
+
+`BOARD` is the register spacing, and it is the one thing that changes the
+decode: sixteen bytes apart for the Macintosh, one for a generic ISA card.
+With a stride of one the register window is eight bytes rather than a hundred
+and twenty-eight, and the byte a register lands in is the low two bits of its
+own address rather than always zero.  Linux's `g_NCR5380` drives the second
+with `board=0`, which is what the co-simulation boots against.  A test that
+needs the spacing asks `env.cfg().reg_stride`; one that hard-codes sixteen is
+a bug.
 
 Work proceeds test first: pick a pending test, implement the RTL, drop the
 marker.  The pending list is the project todo list - prefer adding a pending

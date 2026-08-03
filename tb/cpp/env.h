@@ -34,6 +34,12 @@ namespace wtb {
 #define SYS_PERIOD_PS 20000
 #endif
 
+// Bytes between one register and the next, set by the Makefile's BOARD.  The
+// same number gives the RTL its parameter, so the two cannot drift.
+#ifndef REG_STRIDE
+#define REG_STRIDE 16
+#endif
+
 struct EnvConfig {
   u64 sys_period_ps = u64(SYS_PERIOD_PS);
   // The card behind the target, in 512-byte blocks.  Two thousand and
@@ -49,7 +55,7 @@ struct EnvConfig {
   // of `wb_5380`'s parameters so the two have to be kept in step by hand.
   // Sixteen bytes between registers is the Mac's `(reg) << 4`.
   uint32_t reg_base = 0x000;
-  uint32_t reg_stride = 16;
+  uint32_t reg_stride = REG_STRIDE;
   uint32_t hsk_base = 0x100;   // pseudo-DMA that waits for DRQ
   uint32_t dma_base = 0x200;   // pseudo-DMA that does not
 

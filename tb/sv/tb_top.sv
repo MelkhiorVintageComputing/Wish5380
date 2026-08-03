@@ -14,7 +14,11 @@
 // itself, and both reference drivers depend on seeing their own BSY.
 
 module tb_top #(
-  parameter int CLK_PERIOD_PS = 20000
+  parameter int CLK_PERIOD_PS = 20000,
+  // Bytes between one register and the next: sixteen for the Macintosh, one
+  // for a generic ISA card.  Both instances below take the same one, so a
+  // build is a board rather than a mixture.
+  parameter int REG_STRIDE = 16
 ) (
   input  logic clk_i,
   input  logic rst_i,
@@ -166,7 +170,8 @@ module tb_top #(
   assign bus_dbp_o  = bus.dbp;
 
   wish5380_wb #(
-    .CLK_PERIOD_PS (CLK_PERIOD_PS)
+    .CLK_PERIOD_PS (CLK_PERIOD_PS),
+    .REG_STRIDE    (REG_STRIDE)
   ) u_dut (
     .clk_i        (clk_i),
     .rst_i        (rst_i),
@@ -208,7 +213,8 @@ module tb_top #(
   assign sd_bus_bsy_o = sd_bus.bsy;
 
   wish5380_sd #(
-    .CLK_PERIOD_PS (CLK_PERIOD_PS)
+    .CLK_PERIOD_PS (CLK_PERIOD_PS),
+    .REG_STRIDE    (REG_STRIDE)
   ) u_sd (
     .clk_i     (clk_i),
     .rst_i     (rst_i),
