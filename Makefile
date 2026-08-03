@@ -42,14 +42,17 @@ TB_SV_DIR := tb/sv
 TB_CPP    := tb/cpp
 
 RTL       := $(RTL_DIR)/wish5380_pkg.sv \
-             $(RTL_DIR)/sci_regs.sv
+             $(RTL_DIR)/sci_regs.sv \
+             $(RTL_DIR)/sci_bus.sv \
+             $(RTL_DIR)/scsi_fabric.sv \
+             $(RTL_DIR)/wish5380.sv
 TB_SV     := $(TB_SV_DIR)/tb_top.sv
 CPP_SRCS  := $(wildcard $(TB_CPP)/*.cpp) $(wildcard $(TB_CPP)/tests/*.cpp)
 CPP_HDRS  := $(wildcard $(TB_CPP)/*.h)
 
 # Modules Yosys elaborates one at a time, as a third opinion after Verilator
 # and Icarus.  Kept explicit so a module that stops elaborating is noticed.
-SYNTH_TOPS := sci_regs
+SYNTH_TOPS := sci_regs sci_bus scsi_fabric wish5380
 
 # Tests to run, empty means all.  Pass extra runner flags in FLAGS.
 T     ?=
@@ -57,6 +60,7 @@ FLAGS ?=
 
 VFLAGS := --cc --exe --build --trace -Wall \
           --top-module $(TOP) \
+          -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
           -Mdir $(OBJDIR) \
           -o wish5380_tb \
           -CFLAGS "-I$(CURDIR)/$(TB_CPP) -DSYS_PERIOD_PS=$(SYS_PERIOD_PS) -O2 -Wall -Wno-unused-parameter"
@@ -80,7 +84,10 @@ list: $(BIN)
 	@$(BIN) --list
 
 lint:
-	$(VERILATOR) --lint-only -Wall --top-module $(TOP) $(RTL) $(TB_SV)
+	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
+	  --top-module wish5380 $(RTL)
+	$(VERILATOR) --lint-only -Wall -GCLK_PERIOD_PS=$(SYS_PERIOD_PS) \
+	  --top-module $(TOP) $(RTL) $(TB_SV)
 
 lint-icarus:
 	$(IVERILOG) -g2012 -t null -o /dev/null $(RTL) $(TB_SV)

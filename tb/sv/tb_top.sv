@@ -5,10 +5,54 @@
 // It wires the device under test plus every leaf module that has a unit test,
 // so one binary covers both levels and there is no second build to keep in
 // step.  Adding a unit-tested leaf means adding its ports here.
+//
+// The chip is joined to the fabric together with a peer device the testbench
+// drives signal by signal.  That closes the loop the real bus closes: the
+// chip reads back the OR of what everybody is driving, including itself, and
+// both reference drivers depend on seeing their own BSY.
 
-module tb_top (
+module tb_top #(
+  parameter int CLK_PERIOD_PS = 20000
+) (
   input  logic clk_i,
   input  logic rst_i,
+
+  // ---- the chip ------------------------------------------------------------
+  input  logic       dut_stb_i,
+  input  logic       dut_we_i,
+  input  logic       dut_dack_i,
+  input  logic [2:0] dut_adr_i,
+  input  logic [7:0] dut_dat_i,
+  output logic [7:0] dut_dat_o,
+  input  logic       dut_eop_i,
+  output logic       dut_drq_o,
+  output logic       dut_irq_o,
+
+  // ---- the peer device on the fabric, driven by the testbench --------------
+  input  logic       pr_rst_i,
+  input  logic       pr_bsy_i,
+  input  logic       pr_sel_i,
+  input  logic       pr_req_i,
+  input  logic       pr_ack_i,
+  input  logic       pr_atn_i,
+  input  logic       pr_msg_i,
+  input  logic       pr_cd_i,
+  input  logic       pr_io_i,
+  input  logic [7:0] pr_data_i,
+  input  logic       pr_dbp_i,
+
+  // ---- the bus as everybody sees it ----------------------------------------
+  output logic       bus_rst_o,
+  output logic       bus_bsy_o,
+  output logic       bus_sel_o,
+  output logic       bus_req_o,
+  output logic       bus_ack_o,
+  output logic       bus_atn_o,
+  output logic       bus_msg_o,
+  output logic       bus_cd_o,
+  output logic       bus_io_o,
+  output logic [7:0] bus_data_o,
+  output logic       bus_dbp_o,
 
   // ---- sci_regs, on its own ------------------------------------------------
   input  logic       rg_sclr_i,
@@ -38,12 +82,68 @@ module tb_top (
   input  logic       rg_busy_err_i,
   input  logic       rg_atn_i,
   input  logic       rg_ack_i,
+  input  logic       rg_icr_clr_lo_i,
+  input  logic       rg_mr_dma_clr_i,
+  input  logic       rg_bsy_i,
 
+  output logic       rg_csd_rd_o,
   output logic       rg_rpi_o,
   output logic       rg_sds_o,
   output logic       rg_sdtr_o,
   output logic       rg_sdir_o
 );
+
+  scsi_t chip_drive, peer_drive, bus;
+
+  always_comb begin
+    peer_drive.rst  = pr_rst_i;
+    peer_drive.bsy  = pr_bsy_i;
+    peer_drive.sel  = pr_sel_i;
+    peer_drive.req  = pr_req_i;
+    peer_drive.ack  = pr_ack_i;
+    peer_drive.atn  = pr_atn_i;
+    peer_drive.msg  = pr_msg_i;
+    peer_drive.cd   = pr_cd_i;
+    peer_drive.io   = pr_io_i;
+    peer_drive.data = pr_data_i;
+    peer_drive.dbp  = pr_dbp_i;
+  end
+
+  assign bus_rst_o  = bus.rst;
+  assign bus_bsy_o  = bus.bsy;
+  assign bus_sel_o  = bus.sel;
+  assign bus_req_o  = bus.req;
+  assign bus_ack_o  = bus.ack;
+  assign bus_atn_o  = bus.atn;
+  assign bus_msg_o  = bus.msg;
+  assign bus_cd_o   = bus.cd;
+  assign bus_io_o   = bus.io;
+  assign bus_data_o = bus.data;
+  assign bus_dbp_o  = bus.dbp;
+
+  wish5380 #(
+    .CLK_PERIOD_PS (CLK_PERIOD_PS)
+  ) u_dut (
+    .clk_i   (clk_i),
+    .rst_i   (rst_i),
+    .stb_i   (dut_stb_i),
+    .we_i    (dut_we_i),
+    .dack_i  (dut_dack_i),
+    .adr_i   (dut_adr_i),
+    .dat_i   (dut_dat_i),
+    .dat_o   (dut_dat_o),
+    .eop_i   (dut_eop_i),
+    .drq_o   (dut_drq_o),
+    .irq_o   (dut_irq_o),
+    .drive_o (chip_drive),
+    .bus_i   (bus)
+  );
+
+  scsi_fabric u_fabric (
+    .a_i   (chip_drive),
+    .b_i   (peer_drive),
+    .bus_o (bus)
+  );
 
   sci_regs u_regs (
     .clk_i          (clk_i),
@@ -73,6 +173,10 @@ module tb_top (
     .busy_err_i     (rg_busy_err_i),
     .atn_i          (rg_atn_i),
     .ack_i          (rg_ack_i),
+    .icr_clr_lo_i   (rg_icr_clr_lo_i),
+    .mr_dma_clr_i   (rg_mr_dma_clr_i),
+    .bsy_i          (rg_bsy_i),
+    .csd_rd_o       (rg_csd_rd_o),
     .rpi_o          (rg_rpi_o),
     .sds_o          (rg_sds_o),
     .sdtr_o         (rg_sdtr_o),

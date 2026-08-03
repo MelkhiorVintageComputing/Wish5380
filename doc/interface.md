@@ -119,7 +119,7 @@ There are no SCSI pads.  The only target is the SD-backed one inside the
 chip, so the bus is a private fabric rather than a cable.
 
 The real bus is open collector and active low, and every device sees the OR of
-what everybody is driving.  Here each device drives a `wish5380_pkg::scsi_t`
+what everybody is driving.  Here each device drives a `scsi_t`
 of active-**high** "asserted" signals and `scsi_fabric` ORs them, which is the
 same function with the inversion taken out.  Nothing above the fabric can tell
 the difference, because the sense inversion in the real part is at the pad and
@@ -147,15 +147,29 @@ regression checks the clock that was built:
 
 | delay | value | where |
 |-------|-------|-------|
-| bus free | 400 ns of BSY inactive before the bus is free | p. 18 |
-| bus settle | 400 ns before SEL is believed | p. 19 |
-| bus clear | 800 ns to release the bus after RST | p. 21 |
+| bus free | 400 ns of BSY inactive before arbitration may begin | p. 18 |
+| bus settle | 400 ns before a selection or a loss of BSY is believed | p. 19, p. 22 |
+
+The bus clear delay is not counted anywhere, and does not need to be.  It is a
+*deadline* rather than a wait - a device must release the bus "within a bus
+clear delay (800 nsec)" of RST going true (p. 21) - and this chip releases
+everything on the clock edge that sees RST, which meets it at any clock the
+design will ever be built for.
 
 The arbitration delay of 2.2 µs is deliberately *not* in that table.  The
 datasheet is explicit that the chip does not implement it - *"This delay must
 be implemented in the controlling software driver"* (p. 18) - and both drivers
 do, so counting it here would make a driver that omitted it work when it
 should not.  `tb/cpp/ncr5380.h` carries it because the driver model needs it.
+
+## One register write the chip refuses
+
+Every register write lands except one: "BSY must be active in order to set the
+DMA Mode bit" (p. 14).  Writing the Mode Register with DMA MODE set while the
+bus shows no BSY writes every other bit and leaves that one clear, so a driver
+that started a transfer with no target connected would find it had not started
+one.  It is the only place the register file needs to see the bus at all, and
+`bus_dma_mode_needs_a_connected_bus` pins it.
 
 ## The block back end
 

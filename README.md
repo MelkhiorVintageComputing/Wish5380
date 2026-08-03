@@ -22,22 +22,28 @@ there is a card slot.
 
 ## Status
 
-Early.  The register file is done and tested; the SCSI engine, the Wishbone
-front end, the target and the SD back end are not yet written.
+The chip itself is done: registers, bus, arbitration, the automated
+handshake and every interrupt source.  Nothing is connected to it yet - the
+Wishbone front end, the target and the SD back end are still to write.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
 | constants, checked against both driver headers   | done, tested  |
 | the eight registers (`sci_regs`)                 | done, tested  |
-| SCSI engine: arbitration, selection, handshake (`sci_bus`) | not started |
+| bus driving and the status windows (`sci_bus`)   | done, tested  |
+| arbitration, AIP and LOST ARBITRATION            | done, tested  |
+| the DMA handshake, both roles, both directions   | done, tested  |
+| interrupts: selection, EOP, reset, parity, phase mismatch, loss of BSY | done, tested |
+| internal SCSI fabric (`scsi_fabric`)             | done, tested  |
 | Wishbone front end and pseudo-DMA (`wb_5380`)    | not started   |
-| internal SCSI fabric (`scsi_fabric`)             | not started   |
 | SCSI target and command set (`scsi_targ`)        | not started   |
 | SD card back end (`blk_sd`, `sd_spi`)            | not started   |
 | driver model and system tests                    | not started   |
 | co-simulation against a real driver              | not started   |
 
-22 tests pass, none pending.
+44 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
+delays are derived from the clock rather than written down, so the regression
+checks whichever clock it was built for.
 
 ## Building and testing
 

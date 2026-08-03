@@ -73,6 +73,22 @@ datasheet calls it:
 | TEST MODE (ICR bit 6, w)  | `SCI_ICMD_TEST`         | `ICR_TRI_STATE`          | Linux names it for its effect: all output drivers float |
 | LOST ARBITRATION          | `SCI_ICMD_LST`          | `ICR_ARBITRATION_LOST`   | |
 
+## Two places a driver comment disagrees with the datasheet
+
+Neither changes behaviour, and both are worth knowing before someone "fixes"
+the RTL to match a comment:
+
+* `Linux/NCR5380.c` says *"The chip now waits for BUS FREE phase.  Then after
+  the 800 ns Bus Free Delay, arbitration will begin."*  800 ns is the SCSI
+  specification's bus free delay; the datasheet says this chip's filter is
+  **400 ns** - *"If BSY remains inactive for at least 400 nsec then the SCSI
+  bus is considered free"* (p. 18).  The chip is faster than the standard
+  requires, which is safe, and the RTL follows the datasheet.
+* the same file says *"The SCSI-2 arbitration delay is 2.4 us"* and waits
+  `udelay(3)`; the datasheet says 2.2 µs (p. 18).  Both are the driver's own
+  wait - the chip does not implement the delay at all - so the difference
+  never reaches hardware.
+
 ## Initiator Command does not read back what was written
 
 Bits 6 and 5 of register 1 are different registers on read and on write

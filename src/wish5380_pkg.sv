@@ -157,25 +157,35 @@ package wish5380_pkg;
   // fabric computes, because a test has to be able to drive bad parity.
   // -------------------------------------------------------------------------
 
-  typedef struct packed {
-    logic       rst;
-    logic       bsy;
-    logic       sel;
-    logic       req;
-    logic       ack;
-    logic       atn;
-    logic       msg;
-    logic       cd;
-    logic       io;
-    logic [7:0] data;
-    logic       dbp;
-  } scsi_t;
-
-  // There is deliberately no SCSI_W or SCSI_IDLE constant here.  Yosys 0.23
-  // rejects `$bits` of a type name and Icarus 11 refuses a parameter whose
-  // type is a struct, so both would cost two of the three tool checks to buy
-  // one shorter line.  Modules write `wish5380_pkg::scsi_t` and `'0`.
+  // The type itself is `scsi_t`, declared below at file scope rather than in
+  // here.  See the note there.
 
 endpackage
 
 /* verilator lint_on UNUSEDPARAM */
+
+// Icarus 11 aborts with an internal assertion - elab_type.cc:86 - on any
+// packed struct typedef declared inside a package, whether or not it reaches
+// a port.  It accepts the identical declaration at file scope, so that is
+// where this one lives, and `make lint-icarus` keeps working.
+//
+// File scope means the compilation unit, which for all three tools here is
+// every file given on one command line.  Because this file is first in the
+// Makefile's RTL list, the type is in scope for the rest.
+//
+// There is deliberately no SCSI_W or SCSI_IDLE constant beside it either:
+// Yosys 0.23 rejects `$bits` of a type name and Icarus refuses a parameter
+// whose type is a struct.  Modules write `scsi_t` and `'0`.
+typedef struct packed {
+  logic       rst;
+  logic       bsy;
+  logic       sel;
+  logic       req;
+  logic       ack;
+  logic       atn;
+  logic       msg;
+  logic       cd;
+  logic       io;
+  logic [7:0] data;
+  logic       dbp;
+} scsi_t;

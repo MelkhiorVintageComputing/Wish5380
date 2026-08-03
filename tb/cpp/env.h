@@ -73,6 +73,52 @@ class Env {
   enum Strobe : uint8_t { S_RPI = 1, S_SDS = 2, S_SDTR = 4, S_SDIR = 8 };
   uint8_t last_strobes() const { return strobes_; }
 
+  // ---- the whole chip ----------------------------------------------------
+  //
+  // The same four accessors against `wish5380` rather than the bare register
+  // file, so a test can drive the part the way a driver does.
+  void chip_write(uint8_t adr, uint8_t data);
+  uint8_t chip_read(uint8_t adr);
+  void chip_write_dack(uint8_t data);
+  uint8_t chip_read_dack();
+
+  // ---- the peer device on the fabric -------------------------------------
+  //
+  // Whatever else is on the bus: a target answering a selection, or another
+  // initiator arbitrating.  A test drives it signal by signal because that is
+  // the level the chip is specified at; `sci_target.h` will wrap it once
+  // there is a target worth modelling.
+  struct Peer {
+    bool rst = false, bsy = false, sel = false, req = false, ack = false;
+    bool atn = false, msg = false, cd = false, io = false, dbp = false;
+    uint8_t data = 0;
+
+    // Sets MSG, C/D and I/O from a phase in the Target Command Register's
+    // encoding, and the data lines with correct odd parity.
+    Peer& phase(uint8_t ph);
+    Peer& with_data(uint8_t d, bool good_parity = true);
+  };
+
+  void drive_peer(const Peer& p);
+  const Peer& peer() const { return peer_; }
+  // Changes one field and re-drives, for the many tests that toggle a single
+  // signal in the middle of a sequence.
+  void peer_set(bool Peer::*field, bool v);
+
+  // The bus as every device sees it, in the Current SCSI Bus Status
+  // Register's layout, so it can be compared against what a read returns.
+  uint8_t bus_csb();
+  uint8_t bus_data();
+  bool bus_ack();
+  bool bus_req();
+
+  // How many clocks a delay of dt_ps takes, rounded up the way the RTL
+  // rounds it.  Tests that check the part's timings ask for this rather than
+  // writing a number that only holds at one clock.
+  uint64_t ticks_for_ps(uint64_t dt_ps) const {
+    return (dt_ps + cfg_.sys_period_ps - 1) / cfg_.sys_period_ps;
+  }
+
  private:
   void bind_models();
 
@@ -85,6 +131,7 @@ class Env {
   Sim::Clock* sysclk_ = nullptr;
   void sample_strobes();
   uint8_t strobes_ = 0;
+  Peer peer_;
 };
 
 }  // namespace wtb

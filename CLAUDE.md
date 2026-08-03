@@ -125,6 +125,17 @@ do not "fix" them:
 * **An SCSI reset clears every register except the interrupt latch and ASSERT
   RST** (p. 23), so a driver's own reset pulse is not switched off underneath
   it.  That is a different reset from the RESET pin, which clears everything.
+* **Setting the Mode Register's DMA bit is refused while BSY is false**
+  (p. 14).  It is the only write the chip does not take, and the one place
+  the register file has to see the bus.
+* **Arbitration is lost only to another device's SEL** (p. 12).  A driver
+  asserts SEL itself while still arbitrating - Linux writes
+  `ICR_ASSERT_SEL | ICR_ASSERT_BSY` and clears the Mode Register afterwards -
+  so counting its own would break selection outright.
+* **The chip does not decide who won arbitration.**  It reports AIP and LOST
+  ARBITRATION and nothing else; comparing IDs against the data bus is the
+  driver's job, which is why Linux reads Current SCSI Data and tests it
+  against `id_higher_mask`.
 
 ### A clockless part in a clocked design
 
@@ -206,9 +217,22 @@ Every source file carries `SPDX-License-Identifier: MIT`.  The files under
 * Yosys 0.23 rejects `import pkg::*` in both module headers and module bodies,
   so RTL refers to package items as `wish5380_pkg::NAME`.  Keep it that way or
   `make synth` breaks.
-* Yosys 0.23 also rejects `$bits(some_type)` and Icarus 11 refuses a parameter
-  whose type is a struct, which is why `wish5380_pkg` has a `scsi_t` typedef
-  but no `SCSI_W` or `SCSI_IDLE` constant beside it.
+* Icarus 11 aborts with an internal assertion - `elab_type.cc:86` - on any
+  packed struct typedef declared **inside a package**, reached by a port or
+  not.  `scsi_t` is therefore declared at file scope at the bottom of
+  `wish5380_pkg.sv`, which Icarus accepts.  Do not move it into the package.
+* Yosys 0.23 also rejects `$bits(some_type)` and Icarus refuses a parameter
+  whose type is a struct, which is why there is no `SCSI_W` or `SCSI_IDLE`
+  constant beside `scsi_t`.
+* Verilator treats a packed struct as one signal, so a module whose struct
+  output depends on its struct input - which `sci_bus` is, because an
+  initiator only drives the data lines when the phase matches - trips
+  UNOPTFLAT even though no field depends on itself.  That is the second and
+  last suppression in the RTL, on `drive_data` in `sci_bus.sv`.
+* Icarus prints `sorry: constant selects in always_* processes ...` for the
+  field-by-field assembly of `csb_o`.  It concerns sensitivity-list
+  construction in an `always_comb`, is harmless, and does not fail the run;
+  do not "fix" it by unrolling.
 * `wish5380_pkg.sv` carries the RTL's only `lint_off`, for `UNUSEDPARAM`: it
   is a file of constants describing the whole part, so a constant with no user
   yet is expected.  Do not widen the suppression to other files.

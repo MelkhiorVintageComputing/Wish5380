@@ -66,7 +66,24 @@ module sci_regs (
   input  logic       atn_i,           // BSR bit 1
   input  logic       ack_i,           // BSR bit 0
 
+  // ---- what the engine takes back ----------------------------------------
+  //
+  // An unexpected loss of BSY resets the lower six bits of Initiator Command
+  // and removes every signal from the bus (p. 13), and resets the Mode
+  // Register's DMA bit as well (p. 16).  The engine detects it; the registers
+  // are where it lands.  Both beat whatever the host was writing in the same
+  // cycle, because on the real part the host is not there at all.
+  input  logic       icr_clr_lo_i,
+  input  logic       mr_dma_clr_i,
+
+  // BSY as it stands on the bus.  "Note: BSY must be active in order to set
+  // the DMA Mode bit" (p. 14) - the one place a register write is refused
+  // rather than merely ignored, and a driver that started a DMA transfer with
+  // no target connected would find it had not started one.
+  input  logic       bsy_i,
+
   // ---- strobes, one cycle each -------------------------------------------
+  output logic       csd_rd_o,    // read 0:  where parity is checked (p. 21)
   output logic       rpi_o,       // read 7:  Reset Parity/Interrupt
   output logic       sds_o,       // write 5: Start DMA Send
   output logic       sdtr_o,      // write 6: Start DMA Target Receive
@@ -138,6 +155,7 @@ module sci_regs (
   logic decode;
   assign decode = stb_i && !dack_i;
 
+  assign csd_rd_o = decode && !we_i && (adr_i == wish5380_pkg::A_CSD);
   assign rpi_o  = decode && !we_i && (adr_i == wish5380_pkg::A_RPI);
   assign sds_o  = decode &&  we_i && (adr_i == wish5380_pkg::A_SDS);
   assign sdtr_o = decode &&  we_i && (adr_i == wish5380_pkg::A_SDTR);
@@ -152,29 +170,38 @@ module sci_regs (
       mr_q  <= '0;
       tcr_q <= '0;
       ser_q <= '0;
-    end else if (sclr_i) begin
+    end else begin
+      if (sclr_i) begin
       // An SCSI reset clears the registers but leaves ASSERT RST standing, so
       // a driver holding the bus in reset is not cut off by its own pulse
       // (p. 23).
-      odr_q <= '0;
-      icr_q <= icr_q & (8'b1 << wish5380_pkg::ICR_RST_B);
-      mr_q  <= '0;
-      tcr_q <= '0;
-      ser_q <= '0;
-    end else if (stb_i && we_i) begin
-      if (dack_i) begin
-        odr_q <= dat_i;
-      end else begin
-        unique case (adr_i)
-          wish5380_pkg::A_ODR: odr_q <= dat_i;
-          wish5380_pkg::A_ICR: icr_q <= dat_i;
-          wish5380_pkg::A_MR:  mr_q  <= dat_i;
-          wish5380_pkg::A_TCR: tcr_q <= dat_i;
-          wish5380_pkg::A_SER: ser_q <= dat_i;
-          // 5, 6 and 7 are strobes and hold nothing.
-          default: ;
-        endcase
+        odr_q <= '0;
+        icr_q <= icr_q & (8'b1 << wish5380_pkg::ICR_RST_B);
+        mr_q  <= '0;
+        tcr_q <= '0;
+        ser_q <= '0;
+      end else if (stb_i && we_i) begin
+        if (dack_i) begin
+          odr_q <= dat_i;
+        end else begin
+          unique case (adr_i)
+            wish5380_pkg::A_ODR: odr_q <= dat_i;
+            wish5380_pkg::A_ICR: icr_q <= dat_i;
+            wish5380_pkg::A_MR: begin
+              mr_q <= dat_i;
+              if (!bsy_i) mr_q[wish5380_pkg::MR_DMA_B] <= 1'b0;
+            end
+            wish5380_pkg::A_TCR: tcr_q <= dat_i;
+            wish5380_pkg::A_SER: ser_q <= dat_i;
+            // 5, 6 and 7 are strobes and hold nothing.
+            default: ;
+          endcase
+        end
       end
+
+      // The engine's own clears come last so they win a tie with the host.
+      if (icr_clr_lo_i) icr_q[5:0] <= 6'b0;
+      if (mr_dma_clr_i) mr_q[wish5380_pkg::MR_DMA_B] <= 1'b0;
     end
   end
 
