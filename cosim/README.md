@@ -140,18 +140,44 @@ cosim/scripts/run-sun3.py 'b sd()' -- -trace 'sun3_si_*'
 What a working run says:
 
 ```
+>b sd() netbsd.sun3
+Boot: sd(0,0,0)netbsd.sun3
+>> NetBSD/sun3 ufsboot [1.13 (Mon Dec 16 13:08:11 UTC 2024)]
+1522676+76500 [167024+154826]=0x1d5414
+starting program at 0x4000
+[   1.0000000] NetBSD 10.1 (INSTALL) #0: Mon Dec 16 13:08:11 UTC 2024
+[   1.0000000] Model: sun3 60
+[   1.0000000] si0 at obio0 addr 0x140000 ipl 2: options=0xf
+[   1.0000000] scsibus0 at si0: 8 targets, 8 luns per target
+[   3.1400030] sd0 at scsibus0 target 0 lun 0: <DOLBEAU, WISH5380 SD CARD, 0001> disk fixed
+```
+
+Every line of that is somebody else's code.  The PROM found the board and read
+its label; NetBSD's `bootxx` loaded `ufsboot` from a list of raw block numbers;
+`ufsboot` read the filesystem and pulled nearly two megabytes of kernel across
+the chip's DMA port; and then NetBSD's own `si` driver - the one written for the
+real board in 1994 - probed the bus, arbitrated, selected, sent INQUIRY, and
+attached the disk.
+
+Underneath, each of those transfers looks like this:
+
+```
 sun3_si_chain    table at 0xf0400c rsel 0x0182 -> addr 0xf00000 count 256 words
 sun3_si_dma_done residual 0 bytes, csr 0x0003, first four bytes 0xdeadbeef
 ```
 
-That is the whole path in two lines.  The PROM built a six-word chain table in
-DVMA memory and told the Am9516 to fetch it; the UDC read it back through the
-Sun-3 MMU, found a 256-word receive into 0xF00000, and then moved 512 bytes
-from the Verilated chip into the guest's memory with nothing left over and no
-bus error - the bytes coming from an SD card image by way of the SCSI target,
-across a REQ/ACK handshake the driver never touched.
+The PROM built a six-word chain table in DVMA memory and told the Am9516 to
+fetch it; the UDC read it back through the Sun-3 MMU, found a 256-word receive
+into 0xF00000, and moved 512 bytes from the Verilated chip into the guest's
+memory with nothing left over and no bus error - the bytes coming from an SD
+card image by way of the SCSI target, across a REQ/ACK handshake the driver
+never touched.
 
-### Three things this cost, worth knowing before the next one
+It is slow.  The core runs about sixteen times slower than the part it models,
+so loading the kernel takes twenty minutes of wall clock where a real 3/60
+took seconds.  Nothing is waiting on anything; it is simply that many bytes.
+
+### Four things this cost, worth knowing before the next one
 
 **A device can be perfectly modelled, correctly mapped, and still invisible.**
 The Sun-3 MMU checks every translated physical address against a list of what
@@ -171,6 +197,16 @@ word carries A23-A16 in its *high byte*, the low byte being reference and
 control.  Read flat, the chain table address 0xF04000 becomes 0x004000, which
 is not wrong data but a translation failure - so it surfaces as a DMA bus error
 rather than as garbage, and points away from itself.
+
+**A DMA controller waits for DREQ; it does not sample it.**  The board model
+looked at DRQ once per guest register access and moved a byte if it happened to
+be asserted, which made a transfer advance about a byte per poll.  The PROM
+waits for the chip's interrupt with a finite count and gave up long before the
+data arrived.  What found it was asking `tb/` the question the PROM had already
+answered - does the chip interrupt at the end of a transfer when the driver has
+*not* enabled the End of Process interrupt?  It does, and
+`dma_a_transfer_ends_by_interrupting_without_the_eop_enable` now says so, which
+is what moved the search off the RTL and onto the board.
 
 ### The disk
 
