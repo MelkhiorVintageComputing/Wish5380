@@ -36,7 +36,7 @@
 extern "C" {
 #endif
 
-#define WISH_RTL_ABI 1
+#define WISH_RTL_ABI 2
 
 typedef struct WishRtl WishRtl;
 
@@ -62,6 +62,23 @@ uint8_t wish_rtl_read(WishRtl *r, int reg);
 
 /* The core's interrupt output, as it stands now. */
 int wish_rtl_irq(WishRtl *r);
+
+/* The DMA handshake.  A board with a real DMA controller in front of the chip
+ * watches DRQ and answers it with an acknowledge cycle, which reaches a data
+ * register without the address being decoded at all (p. 6) - so there is no
+ * register number to pass.
+ *
+ * A card that moves bytes with the CPU never needs any of this: it polls the
+ * DRQ bit in the Bus and Status Register instead, and has no End of Process
+ * pin to assert.  That is the whole difference between the Macintosh's
+ * pseudo-DMA and the Sun-3's Am9516. */
+int wish_rtl_drq(WishRtl *r);
+uint8_t wish_rtl_dack_read(WishRtl *r);
+void wish_rtl_dack_write(WishRtl *r, uint8_t val);
+
+/* Hold End of Process asserted across the next acknowledge cycle, which is
+ * what sets END OF DMA and, if it is enabled, interrupts. */
+void wish_rtl_set_eop(WishRtl *r, int asserted);
 
 /* Let the core run with nothing else happening.  A card calls this from a
  * timer so the target and the SD card keep making progress while the guest is

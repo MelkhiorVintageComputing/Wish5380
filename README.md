@@ -65,9 +65,13 @@ derived from the clock rather than written down and the register spacing is an
 elaboration parameter, so the regression checks whichever build it was given
 rather than a nominal one.
 
-Beyond the regression, an unmodified i386 Linux probes the design with its own
-`g_NCR5380`, attaches `sda`, mounts an ext2 root filesystem off it and reads
-and writes files - see [`cosim/`](cosim/README.md).
+Beyond the regression, two guests drive the design in the two ways the chip can
+be driven.  An unmodified i386 Linux probes it with its own `g_NCR5380`,
+attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
+files, all in programmed I/O.  A Sun-3/60 boot PROM drives the same core
+through an Am9516 DMA controller instead: it selects the target and reads a
+block, and the bytes cross by DRQ and DACK without the CPU touching them.
+See [`cosim/`](cosim/README.md).
 
 ## Building and testing
 
@@ -102,8 +106,9 @@ which question.  The two to start from:
 Then [`doc/target.md`](doc/target.md) for the disk, [`doc/sd.md`](doc/sd.md)
 for the card behind it, [`doc/drivers`](doc/drivers/README.md) for the vintage
 drivers and which of them is the authority on what, and
-[`cosim/`](cosim/README.md) for an unmodified Linux booting off the whole
-thing.
+[`cosim/`](cosim/README.md) for the two guests - an unmodified Linux booting
+off the whole thing, and a Sun-3 PROM reading a block through a real DMA
+controller.
 
 ## Layout
 
@@ -111,6 +116,6 @@ thing.
 src/      RTL
 tb/sv/    simulation top level
 tb/cpp/   testbench: bus models, SCSI and SD models, test framework, tests
-cosim/    the Verilated core behind a C interface, and a guest that drives it
+cosim/    the Verilated core behind a C interface, and the guests that drive it
 doc/      datasheets, interface notes, vintage drivers
 ```

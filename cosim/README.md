@@ -1,10 +1,15 @@
 # Co-simulation
 
 The regression in `tb/` checks the design against a model of what the drivers
-do.  This checks it against a driver itself: QEMU gets an ISA card carrying the
-Verilated `wish5380_sd`, an unmodified i386 Linux probes it with its own
-`g_NCR5380`, and the guest mounts a filesystem off an SD card model and reads
-and writes files on it.
+do.  This checks it against drivers themselves, on two machines that use the
+chip in the two ways it can be used:
+
+* **An ISA card in an i386 Linux guest** - programmed I/O, every byte carried
+  across the register port by the CPU.  Linux's own `g_NCR5380` finds it and
+  mounts a filesystem off the SD card model.
+* **The onboard SCSI of a Sun-3/60** - real bus-master DMA, where an Am9516
+  answers the chip's DRQ and moves the bytes into memory itself.  The 3/60
+  boot PROM selects a target and reads a block through it.
 
 It is a separate and much slower loop and is deliberately not part of
 `make test`.  Nothing in `src/` or `tb/` may grow a dependency on it - the
@@ -113,9 +118,72 @@ waiting out a `udelay`, or spinning on jiffies.
 
 The whole run takes a few minutes, most of it in the guest's own boot.
 
+## The Sun-3/60
+
+The second guest exists because the first one cannot exercise the chip's DMA
+mode at all.  An ISA 5380 card has no DMA controller in front of it, so `tb/`
+was the only thing that had ever driven DRQ, DACK and EOP.  A Sun-3/60 has an
+Am9516 Universal DMA Controller doing exactly that, and a boot PROM that uses
+it.
+
+Mainline QEMU has no Sun-3.  The machine model lives in a separate fork under
+separate ownership, which nothing here modifies; `cosim/patches/sun3/` holds
+what has to be added to it and `cosim/patches/README.md` explains the shape.
+
+```sh
+make -C cosim/rtl                  # the shared library, as before
+cosim/scripts/build-sun3-qemu.sh   # clone the fork, apply our patches, build
+dd if=/dev/zero of=work/sun3/disk.img bs=1M count=16
+cosim/scripts/run-sun3.py 'b sd()' -- -trace 'sun3_si_*'
+```
+
+What a working run says:
+
+```
+sun3_si_chain    table at 0xf0400c rsel 0x0182 -> addr 0xf00000 count 256 words
+sun3_si_dma_done residual 0 bytes, csr 0x0003, first four bytes 0xdeadbeef
+```
+
+That is the whole path in two lines.  The PROM built a six-word chain table in
+DVMA memory and told the Am9516 to fetch it; the UDC read it back through the
+Sun-3 MMU, found a 256-word receive into 0xF00000, and then moved 512 bytes
+from the Verilated chip into the guest's memory with nothing left over and no
+bus error - the bytes coming from an SD card image by way of the SCSI target,
+across a REQ/ACK handshake the driver never touched.
+
+### Three things this cost, worth knowing before the next one
+
+**A device can be perfectly modelled, correctly mapped, and still invisible.**
+The Sun-3 MMU checks every translated physical address against a list of what
+exists on the machine and turns anything else into a bus error before the
+access is dispatched.  SCSI was not on the list.  The PROM's probe wrote one
+word, took a bus error, and said "Device not found" without ever reading a
+register - which looks exactly like a device that is not there.
+
+**The VME-only registers are not optional.**  One driver serves both the
+onboard and the VME board and writes them unconditionally; the 3/60 PROM puts
+`VME_SUPV_DATA_24` in `si_iv_am` at offset 0x1e before it does anything else.
+A model that stopped at `si_csr`, where the onboard register list stops, failed
+the probe outright.
+
+**An Am9516 address is not a 32-bit number.**  It is a pair of words whose high
+word carries A23-A16 in its *high byte*, the low byte being reference and
+control.  Read flat, the chain table address 0xF04000 becomes 0x004000, which
+is not wrong data but a translation failure - so it surfaces as a DMA bus error
+rather than as garbage, and points away from itself.
+
+### Where it stops
+
+The PROM reads block 0 and gets what is on the disk.  It does not yet boot an
+operating system, because that needs a disk image with a real boot block and
+filesystem on it, which is a separate piece of work.  NetBSD's own `si` driver
+is the next thing to put in front of this.
+
 ## Rules this directory follows
 
 * No QEMU or Linux source, binaries or images in git.  They live in `work/`.
+* The Sun-3 fork is read-only to us.  Its tree is cloned into `work/`, our
+  commits go on a branch there, and what is kept is `git format-patch` output.
 * QEMU changes exist only as patches against the released tarball, regenerated
   with `diff -ruN` against the pristine copy `fetch-qemu.sh` keeps beside it.
 * The guest is never patched.  If something only works with a modified guest,

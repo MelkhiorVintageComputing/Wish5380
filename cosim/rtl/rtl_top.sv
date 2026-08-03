@@ -26,6 +26,9 @@ module rtl_top (
 
   output logic irq_o,
   output logic drq_o,
+  // The part's End of Process pin.  The ISA card has nothing to drive it; a
+  // Sun 3/60's Am9516 asserts it on the last word of a transfer.
+  input  logic eop_i,
 
   output logic sd_clk_o,
   output logic sd_cs_n_o,
@@ -73,7 +76,7 @@ module rtl_top (
     .wb_err_o  (wb_err_o),
     .irq_o     (irq_o),
     .drq_o     (drq_o),
-    .eop_i     (1'b0),
+    .eop_i     (eop_i),
     .sd_clk_o  (sd_clk_o),
     .sd_cs_n_o (sd_cs_n_o),
     .sd_mosi_o (sd_mosi_o),

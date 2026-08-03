@@ -1,0 +1,873 @@
+From 034a18c110821345882e2cb53e476b9a47aa1c32 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Mon, 3 Aug 2026 21:03:03 +0200
+Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
+
+The 3/60's SCSI is three things in one 32-byte register block: an NCR
+5380, an AMD Am9516 Universal DMA Controller, and Sun's own byte/word
+packing FIFO between them.  This models the second and third; the 5380
+itself is a Verilated implementation loaded at run time from a shared
+library, which is why there is no SCSI protocol in this file at all.
+
+The board is not pseudo-DMA, a claim worth contradicting because it is
+widely repeated.  The Am9516 is a real bus master: the driver builds a
+six-word chain table in DVMA memory, hands the UDC only the address of
+it, and says "start chaining"; the UDC fetches its own channel setup
+from that table and then moves the data through the machine's DVMA
+IOMMU.  Both the Sun-3 Architecture Manual and every driver that has
+ever driven this board work that way.
+
+Only the corner of the Am9516 that Sun uses is modelled: channel 1,
+word transfers, a one-shot chain of three register groups.  A model of
+the rest would be a model of code nobody runs.
+
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ hw/scsi/Kconfig      |   6 +
+ hw/scsi/meson.build  |   2 +
+ hw/scsi/sun3-si.c    | 791 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/trace-events |   7 +
+ 4 files changed, 806 insertions(+)
+ create mode 100644 hw/scsi/sun3-si.c
+
+diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
+index 5743ee9b4d..787975057f 100644
+--- a/hw/scsi/Kconfig
++++ b/hw/scsi/Kconfig
+@@ -69,3 +69,9 @@ config VHOST_USER_SCSI
+     default y if VIRTIO_PCI
+     select VHOST_SCSI_COMMON
+     depends on VIRTIO && VHOST_USER && LINUX
++
++config SUN3_SI
++    bool
++    # The Sun-3 board's own logic - an Am9516 UDC and a packing FIFO.  The
++    # NCR 5380 in front of it is a shared library loaded at run time, so this
++    # depends on nothing else in hw/scsi and does not select SCSI.
+diff --git a/hw/scsi/meson.build b/hw/scsi/meson.build
+index 69fde0cf84..29adf48134 100644
+--- a/hw/scsi/meson.build
++++ b/hw/scsi/meson.build
+@@ -27,5 +27,7 @@ scsi_ss.add_all(when: 'CONFIG_VIRTIO_SCSI', if_true: virtio_scsi_ss)
+ 
+ specific_scsi_ss.add(when: 'CONFIG_SPAPR_VSCSI', if_true: files('spapr_vscsi.c'))
+ 
++system_ss.add(when: 'CONFIG_SUN3_SI', if_true: files('sun3-si.c'))
++
+ system_ss.add_all(when: 'CONFIG_SCSI', if_true: scsi_ss)
+ specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
+diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
+new file mode 100644
+index 0000000000..e83576617e
+--- /dev/null
++++ b/hw/scsi/sun3-si.c
+@@ -0,0 +1,791 @@
++/*
++ * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * The board is three things in one 32-byte register block: an NCR 5380, an
++ * AMD Am9516 Universal DMA Controller, and Sun's own byte/word packing FIFO
++ * between them.  Only the FIFO and the UDC are modelled here; the 5380 itself
++ * is the Verilated wish5380 behind a shared library, which is why this file
++ * contains no SCSI protocol at all.
++ *
++ * The layout is NetBSD's sys/arch/sun3/dev/sireg.h:
++ *
++ *   0x00-0x07  the NCR 5380, one byte apart
++ *   0x08-0x0e  dma_addrh/l, dma_counth/l   VME only
++ *   0x10       udc_data     Am9516 data port
++ *   0x12       udc_addr     Am9516 register pointer
++ *   0x14       fifo_data    read-only; the leftover byte of an odd transfer
++ *   0x16       fifo_count   bytes; reads back as the residual
++ *   0x18       si_csr       control and status
++ *   0x1a-0x20  si_bprh/l, si_iv_am, fifo_cnt_hi   VME only
++ *
++ * The VME-only registers are not decoration.  One driver serves both boards
++ * and writes them unconditionally, and the 3/60 PROM is one of them: it puts
++ * VME_SUPV_DATA_24 in si_iv_am before it does anything else.  On this machine
++ * an unmapped access is a real bus error, so a model that stopped at si_csr
++ * would fail the PROM's probe outright and report itself as no controller at
++ * all.  They are accepted and ignored here, which is what the onboard board
++ * does with them.
++ *
++ * The 3/60's SCSI is *not* pseudo-DMA - a claim worth contradicting because
++ * it is widely repeated.  The Am9516 is a real bus master: the driver builds
++ * a six-word chain table in DVMA memory, hands the UDC only the address of
++ * it, and says "start chaining"; the UDC fetches its own channel setup from
++ * that table and then moves the data.  Both the Sun-3 Architecture Manual
++ * (S5.15) and every driver that has ever driven this board work that way.
++ *
++ * What is modelled is the corner of the Am9516 that Sun uses: channel 1,
++ * word-to-word flyby transfer, a one-shot chain of three register groups.
++ * Nothing here does searches, pattern matching, base-register reload, or
++ * memory-to-memory - the driver never asks for any of it, and a model of the
++ * whole chip would be a model of code nobody runs.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/sysbus.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++#include "trace.h"
++#include "system/dma.h"
++#include "system/address-spaces.h"
++#include "system/system.h"
++
++#include <dlfcn.h>
++#include <sys/stat.h>
++
++#define TYPE_SUN3_SI "sun3-si"
++OBJECT_DECLARE_SIMPLE_TYPE(Sun3SiState, SUN3_SI)
++
++/* Must match cosim/rtl/wish_rtl.h in the Wish5380 tree. */
++#define WISH_RTL_ABI 2
++typedef struct WishRtl WishRtl;
++
++/* si_csr, from sireg.h. */
++#define SI_CSR_DMA_ACTIVE   0x8000  /* r  */
++/*
++ * DMA_CONFLICT reports a real bus collision: the CPU reached the 5380 while
++ * the UDC was in the middle of a cycle.  It is never set here, and that is
++ * not a simplification.  Arming the UDC and then programming the chip is the
++ * normal order - the PROM writes the mode, target command and start-DMA
++ * registers after the chain is running - and nothing is on the bus until the
++ * chip raises DREQ.  A model that flagged every access during a transfer
++ * would condemn the drivers that exist.
++ */
++#define SI_CSR_DMA_CONFLICT 0x4000  /* r  never set: see above */
++#define SI_CSR_DMA_BUS_ERR  0x2000  /* r  */
++#define SI_CSR_ID           0x1000  /* r  0 for the onboard board */
++#define SI_CSR_FIFO_FULL    0x0800  /* r  */
++#define SI_CSR_FIFO_EMPTY   0x0400  /* r  */
++#define SI_CSR_SBC_IP       0x0200  /* r  the 5380 is interrupting */
++#define SI_CSR_DMA_IP       0x0100  /* r  the UDC is interrupting */
++#define SI_CSR_SEND         0x0008  /* rw direction, 1 = to the device */
++#define SI_CSR_INTR_EN      0x0004  /* rw gates both onto level 2 */
++#define SI_CSR_FIFO_RES     0x0002  /* rw active low */
++#define SI_CSR_SCSI_RES     0x0001  /* rw active low; resets the 5380 and UDC */
++
++#define SI_CSR_WRITABLE     (SI_CSR_SEND | SI_CSR_INTR_EN | \
++                             SI_CSR_FIFO_RES | SI_CSR_SCSI_RES)
++
++/* Am9516 register pointers the driver uses, from am9516.h.  Bit 1 of a
++ * pointer selects the channel and Sun uses channel 1 throughout. */
++#define UDC_ADR_MODE        0x38
++#define UDC_ADR_COMMAND     0x2e    /* status when read */
++#define UDC_ADR_CAR_HIGH    0x26
++#define UDC_ADR_CAR_LOW     0x22
++#define UDC_ADR_COUNT       0x32
++
++#define UDC_CMD_RESET       0x00
++#define UDC_CMD_CIE         0x32
++#define UDC_CMD_STRT_CHN    0xa0
++
++#define UDC_SR_CIE          0x8000
++#define UDC_SR_IP           0x2000
++#define UDC_SR_CA           0x1000
++#define UDC_SR_NAC          0x0800
++#define UDC_SR_TC           0x0001
++
++/* Reload-word bits, scanned from 9 down to 0 (Am9516A datasheet, Figure 12).
++ * Sun sends 0x0282 to send and 0x0182 to receive, which is Current ARA or
++ * Current ARB, then the operation count, then the channel mode. */
++#define RSEL_CUR_ARA        (1 << 9)
++#define RSEL_CUR_ARB        (1 << 8)
++#define RSEL_CUR_COUNT      (1 << 7)
++#define RSEL_BASE_ARA       (1 << 6)
++#define RSEL_BASE_ARB       (1 << 5)
++#define RSEL_BASE_COUNT     (1 << 4)
++#define RSEL_PATTERN_MASK   (1 << 3)
++#define RSEL_INT_VECTOR     (1 << 2)
++#define RSEL_CHANNEL_MODE   (1 << 1)
++#define RSEL_CHAIN_ADDR     (1 << 0)
++
++/*
++ * Pacing.
++ *
++ * A Verilated 5380 with an SD card behind it runs about sixteen times slower
++ * than the part it models, so the core cannot simply be run at the emulator's
++ * virtual rate - the whole machine would crawl, selftest and all.  What makes
++ * that affordable is that the chip is idle for almost all of a boot: the bus
++ * is free, nothing is selected, and no amount of simulation would change any
++ * answer the guest could read.
++ *
++ * So the core is advanced to virtual time only while something is actually
++ * happening - a transfer in flight, or BSY asserted on the SCSI bus.  Then it
++ * keeps step with the guest exactly, which is what makes the guest's own
++ * timeouts mean what they say; the rest of the time it costs nothing.  Each
++ * register access also buys a little core time, so a driver polling a status
++ * register still makes progress between timer ticks.
++ */
++#define STEP_PER_ACCESS_NS  1000
++#define TIMER_PERIOD_NS     (500 * 1000)
++#define MAX_CATCH_UP_NS     (2 * 1000 * 1000)
++
++/* A transfer moves at most this many bytes per pump, so a runaway cannot wedge
++ * the whole emulator.  NetBSD caps a request at 0xE000. */
++#define PUMP_LIMIT          0x20000
++
++struct Sun3SiState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    int irq_level;
++    QEMUTimer *timer;
++
++    MemoryRegion *dma_mr;
++    AddressSpace dma_as;
++
++    char *rtl;
++    char *image;
++    uint32_t blocks;
++
++    /* Sun's own logic. */
++    uint16_t csr;
++    uint16_t fifo_count;    /* bytes; the driver reads this as the residual */
++    uint16_t fifo_data;     /* the leftover byte, in bits 15:8 */
++    /* The VME-only registers, indexed by (offset - 8) / 2: written by any
++     * driver that serves both boards, and ignored by this one. */
++    uint16_t vme[13];
++
++    /* The Am9516, as far as Sun uses it. */
++    uint8_t  udc_ptr;
++    uint16_t udc_mode;
++    uint16_t udc_car_hi, udc_car_lo;
++    uint16_t udc_count;     /* words remaining */
++    uint16_t udc_status;
++    uint32_t dma_addr;      /* 24-bit DVMA byte address */
++    uint32_t head;          /* the first four bytes of the transfer, traced */
++    unsigned head_n;
++    bool     dma_running;
++
++    int64_t last_ns;
++
++    void *dl;
++    WishRtl *dev;
++
++    uint32_t (*f_abi)(void);
++    WishRtl *(*f_new)(const char *, uint32_t);
++    void (*f_free)(WishRtl *);
++    void (*f_flush)(WishRtl *);
++    int (*f_reset)(WishRtl *);
++    void (*f_write)(WishRtl *, int, uint8_t);
++    uint8_t (*f_read)(WishRtl *, int);
++    int (*f_irq)(WishRtl *);
++    int (*f_drq)(WishRtl *);
++    uint8_t (*f_dack_read)(WishRtl *);
++    void (*f_dack_write)(WishRtl *, uint8_t);
++    void (*f_set_eop)(WishRtl *, int);
++    void (*f_run_ns)(WishRtl *, uint64_t);
++};
++
++static void sun3_si_update_irq(Sun3SiState *s)
++{
++    int level;
++
++    s->csr &= ~SI_CSR_SBC_IP;
++    if (s->f_irq(s->dev)) {
++        s->csr |= SI_CSR_SBC_IP;
++    }
++
++    /* Both the chip and the UDC arrive on level 2, and SBC_INT_EN gates them
++     * both.  The driver tells them apart by these two status bits. */
++    level = (s->csr & SI_CSR_INTR_EN) &&
++            (s->csr & (SI_CSR_SBC_IP | SI_CSR_DMA_IP));
++
++    if (level != s->irq_level) {
++        s->irq_level = level;
++        qemu_set_irq(s->irq, level);
++    }
++}
++
++/* Is anything happening that simulating would change?  DMA in flight, or BSY
++ * asserted - which covers arbitration, selection and every phase of a
++ * connection, because BSY is held for all of it. */
++static bool sun3_si_busy(Sun3SiState *s)
++{
++#define CSB_BSY 0x40
++    return s->dma_running || (s->f_read(s->dev, 4) & CSB_BSY);
++}
++
++/* Bring the core up to virtual time, but only while it has work to do. */
++static void sun3_si_catch_up(Sun3SiState *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    int64_t delta = now - s->last_ns;
++
++    s->last_ns = now;
++    if (delta <= 0 || !sun3_si_busy(s)) {
++        return;
++    }
++    if (delta > MAX_CATCH_UP_NS) {
++        delta = MAX_CATCH_UP_NS;
++    }
++    s->f_run_ns(s->dev, delta);
++}
++
++/*
++ * Move whatever the chip is asking for.
++ *
++ * A real UDC is woken by DREQ and takes the bus; here the pump is called after
++ * every register access and from a timer, which comes to the same thing
++ * because nothing else can happen in between.  End of Process is asserted
++ * across the last acknowledge, which is what sets END OF DMA in the chip.
++ */
++static void sun3_si_pump(Sun3SiState *s)
++{
++    unsigned moved = 0;
++
++    if (!s->dma_running) {
++        return;
++    }
++
++    while (s->fifo_count > 0 && moved < PUMP_LIMIT && s->f_drq(s->dev)) {
++        bool last = (s->fifo_count == 1);
++        uint8_t byte;
++
++        if (last) {
++            s->f_set_eop(s->dev, 1);
++        }
++
++        if (s->csr & SI_CSR_SEND) {
++            if (dma_memory_read(&s->dma_as, s->dma_addr, &byte, 1,
++                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++                s->csr |= SI_CSR_DMA_BUS_ERR;
++                break;
++            }
++            s->f_dack_write(s->dev, byte);
++        } else {
++            byte = s->f_dack_read(s->dev);
++            if (dma_memory_write(&s->dma_as, s->dma_addr, &byte, 1,
++                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++                s->csr |= SI_CSR_DMA_BUS_ERR;
++                break;
++            }
++        }
++
++        if (last) {
++            s->f_set_eop(s->dev, 0);
++        }
++
++        /* The FIFO packs bytes into words most significant byte first - the
++         * 68020's order, with no swap anywhere on the SCSI path.  A driver
++         * picking up an odd leftover reads it from bits 15:8. */
++        s->fifo_data = (uint16_t)byte << 8;
++        /* Count in the transfer, not in this call: the pump is re-entered
++         * every time the guest touches a register, so a per-call counter
++         * would end up holding the last four bytes rather than the first. */
++        if (s->head_n < 4) {
++            s->head = (s->head << 8) | byte;
++            s->head_n++;
++        }
++        s->dma_addr++;
++        s->fifo_count--;
++        if (s->udc_count > 0 && (s->fifo_count & 1) == 0) {
++            s->udc_count--;
++        }
++        moved++;
++    }
++
++    if (s->fifo_count == 0 || (s->csr & SI_CSR_DMA_BUS_ERR)) {
++        /* Terminal count, or a translation failure that forces the UDC's
++         * external EOP.  Either way the transfer is over and the UDC
++         * interrupts if it was told to. */
++        s->dma_running = false;
++        s->csr &= ~SI_CSR_DMA_ACTIVE;
++        trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
++        s->udc_status |= UDC_SR_TC | UDC_SR_NAC;
++        if (s->udc_status & UDC_SR_CIE) {
++            s->udc_status |= UDC_SR_IP;
++            s->csr |= SI_CSR_DMA_IP;
++        }
++    }
++}
++
++static void sun3_si_udc_reset(Sun3SiState *s)
++{
++    s->dma_running = false;
++    s->udc_mode = 0;
++    s->udc_count = 0;
++    s->udc_status = UDC_SR_CA | UDC_SR_NAC;   /* reset locks the channel out */
++    s->csr &= ~(SI_CSR_DMA_ACTIVE | SI_CSR_DMA_IP);
++}
++
++/*
++ * "Start chaining": the UDC fetches its own setup.  It reads a reload word and
++ * then scans it from bit 9 down to bit 0, taking successive words out of
++ * memory for each selected register.  Sun only ever selects three groups, but
++ * the scan is written out because a driver that selected a fourth would
++ * otherwise be silently misparsed.
++ */
++static void sun3_si_start_chain(Sun3SiState *s)
++{
++    /*
++     * An Am9516 address is a pair of words, and the high word is not simply
++     * the top sixteen bits: A23-A16 sit in its high byte and its low byte is
++     * the reference and control field (Sun writes 0x40 there, "system memory,
++     * increment").  Reading it as a flat 32-bit address puts the chain table
++     * at 0x004000 instead of 0xF04000, which is a translation failure rather
++     * than wrong data, so it shows up as a bus error and not as garbage.
++     */
++    uint32_t at = (((uint32_t)s->udc_car_hi & 0xff00) << 8) | s->udc_car_lo;
++    uint16_t rsel, w;
++    uint16_t addr_hi = 0, addr_lo = 0;
++    bool got_addr = false;
++    int i;
++
++    if (s->udc_status & UDC_SR_CA) {
++        /* Reset leaves the channel aborted; the driver clears that by
++         * starting a chain, which is the only thing that does. */
++        s->udc_status &= ~UDC_SR_CA;
++    }
++
++    if (dma_memory_read(&s->dma_as, at, &rsel, 2,
++                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        s->csr |= SI_CSR_DMA_BUS_ERR;
++        return;
++    }
++    rsel = be16_to_cpu(rsel);
++    at += 2;
++
++    for (i = 9; i >= 0; i--) {
++        int words;
++
++        if (!(rsel & (1 << i))) {
++            continue;
++        }
++        switch (1 << i) {
++        case RSEL_CUR_ARA:
++        case RSEL_CUR_ARB:
++        case RSEL_BASE_ARA:
++        case RSEL_BASE_ARB:
++        case RSEL_CHANNEL_MODE:
++        case RSEL_CHAIN_ADDR:
++        case RSEL_PATTERN_MASK:
++            words = 2;
++            break;
++        default:
++            words = 1;
++            break;
++        }
++
++        while (words--) {
++            if (dma_memory_read(&s->dma_as, at, &w, 2,
++                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++                s->csr |= SI_CSR_DMA_BUS_ERR;
++                return;
++            }
++            w = be16_to_cpu(w);
++            at += 2;
++
++            /* Only the fields the transfer needs are kept.  The address
++             * registers arrive upper word first; the upper word carries
++             * A23-A16 in bits 15:8 and the reference and control fields
++             * below, which for Sun are always "system memory, increment". */
++            if ((1 << i) == RSEL_CUR_ARA || (1 << i) == RSEL_CUR_ARB) {
++                if (!got_addr) {
++                    addr_hi = w;
++                    got_addr = true;
++                } else {
++                    addr_lo = w;
++                }
++            } else if ((1 << i) == RSEL_CUR_COUNT) {
++                s->udc_count = w;
++            }
++        }
++    }
++
++    s->dma_addr = (((uint32_t)addr_hi & 0xff00) << 8) | addr_lo;
++    trace_sun3_si_chain(at, rsel, s->dma_addr, s->udc_count);
++    s->udc_status &= ~(UDC_SR_TC | UDC_SR_NAC);
++    s->head = 0;
++    s->head_n = 0;
++    s->dma_running = true;
++    s->csr |= SI_CSR_DMA_ACTIVE;
++    s->csr &= ~(SI_CSR_DMA_IP | SI_CSR_DMA_BUS_ERR);
++}
++
++static void sun3_si_udc_write(Sun3SiState *s, uint16_t val)
++{
++    switch (s->udc_ptr) {
++    case UDC_ADR_MODE:
++        s->udc_mode = val;
++        break;
++    case UDC_ADR_CAR_HIGH:
++        s->udc_car_hi = val;
++        break;
++    case UDC_ADR_CAR_LOW:
++        s->udc_car_lo = val;
++        break;
++    case UDC_ADR_COUNT:
++        s->udc_count = val;
++        break;
++    case UDC_ADR_COMMAND:
++        trace_sun3_si_udc_cmd(val & 0xff);
++        switch (val & 0xff) {
++        case UDC_CMD_RESET:
++            sun3_si_udc_reset(s);
++            break;
++        case UDC_CMD_CIE:
++            s->udc_status |= UDC_SR_CIE;
++            break;
++        case UDC_CMD_STRT_CHN:
++            sun3_si_start_chain(s);
++            break;
++        default:
++            qemu_log_mask(LOG_UNIMP, "sun3-si: UDC command 0x%02x\n",
++                          val & 0xff);
++            break;
++        }
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "sun3-si: write to UDC register 0x%02x\n",
++                      s->udc_ptr);
++        break;
++    }
++}
++
++static uint16_t sun3_si_udc_read(Sun3SiState *s)
++{
++    switch (s->udc_ptr) {
++    case UDC_ADR_COMMAND:       /* status shares the pointer with command */
++        return s->udc_status;
++    case UDC_ADR_MODE:
++        return s->udc_mode;
++    case UDC_ADR_CAR_HIGH:
++        return s->udc_car_hi;
++    case UDC_ADR_CAR_LOW:
++        return s->udc_car_lo;
++    case UDC_ADR_COUNT:
++        return s->udc_count;
++    default:
++        /* Several UDC registers are not readable in the Sun-3 implementation
++         * at all; the manual says reads return unknown data. */
++        return 0;
++    }
++}
++
++/* The 5380's current phase, for the one place the board cares about it. */
++static bool sun3_si_in_data_phase(Sun3SiState *s)
++{
++    uint8_t csb = s->f_read(s->dev, 4);     /* Current SCSI Bus Status */
++    uint8_t phase = (csb >> 2) & 7;
++    return phase == 0 /* DATA OUT */ || phase == 1 /* DATA IN */;
++}
++
++static uint64_t sun3_si_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Sun3SiState *s = opaque;
++    uint64_t val = 0;
++
++    if (addr < 8) {
++        /* The chip is eight byte-wide registers on a 16-bit bus.  A word
++         * access is two register cycles, high byte first - not one wide
++         * register - and getting that wrong would quietly halve the register
++         * file for anyone who used one. */
++        val = s->f_read(s->dev, addr & 7);
++        if (size == 2) {
++            val = (val << 8) | s->f_read(s->dev, (addr + 1) & 7);
++        }
++    } else {
++        switch (addr) {
++        case 0x10:
++            val = sun3_si_udc_read(s);
++            break;
++        case 0x12:
++            val = s->udc_ptr;
++            break;
++        case 0x14:
++            val = s->fifo_data;
++            break;
++        case 0x16:
++            val = s->fifo_count;
++            break;
++        case 0x08: case 0x0a: case 0x0c: case 0x0e:
++        case 0x1a: case 0x1c: case 0x1e: case 0x20:
++            val = s->vme[(addr - 8) / 2];
++            break;
++        case 0x18:
++            sun3_si_update_irq(s);
++            s->csr &= ~(SI_CSR_FIFO_FULL | SI_CSR_FIFO_EMPTY);
++            /* The FIFO is empty exactly when there is nothing left to move;
++             * the driver waits on this after a read. */
++            if (!s->dma_running) {
++                s->csr |= SI_CSR_FIFO_EMPTY;
++            }
++            val = s->csr;
++            break;
++        default:
++            qemu_log_mask(LOG_UNIMP, "sun3-si: read 0x%" HWADDR_PRIx "\n",
++                          addr);
++            break;
++        }
++    }
++
++    sun3_si_catch_up(s);
++    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    sun3_si_pump(s);
++    sun3_si_update_irq(s);
++    trace_sun3_si_reg_read(addr, size, val);
++    return val;
++}
++
++static void sun3_si_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    Sun3SiState *s = opaque;
++
++    trace_sun3_si_reg_write(addr, size, val);
++    if (addr < 8) {
++        if (size == 2) {
++            s->f_write(s->dev, addr & 7, val >> 8);
++            s->f_write(s->dev, (addr + 1) & 7, val);
++        } else {
++            s->f_write(s->dev, addr & 7, val);
++        }
++    } else {
++        switch (addr) {
++        case 0x10:
++            sun3_si_udc_write(s, val);
++            break;
++        case 0x12:
++            /* Only six bits of pointer, and bit 1 picks the channel. */
++            s->udc_ptr = val & 0x7e;
++            break;
++        case 0x16:
++            /* "The OBIO si IGNORES any attempt to set the FIFO count register
++             * after the SCSI bus goes into any DATA phase" - which is why the
++             * driver sets it during COMMAND or MESSAGE IN.  A model that
++             * accepted it here would let a driver work that could not. */
++            if (!sun3_si_in_data_phase(s)) {
++                s->fifo_count = val;
++            }
++            break;
++        case 0x18: {
++            uint16_t old = s->csr;
++            s->csr = (s->csr & ~SI_CSR_WRITABLE) | (val & SI_CSR_WRITABLE);
++            /* Both resets are active low. */
++            if (!(val & SI_CSR_SCSI_RES)) {
++                sun3_si_udc_reset(s);
++                s->f_reset(s->dev);
++                s->csr &= ~SI_CSR_DMA_BUS_ERR;
++            }
++            if (!(val & SI_CSR_FIFO_RES)) {
++                s->fifo_data = 0;
++            }
++            (void)old;
++            break;
++        }
++        case 0x08: case 0x0a: case 0x0c: case 0x0e:
++        case 0x1a: case 0x1c: case 0x1e: case 0x20:
++            s->vme[(addr - 8) / 2] = val;
++            break;
++        case 0x14:
++            break;      /* read-only */
++        default:
++            qemu_log_mask(LOG_UNIMP, "sun3-si: write 0x%" HWADDR_PRIx "\n",
++                          addr);
++            break;
++        }
++    }
++
++    sun3_si_catch_up(s);
++    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    sun3_si_pump(s);
++    sun3_si_update_irq(s);
++}
++
++static const MemoryRegionOps sun3_si_ops = {
++    .read = sun3_si_read,
++    .write = sun3_si_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 2,
++};
++
++static void sun3_si_tick(void *opaque)
++{
++    Sun3SiState *s = opaque;
++
++    sun3_si_catch_up(s);
++    sun3_si_pump(s);
++    sun3_si_update_irq(s);
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++}
++
++static void sun3_si_exit_notify(Notifier *n, void *opaque);
++
++typedef struct {
++    Notifier notifier;
++    Sun3SiState *s;
++} Sun3SiExit;
++
++static Sun3SiExit sun3_si_exit;
++
++static void sun3_si_exit_notify(Notifier *n, void *opaque)
++{
++    Sun3SiExit *e = container_of(n, Sun3SiExit, notifier);
++
++    if (e->s && e->s->dev) {
++        e->s->f_flush(e->s->dev);
++    }
++}
++
++static void *sym(Sun3SiState *s, const char *name, Error **errp)
++{
++    void *p = dlsym(s->dl, name);
++    if (!p) {
++        error_setg(errp, "%s: missing symbol %s", s->rtl, name);
++    }
++    return p;
++}
++
++static void sun3_si_realize(DeviceState *dev, Error **errp)
++{
++    Sun3SiState *s = SUN3_SI(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++
++    if (!s->rtl) {
++        error_setg(errp, "rtl= is required: this board has no SCSI controller "
++                         "of its own, it puts the Verilated wish5380 behind "
++                         "the first eight registers");
++        return;
++    }
++
++    s->dl = dlopen(s->rtl, RTLD_NOW);
++    if (!s->dl) {
++        error_setg(errp, "cannot load %s: %s", s->rtl, dlerror());
++        return;
++    }
++
++#define GET(field, name)                                    \
++    do {                                                    \
++        s->field = sym(s, name, errp);                      \
++        if (!s->field) { return; }                          \
++    } while (0)
++    GET(f_abi, "wish_rtl_abi");
++    GET(f_new, "wish_rtl_new");
++    GET(f_free, "wish_rtl_free");
++    GET(f_flush, "wish_rtl_flush");
++    GET(f_reset, "wish_rtl_reset");
++    GET(f_write, "wish_rtl_write");
++    GET(f_read, "wish_rtl_read");
++    GET(f_irq, "wish_rtl_irq");
++    GET(f_drq, "wish_rtl_drq");
++    GET(f_dack_read, "wish_rtl_dack_read");
++    GET(f_dack_write, "wish_rtl_dack_write");
++    GET(f_set_eop, "wish_rtl_set_eop");
++    GET(f_run_ns, "wish_rtl_run_ns");
++#undef GET
++
++    if (s->f_abi() != WISH_RTL_ABI) {
++        error_setg(errp, "%s: ABI %u, this board speaks %u",
++                   s->rtl, s->f_abi(), WISH_RTL_ABI);
++        return;
++    }
++
++    if (s->dma_mr) {
++        address_space_init(&s->dma_as, s->dma_mr, "sun3-si-dma");
++    } else {
++        address_space_init(&s->dma_as, get_system_memory(), "sun3-si-dma");
++    }
++
++    if (!s->blocks) {
++        /* Size the card from the image, so a disk is as big as its file and
++         * nobody has to say the same number twice. */
++        struct stat st;
++        if (s->image && stat(s->image, &st) == 0 && st.st_size >= 512) {
++            s->blocks = st.st_size / 512;
++        } else {
++            s->blocks = 4096;
++        }
++    }
++
++    s->dev = s->f_new(s->image, s->blocks);
++    if (!s->dev) {
++        error_setg(errp, "%s: could not create the device", s->rtl);
++        return;
++    }
++
++    /* Bring the card up before the guest is anywhere near it: an SD card
++     * takes milliseconds, which a machine finishing its power-on self test
++     * would never notice. */
++    if (!s->f_reset(s->dev)) {
++        error_setg(errp, "the card behind %s never came up", s->rtl);
++        return;
++    }
++
++    sun3_si_udc_reset(s);
++    s->csr = SI_CSR_FIFO_EMPTY;     /* ID reads 0 on the onboard board */
++    s->fifo_count = 0;
++    s->irq_level = 0;
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &sun3_si_ops, s,
++                          TYPE_SUN3_SI, 0x28);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++
++    sun3_si_exit.s = s;
++    sun3_si_exit.notifier.notify = sun3_si_exit_notify;
++    qemu_add_exit_notifier(&sun3_si_exit.notifier);
++
++    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sun3_si_tick, s);
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++}
++
++static const Property sun3_si_properties[] = {
++    DEFINE_PROP_STRING("rtl", Sun3SiState, rtl),
++    DEFINE_PROP_STRING("image", Sun3SiState, image),
++    DEFINE_PROP_UINT32("blocks", Sun3SiState, blocks, 0),
++    DEFINE_PROP_LINK("dma_mr", Sun3SiState, dma_mr,
++                     TYPE_MEMORY_REGION, MemoryRegion *),
++};
++
++static void sun3_si_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = sun3_si_realize;
++    dc->desc = "Sun-3 onboard SCSI: NCR 5380 (Verilated) with an Am9516 UDC";
++    device_class_set_props(dc, sun3_si_properties);
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo sun3_si_info = {
++    .name          = TYPE_SUN3_SI,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Sun3SiState),
++    .class_init    = sun3_si_class_init,
++};
++
++static void sun3_si_register_types(void)
++{
++    type_register_static(&sun3_si_info);
++}
++
++type_init(sun3_si_register_types)
+diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
+index a8ac1e7f1d..70a68bc409 100644
+--- a/hw/scsi/trace-events
++++ b/hw/scsi/trace-events
+@@ -392,3 +392,10 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
+ scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
+ scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
+ scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
++
++# sun3-si.c
++sun3_si_reg_read(uint64_t addr, unsigned size, uint64_t val) "addr 0x%02"PRIx64" size %u -> 0x%04"PRIx64
++sun3_si_reg_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%02"PRIx64" size %u <- 0x%04"PRIx64
++sun3_si_udc_cmd(uint8_t cmd) "command 0x%02x"
++sun3_si_chain(uint32_t at, uint16_t rsel, uint32_t addr, uint16_t count) "table at 0x%06x rsel 0x%04x -> addr 0x%06x count %u words"
++sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
+-- 
+2.39.5
+

@@ -107,6 +107,7 @@ extern "C" WishRtl* wish_rtl_new(const char* image, uint32_t blocks) {
   }
 
   r->dut->rst = 1;
+  r->dut->eop_i = 0;
   r->sim->eval();
   return r;
 }
@@ -131,8 +132,13 @@ extern "C" void wish_rtl_free(WishRtl* r) {
 }
 
 // Byte address of a register.  rtl_top builds the card with a stride of one,
-// which is the generic ISA layout the guest's driver expects.
+// which is both the generic ISA layout and the Sun-3's.
 static uint32_t reg_addr(int reg) { return uint32_t(reg & 7); }
+
+// The acknowledge cycle goes through the pseudo-DMA window that does not wait
+// for DRQ: a DMA controller answering its own DRQ has already established
+// there is a byte, which is exactly what that window is for.
+static constexpr uint32_t DACK_ADDR = 0x200;
 
 extern "C" void wish_rtl_write(WishRtl* r, int reg, uint8_t val) {
   uint32_t ba = reg_addr(reg);
@@ -156,6 +162,34 @@ extern "C" uint8_t wish_rtl_read(WishRtl* r, int reg) {
             r->host->last_error() ? "  ERR" : "");
   }
   return b;
+}
+
+extern "C" int wish_rtl_drq(WishRtl* r) {
+  r->sim->eval();
+  return r->dut->drq_o ? 1 : 0;
+}
+
+extern "C" uint8_t wish_rtl_dack_read(WishRtl* r) {
+  uint32_t v = r->host->read32(DACK_ADDR, 0x1);
+  uint8_t b = uint8_t(v & 0xff);
+  if (r->trace) {
+    fprintf(stderr, "[wish5380 %8llu ns] r DACK  -> %02x\n",
+            (unsigned long long)(r->sim->time_ps() / 1000), b);
+  }
+  return b;
+}
+
+extern "C" void wish_rtl_dack_write(WishRtl* r, uint8_t val) {
+  r->host->write32(DACK_ADDR, uint32_t(val), 0x1);
+  if (r->trace) {
+    fprintf(stderr, "[wish5380 %8llu ns] w DACK  <- %02x\n",
+            (unsigned long long)(r->sim->time_ps() / 1000), val);
+  }
+}
+
+extern "C" void wish_rtl_set_eop(WishRtl* r, int asserted) {
+  r->dut->eop_i = asserted ? 1 : 0;
+  r->sim->eval();
 }
 
 extern "C" int wish_rtl_irq(WishRtl* r) {
