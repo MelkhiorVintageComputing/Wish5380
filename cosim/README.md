@@ -149,7 +149,11 @@ starting program at 0x4000
 [   1.0000000] Model: sun3 60
 [   1.0000000] si0 at obio0 addr 0x140000 ipl 2: options=0xf
 [   1.0000000] scsibus0 at si0: 8 targets, 8 luns per target
-[   3.1400030] sd0 at scsibus0 target 0 lun 0: <DOLBEAU, WISH5380 SD CARD, 0001> disk fixed
+[   3.2100030] sd0 at scsibus0 target 0 lun 0: <DOLBEAU, WISH5380 SD CARD, 0001> disk fixed
+[   3.2500030] sd0: 16384 KB, 16 cyl, 64 head, 32 sec, 512 bytes/sect x 32768 sectors
+[   3.5400030] boot device: sd0a
+[   3.7000030] root on sd0a dumps on sd0b
+[   3.8400030] root file system type: ffs
 ```
 
 Every line of that is somebody else's code.  The PROM found the board and read
@@ -157,7 +161,7 @@ its label; NetBSD's `bootxx` loaded `ufsboot` from a list of raw block numbers;
 `ufsboot` read the filesystem and pulled nearly two megabytes of kernel across
 the chip's DMA port; and then NetBSD's own `si` driver - the one written for the
 real board in 1994 - probed the bus, arbitrated, selected, sent INQUIRY, and
-attached the disk.
+attached the disk - and then mounted its root filesystem off it.
 
 Underneath, each of those transfers looks like this:
 
