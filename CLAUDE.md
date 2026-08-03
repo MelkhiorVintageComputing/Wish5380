@@ -10,12 +10,18 @@ targeting FPGAs: Wishbone B4 on the host side, an SD card on the storage side.
 The point is to let recreated vintage machines run their original, unmodified
 drivers against a disk that is really a memory card.
 
-There is **no SCSI cable and no SCSI pads**.  The chip's initiator side and an
-SD-backed target sit on a private wired-OR fabric inside the design.  A driver
-sees a SCSI bus with a disk on it; a board sees a card slot.
+There is **no SCSI cable and no SCSI pads**.  The chip's initiator side and two
+SD-backed targets sit on a private wired-OR fabric inside the design.  A driver
+sees a SCSI bus with two disks on it; a board sees two card slots.
 
-The first target machine is the **Mac Plus / SE**, which sets what the
-Wishbone front end looks like and which drivers the testbench models.
+The machine the design is *for* is the **Mac Plus / SE**, which is what the
+Wishbone front end's three windows and its register spacing are shaped by.  The
+machine the co-simulation actually boots is an i386 Linux, because every Mac
+emulator needs a ROM a script cannot fetch; `cosim/README.md` argues that at
+length, and it is the question everyone asks first.
+
+The design is complete.  All 103 tests pass on both boards at three clock
+rates, and an unmodified Linux mounts a filesystem off it.
 
 ### Where answers come from
 
@@ -59,6 +65,9 @@ make lint               # Verilator lint, -Wall, must stay clean
 make lint-icarus        # Icarus parse check
 make synth              # Yosys elaboration check of every module
 make clean
+
+make -C cosim/rtl check # drive the Verilated core through a driver's own
+                        # sequences, with no emulator in the loop
 ```
 
 `make test` must stay green on **both boards**.  Green means 0 failed; pending
@@ -73,9 +82,12 @@ with `board=0`, which is what the co-simulation boots against.  A test that
 needs the spacing asks `env.cfg().reg_stride`; one that hard-codes sixteen is
 a bug.
 
-Work proceeds test first: pick a pending test, implement the RTL, drop the
-marker.  The pending list is the project todo list - prefer adding a pending
-test for missing behaviour over leaving it untested.
+Nothing is pending and nothing is unfinished, so the test-first loop the
+project was built with - add a `TEST_PENDING`, implement the RTL, drop the
+marker - is now the loop for *adding* something rather than for finishing it.
+It still applies: behaviour that is not pinned by a test does not stay
+working.  A change that touches the RTL runs `make test-all`, not `make test`,
+because a stride of one and a stride of sixteen are different decodes.
 
 ## Architecture
 
@@ -94,28 +106,34 @@ expectations from the RTL.
 ### RTL (`src/`)
 
 ```
-wish5380_sd                  the whole thing: WB B4 slave and a card slot
-├── wish5380_wb              WB B4 slave, one clock, irq_o, a block port
+wish5380_sd                  the whole thing: a WB B4 slave and two card slots
+├── wish5380_wb              the same, for a board with some other back end
 │   ├── wb_5380              machine glue: three windows, lanes, pseudo-DMA
 │   ├── wish5380             the part
 │   │   ├── sci_regs         the eight registers and the port they hide behind
 │   │   └── sci_bus          arbitration, selection, handshake, interrupts
-│   ├── scsi_fabric          the wired-OR joining everything on the bus
-│   └── scsi_targ  x TARGETS two direct-access devices; see doc/target.md
-└── blk_sd -> sd_spi   x2    one SD card each;  see doc/sd.md
+│   ├── scsi_fabric          the wired-OR: the chip, the drives, and one spare
+│   └── scsi_targ  x TARGETS a direct-access device each; see doc/target.md
+└── blk_sd -> sd_spi  x TARGETS  one SD card each; see doc/sd.md
 ```
 
-The two tops are kept apart because the block interface between them is the
-seam that makes the rest testable.  `tb_top` instantiates **both**: the
-regression drives `wish5380_wb` against a software disk, and only the `sd_`
-tests pay for a card that has to be initialised at 400 kHz before it will say
-anything.  Those tests take longer than the whole of the rest of the suite.
+`TARGETS` is one or two and two is the default.  A board carrying one drive
+leaves the second out entirely rather than wiring an empty slot to it: a
+device driving nothing is a device that is not there.  Two is the default
+because a bus with one device never exercises the ID decode against anything
+that could get it wrong - the only other outcome is silence.
 
-`wish5380_wb` is what `tb_top` instantiates, so **every test reaches the chip
-the way a machine does** - through the Wishbone slave and its register window.
-There is no back door, and adding one would be a mistake: the first bug the
-Wishbone path found was a test that only passed because a direct register
-accessor was faster than a real bus cycle.
+**The two tops are kept apart because the block interface between them is the
+seam that makes the rest testable.**  `tb_top` instantiates both: the bulk of
+the regression drives `wish5380_wb` against a software disk, and only the
+`sd_` tests pay for a card that has to be initialised at 400 kHz before it
+will say anything.  Those thirteen tests take longer than the other ninety.
+
+Either way **every test reaches the chip the way a machine does** - through
+the Wishbone slave and its register window.  There is no back door, and adding
+one would be a mistake: the first bug the Wishbone path found was a test that
+had only ever passed because a direct register accessor was faster than a real
+bus cycle.
 
 `doc/target.md` is the target's own contract: its command set, the three rules
 that are easy to get subtly wrong, and what it deliberately does not do.
@@ -252,15 +270,22 @@ leaf means adding its ports here.
 
 ### Tests (`tb/cpp/tests/`)
 
-Prefixes are meaningful and ordered by trust: `infra_` checks the testbench
-itself, `layout_` checks our constants against the datasheet and both driver
-headers, `two_` checks what only two drives on the bus can check, `unit_` checks RTL
-leaves against software models, `reg_` the
-register file, `bus_` the SCSI engine, `wb_` the machine glue and its three
-windows, `sys_` the whole thing the way a driver drives it - arbitrate,
-select, command, data, status, message, bus free - and `sd_` that same stack
-again with a real card underneath it.  If an `infra_` test breaks, no `sys_`
-result means anything.
+Prefixes are meaningful and ordered by trust:
+
+| prefix   | what it checks |
+|----------|----------------|
+| `infra_` | the testbench itself: the clock, the reset, the accessors |
+| `layout_`| our constants, against the datasheet and both driver headers |
+| `reg_`   | the register file, on its own |
+| `bus_`   | the SCSI engine |
+| `wb_`    | the machine glue and its three windows |
+| `sys_`   | the whole thing the way a driver drives it - arbitrate, select, command, data, status, message, bus free |
+| `two_`   | what only two drives on the bus can check: the ID decode, and a wired-OR with three devices on it |
+| `sd_`    | that same stack again with a real card underneath it |
+
+If an `infra_` test breaks, no `sys_` result means anything.  The counts are
+in the top-level README and add to the total, so a prefix that stops being
+counted shows up as arithmetic.
 
 `TEST(name)` must pass.  `TEST_PENDING(name, "reason")` runs, is expected to
 fail, and is reported as PENDING; when it starts passing the runner says XPASS
@@ -268,7 +293,9 @@ and the marker comes off.
 
 Tests self register; adding a file in `tb/cpp/tests/` is enough, the Makefile
 globs it.  Checks are `CHECK`, `CHECK_MSG`, `CHECK_EQ`, `CHECK_NE` and
-`CHECK_DRV`.
+`CHECK_DRV`.  `CHECK_DRV` reports `env.drv()`'s error, which is the fast
+path's driver; `test_sd.cpp` runs on the other one and has its own `CHECK_SD`
+for that reason.
 
 ## Co-simulation (`cosim/`)
 
@@ -321,12 +348,8 @@ Every source file carries `SPDX-License-Identifier: MIT`.  The files under
 * Verilator treats a packed struct as one signal, so a module whose struct
   output depends on its struct input - which `sci_bus` is, because an
   initiator only drives the data lines when the phase matches - trips
-  UNOPTFLAT even though no field depends on itself.  That is one of five
-  suppressions in the RTL; the others are UNUSEDPARAM on the constants
-  package, two UNUSEDSIGNAL in `scsi_targ` - a target never reads back the
-  signals it drives, and ignores the reserved fields of a command block - and
-  one in `blk_sd`, for the reserved fields of the card's own registers.  All
-  five are narrow and on a declaration.
+  UNOPTFLAT even though no field depends on itself.  Synthesis sees the real,
+  acyclic netlist.
 * A mutation test on a parameterised module has to change the parameter at the
   level that *sets* it.  Changing `wb_5380`'s default proves nothing, because
   `wish5380_wb` overrides it.  And a mutation that leaves a signal unused
@@ -336,8 +359,21 @@ Every source file carries `SPDX-License-Identifier: MIT`.  The files under
   field-by-field assembly of `csb_o`.  It concerns sensitivity-list
   construction in an `always_comb`, is harmless, and does not fail the run;
   do not "fix" it by unrolling.
-* `wish5380_pkg.sv` carries the RTL's only `lint_off`, for `UNUSEDPARAM`: it
-  is a file of constants describing the whole part, so a constant with no user
-  yet is expected.  Do not widen the suppression to other files.
-* `make lint` runs with `-Wall` and must stay silent.  Suppressions are narrow
-  `lint_off` pragmas - narrow them further rather than widening.
+* `make lint` runs with `-Wall` and must stay silent.  Every suppression in
+  the RTL is a narrow `lint_off`/`lint_on` pair around a declaration, and
+  there are four reasons for one - `grep -n lint_off src/*.sv` is the list,
+  not a number in this file, because a number here goes stale:
+  * **UNUSEDPARAM** on `wish5380_pkg.sv`, which describes the whole part
+    rather than the part of it wired up today;
+  * **UNOPTFLAT** on `drive_data` in `sci_bus.sv`, for the struct-granularity
+    reason above;
+  * **UNUSEDSIGNAL** on registers a device defines and this design reads only
+    some fields of - a command block's reserved bytes in `scsi_targ.sv`, the
+    card's own registers in `blk_sd.sv`;
+  * **UNUSEDSIGNAL** on the second drive's wires and ports in
+    `wish5380_wb.sv` and `wish5380_sd.sv`, which exist whether or not
+    `TARGETS` builds a drive on the end of them.
+
+  Narrow them further rather than widening, and prefer using a signal to
+  suppressing it: two of the four above started as something that could have
+  been used and was not.
