@@ -172,12 +172,47 @@ control.  Read flat, the chain table address 0xF04000 becomes 0x004000, which
 is not wrong data but a translation failure - so it surfaces as a DMA bus error
 rather than as garbage, and points away from itself.
 
-### Where it stops
+### The disk
 
-The PROM reads block 0 and gets what is on the disk.  It does not yet boot an
-operating system, because that needs a disk image with a real boot block and
-filesystem on it, which is a separate piece of work.  NetBSD's own `si` driver
-is the next thing to put in front of this.
+`cosim/scripts/make-sun3-disk.py` builds a bootable NetBSD/sun3 disk out of
+parts NetBSD publishes, and assembles it here rather than installing it inside
+the machine, because installing it inside the machine needs a machine that
+already boots.
+
+```sh
+cd work/netbsd
+curl -O https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/sun3/installation/miniroot/miniroot.fs.gz
+curl -O https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/sun3/binary/sets/base.tgz
+gunzip -k miniroot.fs.gz
+tar xzf base.tgz ./usr/mdec
+cd ../..
+cosim/scripts/make-sun3-disk.py --miniroot work/netbsd/miniroot.fs \
+    --bootxx work/netbsd/usr/mdec/bootxx --out work/sun3/disk.img
+```
+
+What that produces, and why each piece is where it is:
+
+| blocks | what |
+|---|---|
+| 0 | the Sun label - geometry and the partition table |
+| 1-15 | `bootxx`, which the PROM loads whole and jumps into |
+| 32 on | NetBSD's miniroot, holding `/ufsboot` and `/netbsd.sun3` |
+
+**`bootxx` is not a filesystem reader.**  It carries a list of raw block
+numbers, and copies those blocks into memory and jumps to them; that is how
+the second stage gets loaded before anything in the machine understands FFS.
+On a real installation `installboot(8)` asks the running kernel where
+`/ufsboot` lives and patches the list in.  Here `cosim/scripts/ffs.py` reads
+the miniroot's own inode for it and we patch it ourselves - which needs a
+filesystem *reader* and not a writer, and the label and boot blocks go in the
+sixteen kilobytes the filesystem already reserves ahead of its superblock.
+
+`ffs.py` is checked against itself: the `/ufsboot` it extracts from the
+miniroot is byte-identical to the `usr/mdec/ufsboot` in the distribution, and
+the `/netbsd.sun3` it extracts - which is large enough to need the indirect
+blocks - is a valid m68k ELF that says `NetBSD 10.1 (INSTALL)`.
+
+### Where it stops
 
 ## Rules this directory follows
 

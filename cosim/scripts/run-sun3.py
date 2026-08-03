@@ -50,8 +50,10 @@ def main():
     ap.add_argument('-q', '--quiet', action='store_true',
                     help='do not echo the console as it arrives')
     ap.add_argument('-m', '--memory', default='4M')
-    ap.add_argument('-t', '--timeout', type=float, default=180,
-                    help='seconds to keep reading after the last command')
+    ap.add_argument('-t', '--timeout', type=float, default=600,
+                    help='seconds to allow the run in total')
+    ap.add_argument('-i', '--idle', type=float, default=60,
+                    help='give up after this long with nothing on the console')
     ap.add_argument('--qemu', default=os.path.join(SUN3, 'build',
                                                    'qemu-system-m68k'))
     ap.add_argument('--prom', default=os.path.join(FORK, 'roms',
@@ -107,6 +109,7 @@ def main():
     pending = list(args.commands)
     deadline = time.time() + args.timeout
     last_sent = None
+    last_out = time.time()
 
     try:
         while time.time() < deadline:
@@ -125,6 +128,7 @@ def main():
                 sys.stdout.buffer.flush()
             buf += clean
             log += clean
+            last_out = time.time()
 
             # The prompt is a ">" at the start of a line with nothing after it
             # yet; wait a beat so a command's own echo does not look like one.
@@ -134,7 +138,10 @@ def main():
                 os.write(fd, line.encode() + b'\r')
                 last_sent = time.time()
                 buf = b''
-            elif not pending and last_sent and time.time() - last_sent > 30:
+            # Stop when the machine goes quiet, not a fixed time after the
+            # last command: booting an operating system through a Verilated
+            # chip takes minutes, and most of them are silent ones.
+            if not pending and last_sent and time.time() - last_out > args.idle:
                 break
     finally:
         try:
