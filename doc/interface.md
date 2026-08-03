@@ -15,15 +15,21 @@ Page numbers are the printed pages of `doc/NCR5380_design_manual_Mar86.pdf`.
 ## The shape of the thing
 
 ```
-wish5380_wb                  Wishbone B4 slave, one clock, irq_o
-├── wb_5380                  the machine glue: apertures, byte lanes, pseudo-DMA
-├── wish5380                 the part
-│   ├── sci_regs             the eight registers and the port they hide behind
-│   └── sci_bus              arbitration, selection, handshake, interrupts
-├── scsi_fabric              the wired-OR joining the part to the target
-└── scsi_targ                a direct-access device
-    └── blk_sd -> sd_spi     the SD card behind it
+wish5380_sd                  the whole thing: a WB B4 slave and two card slots
+├── wish5380_wb              the same, for a board with some other back end
+│   ├── wb_5380              the machine glue: windows, byte lanes, pseudo-DMA
+│   ├── wish5380             the part
+│   │   ├── sci_regs         the eight registers and the port they hide behind
+│   │   └── sci_bus          arbitration, selection, handshake, interrupts
+│   ├── scsi_fabric          the wired-OR: the chip, the drives, and one spare
+│   └── scsi_targ  x TARGETS a direct-access device each
+└── blk_sd -> sd_spi  x TARGETS  one SD card each
 ```
+
+The two tops are separate because the block interface between them is a seam
+worth having: `wish5380_wb` is the design for a board that backs its drives
+with something other than an SD card, and it is what the bulk of the
+regression drives, against a software disk.
 
 ## Where the line between the part and the machine falls
 
@@ -97,17 +103,34 @@ NetBSD's `sbc_obio.c` names them (lines 60-74), and they are the model here:
 
 The register window puts register *n* at byte offset *n* × `REG_STRIDE`.
 `REG_STRIDE` is an elaboration parameter and defaults to 16, which is the
-Mac's `(reg) << 4` in `mac_scsi.c` line 38.  A generic ISA card sets it to 1.
+Mac's `(reg) << 4` in `mac_scsi.c` line 38; a generic ISA card sets it to 1,
+which is `inb(base + reg)` in `g_NCR5380.c`.
+
+That is the whole difference between the two boards, and it is enough to
+change the decode: with a stride of one the register window is eight bytes
+rather than a hundred and twenty-eight, and the byte a register lands in is
+the low two bits of its own address rather than always zero.  `make test-all`
+runs the whole suite against both, the way the sibling project runs its
+against both MII and GMII.
 
 The handshake aperture is where the Mac's character comes from.  Linux's
-`mac_scsi.c` reads and writes it with `movew` and `moveml` - two and thirty-two
-bytes per instruction (lines 215-266) - so a wider access there is *n*
-consecutive byte handshakes on the SCSI bus, not one wide one.  And it wraps
-those instructions in an exception fixup table, because the Mac's hardware
-raises a **bus error** when the chip does not produce a byte in time; that is
-`ERR_O` here, and the driver counts on it as a normal outcome rather than a
-fault.  `macscsi_wait_for_drq` (line 279) shows what it polls before each
-chunk and is the sequence to match.
+`mac_scsi.c` reads and writes it with `moveb` and `movew`, so an access there
+moves one SCSI byte per asserted byte lane - a `movew` is two consecutive
+REQ/ACK handshakes on the bus, not one wide one.
+
+**A `movew` is the widest access the aperture has to serve.**  `MOVE_16_WORDS`
+looks like a burst instruction and is not: it is sixteen `movew` instructions
+unrolled for speed (lines 163-210), and there is no `movem` anywhere in the
+file.  A glue that prepared for a thirty-two byte transaction would be
+preparing for something no driver issues.
+
+The driver wraps those instructions in an exception fixup table, because the
+Mac's hardware raises a **bus error** when the chip does not produce a byte in
+time; that is `ERR_O` here, and the driver counts on it as a normal outcome
+rather than a fault - a faulting `moveb` on receive is retried, a faulting
+`movew` abandons the transfer because the residual count is then uncertain.
+`macscsi_wait_for_drq` shows what it polls before each chunk and is the
+sequence to match.
 
 The no-handshake aperture exists for the machines where the hardware
 handshake is broken or absent; there an access is a plain DACK cycle and the
@@ -115,8 +138,8 @@ driver has already satisfied itself that a byte is ready.
 
 ## The internal SCSI bus
 
-There are no SCSI pads.  The only target is the SD-backed one inside the
-chip, so the bus is a private fabric rather than a cable.
+There are no SCSI pads.  The only devices are the chip and the SD-backed
+drives beside it, so the bus is a private fabric rather than a cable.
 
 The real bus is open collector and active low, and every device sees the OR of
 what everybody is driving.  Here each device drives a `scsi_t`
@@ -134,6 +157,19 @@ check that arbitration was won.
 
 Parity travels as a bit rather than as something the fabric computes, so a
 test can drive bad parity at a chip that has ENABLE PARITY CHECKING set.
+
+**The fabric carries four devices**: the chip, two drives, and one spare.  The
+spare is what the testbench drives to stand in for something else on the bus,
+and is tied to zero in the real top level - a device driving nothing is a
+device that is not there, which is exactly what an open-collector bus means by
+it, and it is also how `TARGETS` switches the second drive off for a board
+that carries one.
+
+Two drives is the default because a bus with one device never exercises the ID
+decode against anything that could get it wrong: the only other outcome is
+silence, so a target that answered every selection and one that answered only
+its own would be indistinguishable.  `doc/target.md` says more, including why
+"arbitration" is the wrong word for what a second drive exercises.
 
 ## Clocking, and a clockless part
 
@@ -182,20 +218,18 @@ the same time, so no arbitration is needed and none is implemented.
 512-byte blocks, which is both the SD card's unit and the sector size every
 vintage driver expects.
 
-That interface is what lets `blk_sd` replace `tb/cpp/disk.h` without the SCSI
-side noticing, and what lets the SD 4-bit layer later replace the SPI one
-without the block side noticing.  `doc/target.md` sets out the rest of the
-target's contract.
+That interface is what lets `blk_sd` stand where `tb/cpp/disk.h` stands
+without the SCSI side noticing - which is not a hypothetical, since the
+regression tests SCSI against the software disk and only the `sd_` tests pay
+for a card - and what would let an SD 4-bit layer replace the SPI one without
+the block side noticing.  `doc/target.md` sets out the rest of the target's
+contract and `doc/sd.md` what is on the far side of this one.
 
-## The fabric has three ports
+## Four decisions with no silicon to be faithful to
 
-Two devices and a spare.  The spare is what the testbench drives to stand in
-for another device on the bus, and is tied to zero in the real top level: a
-device driving nothing is a device that is not there, which is exactly what an
-open-collector bus means by it.  A second target means widening this and
-nothing else.
-
-## Three questions, now answered
+Everything above is what the datasheet or a driver settles.  These four had to
+be argued instead, and are recorded because the argument is the only thing
+that makes them reviewable.
 
 * **A wide access to the register window answers `ERR_O`.**  A register is one
   byte and every driver reaches it with one; what real hardware would do with
@@ -212,18 +246,15 @@ nothing else.
   `peer_i` to drive.  An interconnect that cannot be seen cannot be debugged
   on hardware either, and an integrator will want it on a logic analyser.  Tie
   `peer_i` to zero and leave `bus_o` unconnected in a real design.
+* **The pseudo-DMA windows stay addressable in the ISA build**, even though no
+  generic-ISA driver looks there - Linux's own boot line says
+  `NO_PSEUDO_DMA`.  Taking them away would be more faithful to a real generic
+  card and would only take away coverage, since every test that exercises
+  those windows would then have to be Mac-only.
 
 ## Nothing is open
 
-The fabric carries four devices: the chip, two drives, and one port the
-testbench drives.  `TARGETS` chooses whether the second drive is built, and
-two is the default - `doc/target.md` says why one is not enough to test with,
-and why "arbitration" was the wrong word for what a second drive exercises.
-
-The second configuration is settled: `make test-all` runs the whole suite
-against both boards, `BOARD=mac` and `BOARD=isa`, the way the sibling project
-runs its against both MII and GMII.  The two differ in `REG_STRIDE` alone,
-which is what changes the decode.  The pseudo-DMA windows stay addressable in
-the ISA build even though no generic-ISA driver looks there - Linux's own boot
-line says `NO_PSEUDO_DMA` - because taking them away would only take away
-coverage.
+Every question this document once listed as unsettled has an answer above.
+What would change it now is a new board, a new back end, or a device on the
+fabric that is not a disk - and any of those changes the RTL, the testbench
+and this document together, which is the rule at the top.
