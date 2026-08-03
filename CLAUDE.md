@@ -258,6 +258,21 @@ Tests self register; adding a file in `tb/cpp/tests/` is enough, the Makefile
 globs it.  Checks are `CHECK`, `CHECK_MSG`, `CHECK_EQ`, `CHECK_NE` and
 `CHECK_DRV`.
 
+## Co-simulation (`cosim/`)
+
+A separate and much slower loop, deliberately not part of `make test`.
+**Nothing in `src/` or `tb/` may grow a dependency on it** - the traffic goes
+the other way.  `cosim/README.md` records why the guest is an i386 Linux and
+not a Macintosh, which is the question everyone asks first.
+
+`make -C cosim/rtl check` is the thing to run before blaming the RTL: it drives
+the shared library through the driver's own sequences with no emulator in the
+loop, so a fault has two places to be instead of four.
+
+The library reuses `sim`, `wb`, `util` and `sd_card` from `tb/cpp` unchanged.
+A co-simulation with its own bus model would drift from the regression and stop
+saying anything about it.
+
 ## Conventions
 
 RTL: SystemVerilog, `always_ff`/`always_comb`, synchronous active-high reset,

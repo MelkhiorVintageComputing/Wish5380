@@ -22,11 +22,11 @@ there is a card slot.
 
 ## Status
 
-The design is complete.  A driver reaches the Wishbone slave through the
-three windows a Macintosh expects, arbitrates and selects, and reads and
-writes blocks - either a byte at a time in programmed I/O or through the
-pseudo-DMA aperture the Mac uses for speed - and those blocks come off an SD
-card in its slot.  What remains is co-simulation against a real driver.
+The design is complete and an unmodified Linux boots off it.  A driver
+reaches the Wishbone slave through the three windows a Macintosh expects,
+arbitrates and selects, and reads and writes blocks - either a byte at a time
+in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
+and those blocks come off an SD card in its slot.
 
 | block                                            | state         |
 |--------------------------------------------------|---------------|
@@ -46,11 +46,15 @@ card in its slot.  What remains is co-simulation against a real driver.
 | the deliverable top level (`wish5380_wb`)        | done, tested  |
 | SD card in SPI mode (`blk_sd`, `sd_spi`)         | done, tested  |
 | the whole design with a card in it (`wish5380_sd`) | done, tested |
-| co-simulation against a real driver              | not started   |
+| co-simulation against Linux's own driver         | done, running |
 
 95 tests pass, none pending, at 7.8 MHz, 50 MHz and 125 MHz - the part's
 delays are derived from the clock rather than written down, so the regression
 checks whichever clock it was built for.
+
+An i386 Linux, unmodified, probes the design with its own `g_NCR5380`,
+attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
+files - see [`cosim/`](cosim/README.md).
 
 ## Building and testing
 
@@ -91,5 +95,6 @@ failures and do not break the build.
 src/      RTL
 tb/sv/    simulation top level
 tb/cpp/   testbench: bus models, SCSI and SD models, test framework, tests
+cosim/    the Verilated core behind a C interface, and a guest that drives it
 doc/      datasheets, interface notes, vintage drivers
 ```

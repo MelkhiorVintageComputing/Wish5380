@@ -1,0 +1,324 @@
+diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/Kconfig work/qemu-src/hw/scsi/Kconfig
+--- a/hw/scsi/Kconfig	2025-12-06 14:17:12.000000000 +0100
++++ b/hw/scsi/Kconfig	2026-08-03 18:01:38.466830668 +0200
+@@ -58,3 +58,8 @@
+     # Only PCI devices are provided for now
+     default y if VIRTIO_PCI
+     depends on VIRTIO && VHOST_USER && LINUX
++
++config NCR5380_ISA
++    bool
++    default y
++    depends on ISA_BUS
+diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/meson.build work/qemu-src/hw/scsi/meson.build
+--- a/hw/scsi/meson.build	2025-12-06 14:17:12.000000000 +0100
++++ b/hw/scsi/meson.build	2026-08-03 18:01:38.486830721 +0200
+@@ -23,4 +23,6 @@
+ 
+ specific_scsi_ss.add(when: 'CONFIG_SPAPR_VSCSI', if_true: files('spapr_vscsi.c'))
+ 
++softmmu_ss.add(when: 'CONFIG_NCR5380_ISA', if_true: files('ncr5380-isa.c'))
++
+ specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
+diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/ncr5380-isa.c work/qemu-src/hw/scsi/ncr5380-isa.c
+--- a/hw/scsi/ncr5380-isa.c	1970-01-01 01:00:00.000000000 +0100
++++ b/hw/scsi/ncr5380-isa.c	2026-08-03 18:07:00.323755586 +0200
+@@ -0,0 +1,275 @@
++/*
++ * An ISA card carrying an NCR 5380, backed by the Verilated wish5380.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * This is the shape Linux's g_NCR5380 driver expects from `board=0`: eight
++ * byte-wide registers at an I/O port, one apart, and an interrupt.  There is
++ * nothing else on the card - no BIOS ROM, no pseudo-DMA window - because the
++ * generic board has nothing else either, and the driver reaches the chip with
++ * `inb(base + reg)`.
++ *
++ * The chip itself is not modelled here.  The card loads the shared library
++ * built by cosim/rtl and asks it the same handful of questions any 5380 model
++ * would be asked: reset, read or write a register, is the interrupt asserted.
++ * That is the whole interface, and its smallness is a property of the part:
++ * a 5380 never masters the bus, so there is no DMA path to arrange and no
++ * guest memory to reach.
++ *
++ * Time is the awkward part.  The core only advances when it is stepped, and
++ * the SCSI target and the SD card behind it need to advance while the guest
++ * is between accesses - waiting out a udelay, or spinning on jiffies.  So
++ * every access steps the core a little, and a timer steps it while nothing is
++ * happening at all.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/isa/isa.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "sysemu/runstate.h"
++#include "qom/object.h"
++
++#include <dlfcn.h>
++
++#define TYPE_NCR5380_ISA "ncr5380-isa"
++OBJECT_DECLARE_SIMPLE_TYPE(Ncr5380IsaState, NCR5380_ISA)
++
++/* Must match cosim/rtl/wish_rtl.h. */
++#define WISH_RTL_ABI 1
++typedef struct WishRtl WishRtl;
++
++/* How far the core is stepped for each register access, and how often and how
++ * far it is stepped when the guest is doing something else.  Both are the
++ * core's own time, which runs ahead of the guest's: a real part is faster than
++ * the bus it sits on, so no driver can tell. */
++#define STEP_PER_ACCESS_NS  1000
++#define TIMER_PERIOD_NS     (500 * 1000)
++#define TIMER_STEP_NS       (100 * 1000)
++
++struct Ncr5380IsaState {
++    ISADevice parent_obj;
++
++    uint32_t iobase;
++    uint32_t isairq;
++    char *rtl;
++    char *image;
++    uint32_t blocks;
++
++    MemoryRegion io;
++    qemu_irq irq;
++    QEMUTimer *timer;
++    int irq_level;
++
++    void *dl;
++    WishRtl *dev;
++    Notifier exit_notifier;
++
++    uint32_t (*f_abi)(void);
++    WishRtl *(*f_new)(const char *, uint32_t);
++    void (*f_free)(WishRtl *);
++    void (*f_flush)(WishRtl *);
++    int (*f_reset)(WishRtl *);
++    void (*f_write)(WishRtl *, int, uint8_t);
++    uint8_t (*f_read)(WishRtl *, int);
++    int (*f_irq)(WishRtl *);
++    void (*f_run_ns)(WishRtl *, uint64_t);
++    uint64_t (*f_time_ns)(WishRtl *);
++};
++
++/* QEMU does not unrealize devices on the way out, and the card image is only
++ * written back when the library is told to.  Without this, everything the
++ * guest wrote would live and die inside the SD card model. */
++static void ncr5380_exit_notify(Notifier *n, void *opaque)
++{
++    Ncr5380IsaState *s = container_of(n, Ncr5380IsaState, exit_notifier);
++    if (s->dev) {
++        s->f_flush(s->dev);
++    }
++}
++
++static void ncr5380_update_irq(Ncr5380IsaState *s)
++{
++    int level = s->f_irq(s->dev);
++    if (level != s->irq_level) {
++        s->irq_level = level;
++        qemu_set_irq(s->irq, level);
++    }
++}
++
++static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Ncr5380IsaState *s = opaque;
++    uint8_t v = s->f_read(s->dev, (int)(addr & 7));
++    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    ncr5380_update_irq(s);
++    return v;
++}
++
++static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    Ncr5380IsaState *s = opaque;
++    s->f_write(s->dev, (int)(addr & 7), (uint8_t)val);
++    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    ncr5380_update_irq(s);
++}
++
++static const MemoryRegionOps ncr5380_ops = {
++    .read = ncr5380_read,
++    .write = ncr5380_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void ncr5380_tick(void *opaque)
++{
++    Ncr5380IsaState *s = opaque;
++    s->f_run_ns(s->dev, TIMER_STEP_NS);
++    ncr5380_update_irq(s);
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++}
++
++static void *sym(Ncr5380IsaState *s, const char *name, Error **errp)
++{
++    void *p = dlsym(s->dl, name);
++    if (!p) {
++        error_setg(errp, "%s: missing symbol %s", s->rtl, name);
++    }
++    return p;
++}
++
++static void ncr5380_realize(DeviceState *dev, Error **errp)
++{
++    ISADevice *isadev = ISA_DEVICE(dev);
++    Ncr5380IsaState *s = NCR5380_ISA(dev);
++
++    if (!s->rtl) {
++        error_setg(errp, "rtl= is required: this card has no chip of its own, "
++                         "it puts the Verilated wish5380 behind the port");
++        return;
++    }
++
++    s->dl = dlopen(s->rtl, RTLD_NOW);
++    if (!s->dl) {
++        error_setg(errp, "cannot load %s: %s", s->rtl, dlerror());
++        return;
++    }
++
++#define GET(field, name)                                    \
++    do {                                                    \
++        s->field = sym(s, name, errp);                      \
++        if (!s->field) { return; }                          \
++    } while (0)
++    GET(f_abi, "wish_rtl_abi");
++    GET(f_new, "wish_rtl_new");
++    GET(f_free, "wish_rtl_free");
++    GET(f_flush, "wish_rtl_flush");
++    GET(f_reset, "wish_rtl_reset");
++    GET(f_write, "wish_rtl_write");
++    GET(f_read, "wish_rtl_read");
++    GET(f_irq, "wish_rtl_irq");
++    GET(f_run_ns, "wish_rtl_run_ns");
++    GET(f_time_ns, "wish_rtl_time_ns");
++#undef GET
++
++    if (s->f_abi() != WISH_RTL_ABI) {
++        error_setg(errp, "%s: ABI %u, this card speaks %u",
++                   s->rtl, s->f_abi(), WISH_RTL_ABI);
++        return;
++    }
++
++    s->dev = s->f_new(s->image, s->blocks);
++    if (!s->dev) {
++        error_setg(errp, "%s: could not create the device", s->rtl);
++        return;
++    }
++
++    /* Bring the card up before the guest is anywhere near it, which is what a
++     * machine that finishes its power-on self test before probing SCSI would
++     * do.  An SD card takes milliseconds; the guest never sees them. */
++    if (!s->f_reset(s->dev)) {
++        error_setg(errp, "the card behind %s never came up", s->rtl);
++        return;
++    }
++
++    s->irq = isa_get_irq(isadev, s->isairq);
++    s->irq_level = 0;
++
++    memory_region_init_io(&s->io, OBJECT(dev), &ncr5380_ops, s,
++                          TYPE_NCR5380_ISA, 8);
++    memory_region_add_subregion(isa_address_space_io(isadev), s->iobase,
++                                &s->io);
++
++    s->exit_notifier.notify = ncr5380_exit_notify;
++    qemu_add_exit_notifier(&s->exit_notifier);
++
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ncr5380_tick, s);
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++}
++
++static void ncr5380_unrealize(DeviceState *dev)
++{
++    Ncr5380IsaState *s = NCR5380_ISA(dev);
++
++    if (s->timer) {
++        timer_del(s->timer);
++    }
++    if (s->dev) {
++        s->f_free(s->dev);
++        s->dev = NULL;
++    }
++}
++
++static void ncr5380_reset(DeviceState *dev)
++{
++    Ncr5380IsaState *s = NCR5380_ISA(dev);
++
++    /* A machine reset does not take the card down: the guest is rebooting,
++     * not being unplugged, and bringing the SD card up again would cost
++     * milliseconds of simulated time for nothing.  The chip's own RESET pin
++     * is what the driver pulses, and that reaches the core through the
++     * registers. */
++    if (s->dev) {
++        ncr5380_update_irq(s);
++    }
++}
++
++static Property ncr5380_properties[] = {
++    DEFINE_PROP_UINT32("iobase", Ncr5380IsaState, iobase, 0x350),
++    DEFINE_PROP_UINT32("irq", Ncr5380IsaState, isairq, 5),
++    DEFINE_PROP_STRING("rtl", Ncr5380IsaState, rtl),
++    DEFINE_PROP_STRING("image", Ncr5380IsaState, image),
++    DEFINE_PROP_UINT32("blocks", Ncr5380IsaState, blocks, 4096),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void ncr5380_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ncr5380_realize;
++    dc->unrealize = ncr5380_unrealize;
++    dc->reset = ncr5380_reset;
++    dc->desc = "NCR 5380 SCSI on an ISA card, behind the Verilated wish5380";
++    device_class_set_props(dc, ncr5380_properties);
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo ncr5380_info = {
++    .name          = TYPE_NCR5380_ISA,
++    .parent        = TYPE_ISA_DEVICE,
++    .instance_size = sizeof(Ncr5380IsaState),
++    .class_init    = ncr5380_class_init,
++};
++
++static void ncr5380_register_types(void)
++{
++    type_register_static(&ncr5380_info);
++}
++
++type_init(ncr5380_register_types)
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/__init__.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/__init__.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/commands.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/commands.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/common.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/common.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/error.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/error.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/events.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/events.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/expr.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/expr.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/gen.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/gen.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/introspect.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/introspect.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/main.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/main.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/parser.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/parser.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/schema.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/schema.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/source.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/source.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/types.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/types.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/qapi/__pycache__/visit.cpython-311.pyc and work/qemu-src/scripts/qapi/__pycache__/visit.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/__pycache__/__init__.cpython-311.pyc and work/qemu-src/scripts/tracetool/__pycache__/__init__.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/__pycache__/transform.cpython-311.pyc and work/qemu-src/scripts/tracetool/__pycache__/transform.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/__pycache__/vcpu.cpython-311.pyc and work/qemu-src/scripts/tracetool/__pycache__/vcpu.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/backend/__pycache__/__init__.cpython-311.pyc and work/qemu-src/scripts/tracetool/backend/__pycache__/__init__.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/backend/__pycache__/dtrace.cpython-311.pyc and work/qemu-src/scripts/tracetool/backend/__pycache__/dtrace.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/backend/__pycache__/log.cpython-311.pyc and work/qemu-src/scripts/tracetool/backend/__pycache__/log.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/format/__pycache__/__init__.cpython-311.pyc and work/qemu-src/scripts/tracetool/format/__pycache__/__init__.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/format/__pycache__/c.cpython-311.pyc and work/qemu-src/scripts/tracetool/format/__pycache__/c.cpython-311.pyc differ
+Binary files work/qemu-pristine/scripts/tracetool/format/__pycache__/h.cpython-311.pyc and work/qemu-src/scripts/tracetool/format/__pycache__/h.cpython-311.pyc differ

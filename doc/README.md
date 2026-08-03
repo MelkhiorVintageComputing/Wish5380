@@ -9,6 +9,7 @@
 | [`sd.md`](sd.md) | the SD card behind the block interface: SPI mode, coming up, and what CRC is checked |
 | [`target.md`](target.md) | the SCSI target behind the fabric: its command set and its limits |
 | [`interface.md`](interface.md) | the contract between `src/` and `tb/`: register port, Wishbone apertures, the internal SCSI bus, clocking |
+| [`../cosim/README.md`](../cosim/README.md) | co-simulation: an unmodified Linux booting off the RTL, and why the guest is not a Macintosh |
 | [`drivers/`](drivers/README.md) | vintage drivers for the real chip, and which source is the authority on what |
 
 Both design manuals are scans from [bitsavers](https://www.bitsavers.org/components/ncr_symbios/scsi/5380/)

@@ -1,7 +1,7 @@
 **~
-build/
-*.vcd
 *.fst
+*.vcd
 .claude/*.tmp.*
-work/
 __pycache__/
+build/
+work/
