@@ -15,6 +15,7 @@
 // model would be checking the model against itself.
 
 #include <dlfcn.h>
+#include <sys/stat.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -235,6 +236,10 @@ std::string ascii(const std::vector<uint8_t>& b, size_t off, size_t n) {
 
 int main(int argc, char** argv) {
   const char* path = (argc > 1) ? argv[1] : "work/lib/libwish5380rtl.so";
+  // An optional image behind the card, and a block in it to check.
+  const char* image = (argc > 2) ? argv[2] : nullptr;
+  uint32_t probe = (argc > 3) ? uint32_t(strtoul(argv[3], nullptr, 0)) : 0;
+  uint32_t nblk  = (argc > 4) ? uint32_t(strtoul(argv[4], nullptr, 0)) : 1;
   lib.h = dlopen(path, RTLD_NOW);
   if (!lib.h) {
     fprintf(stderr, "cannot load %s: %s\n", path, dlerror());
@@ -267,7 +272,13 @@ int main(int argc, char** argv) {
   }
 
   printf("wish5380 self test, ABI %u\n", lib.abi());
-  dev = lib.create(nullptr, 4096);
+  uint32_t card = 4096;
+  if (image) {
+    struct stat st;
+    if (stat(image, &st) == 0 && st.st_size >= 512) card = uint32_t(st.st_size / 512);
+    printf("image %s, %u blocks\n", image, card);
+  }
+  dev = lib.create(image, card);
   if (!dev) { fprintf(stderr, "could not create the device\n"); return 2; }
 
   printf("resetting, and waiting for the card...\n");
@@ -327,6 +338,39 @@ int main(int argc, char** argv) {
     fail("the block did not read back as it was written");
   } else {
     printf("  512 bytes, unchanged\n");
+  }
+
+  // With an image behind the card, read a block wherever the caller asks and
+  // compare it with the file.  A disk with an operating system on it is read
+  // far from block 0 - SunOS's root filesystem starts forty megabytes in -
+  // and nothing else here goes past block 3.
+  if (image) {
+    printf("READ(6) of %u block(s) at %u against the image...\n", nblk, probe);
+    Result pq = command(0, {uint8_t(0x08), uint8_t((probe >> 16) & 0x1f),
+                            uint8_t((probe >> 8) & 0xff), uint8_t(probe & 0xff),
+                            uint8_t(nblk), 0},
+                        {}, size_t(nblk) * 512);
+    std::vector<uint8_t> want(size_t(nblk) * 512);
+    FILE* f = fopen(image, "rb");
+    if (f) {
+      if (fseek(f, long(probe) * 512, SEEK_SET) != 0 ||
+          fread(want.data(), 1, want.size(), f) != want.size()) {
+        want.assign(want.size(), 0);
+      }
+      fclose(f);
+    }
+    if (!pq.ok || pq.status != 0) {
+      fail("the read failed");
+    } else if (pq.data != want) {
+      size_t at = 0;
+      while (at < want.size() && at < pq.data.size() && pq.data[at] == want[at]) at++;
+      fprintf(stderr, "  got %zu bytes, wanted %zu\n", pq.data.size(), want.size());
+      fprintf(stderr, "  first difference at byte %zu: got 0x%02x, want 0x%02x\n",
+              at, pq.data[at], want[at]);
+      fail("the block did not match the image");
+    } else {
+      printf("  %zu bytes, as the file has them\n", want.size());
+    }
   }
 
   printf("simulated time: %llu us\n",

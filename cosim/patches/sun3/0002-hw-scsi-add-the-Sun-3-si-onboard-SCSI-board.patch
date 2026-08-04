@@ -1,6 +1,6 @@
-From 170bdf874a2d51a87d8f936d7349745f5bfcfe98 Mon Sep 17 00:00:00 2001
+From 2142eeac6626fea976d79e15dee3790a992d8912 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
-Date: Tue, 4 Aug 2026 09:08:10 +0200
+Date: Tue, 4 Aug 2026 13:46:10 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
 
 The 3/60's SCSI is three things in one 32-byte register block: an NCR
@@ -21,25 +21,33 @@ Only the corner of the Am9516 that Sun uses is modelled: channel 1,
 word transfers, a one-shot chain of three register groups.  A model of
 the rest would be a model of code nobody runs.
 
-Two status bits are deliberately never set, and both took a driver to
-settle.  DMA_CONFLICT reports a real bus collision, and arming the UDC
-before programming the 5380 is the normal order, so a model that
-flagged every access during a transfer would condemn the drivers that
-exist.  DMA_IP is not raised at terminal count either: both NetBSD and
-SunOS arm the UDC's channel interrupt before every transfer, but
-SunOS's siintr tests DMA_IP before anything else and treats it as an
-error - "dma ip, unknown reason" - so hardware that raised it on a
-normal completion would have failed every transfer SunOS ever made.
-NetBSD forgives it, which is exactly why it needed a second driver to
-notice.
+Three status bits took a driver to settle, and all three are about
+transfers that do not end the tidy way.  DMA_CONFLICT reports a real
+bus collision, and arming the UDC before programming the 5380 is the
+normal order, so a model that flagged every access during a transfer
+would condemn the drivers that exist.  DMA_IP is not raised at terminal
+count: both NetBSD and SunOS arm the UDC's channel interrupt before
+every transfer, but SunOS's siintr tests DMA_IP before anything else
+and treats it as an error - "dma ip, unknown reason" - so hardware that
+raised it on a normal completion would have failed every transfer SunOS
+ever made.
+
+DMA_ACTIVE is the third and it cost a boot.  A transfer ends when the
+chip stops asking, not only when the byte count reaches zero: SunOS
+asks a disk for 56 bytes of INQUIRY, a SCSI-1 disk answers with the
+standard 36 and goes to STATUS, and the UDC stops there with twenty
+bytes still on its count.  si_cmdwait polls the CSR for DMA_ACTIVE to
+clear and gives up with "DMA_ACTIVE still on", which is what a model
+that held the bit until terminal count produced - for ever.  NetBSD
+asks for exactly what it will get, so it never saw it.
 
 Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 839 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/sun3-si.c    | 857 +++++++++++++++++++++++++++++++++++++++++++
  hw/scsi/trace-events |   8 +
- 4 files changed, 855 insertions(+)
+ 4 files changed, 873 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -70,10 +78,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..63b7f7725c
+index 0000000000..c9b5477358
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,857 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -360,8 +368,26 @@ index 0000000000..63b7f7725c
 +        while (!s->f_drq(s->dev)) {
 +            /* The chip has nothing to hand over yet.  If it has interrupted,
 +             * the transfer is over as far as it is concerned - a phase
-+             * mismatch, END OF DMA - and no further request will come. */
-+            if (waited >= DRQ_WAIT_NS || s->f_irq(s->dev)) {
++             * mismatch, END OF DMA - and no further request will come.
++             *
++             * The UDC stops with it.  It is fed by a FIFO that has stopped
++             * asking, so DMA ACTIVE goes away here and not only at terminal
++             * count, and the byte count is left as the residual for the
++             * driver to read.  SunOS waits for exactly this: si_cmdwait
++             * polls the CSR for DMA ACTIVE to clear and gives up with
++             * "DMA_ACTIVE still on".  A transfer that ends short - 56 bytes
++             * of INQUIRY asked for, 36 given - never reaches terminal count,
++             * so a model that held the bit until then hung every SunOS
++             * probe, while NetBSD, which asks for exactly what it will get,
++             * never noticed.
++             */
++            if (s->f_irq(s->dev)) {
++                s->dma_running = false;
++                s->csr &= ~SI_CSR_DMA_ACTIVE;
++                trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
++                return;
++            }
++            if (waited >= DRQ_WAIT_NS) {
 +                return;
 +            }
 +            s->f_run_ns(s->dev, DRQ_STEP_NS);

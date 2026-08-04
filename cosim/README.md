@@ -350,6 +350,66 @@ miniroot is byte-identical to the `usr/mdec/ufsboot` in the distribution, and
 the `/netbsd.sun3` it extracts - which is large enough to need the indirect
 blocks - is a valid m68k ELF that says `NetBSD 10.1 (INSTALL)`.
 
+### SunOS 4.1.1, and a disk we could not build ourselves
+
+The third guest is Sun's own operating system, driven by Sun's own `si` -
+the driver whose source is in `doc/drivers/SunOS34/`.  It boots:
+
+```
+>b sd()
+Boot: sd(0,0,0)
+root on sd0a fstype 4.2
+Boot: vmunix
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+mem = 4096K (0x400000)
+si0 at obio 0x140000 pri 2
+st0 at si0 slave 32
+sr0 at si0 slave 48
+sd0 at si0 slave 0
+le0 at obio 0x120000 pri 3
+```
+
+**The disk had to be made by SunOS.**  NetBSD's boot blocks we can install
+ourselves, because `bootxx` carries a list of raw block numbers and
+`ffs.py` can read the inode that says what they are.  SunOS 4.1.1's
+`installboot` does the same job - its strings give it away: *"Block
+locations:"*, *"The boot program has too many discontinuous blocks"*, *"Boot
+checksum: 0x%x"* - but the array it patches, `_blknos`, is `N_BSS`, so there
+is nothing in the file to patch.  Writing a SunOS boot block means
+reverse-engineering an m68k binary.
+
+So SunOS writes it for us.  TME - the other Sun-3 emulator, and not ours -
+runs the 4.1.1 installer against a disk image, its own `installboot` puts the
+boot block on, and the finished image is what QEMU boots on the Verilated
+chip.  `cosim/scripts/run-tme.py` drives it.  Nothing in `src/` or `tb/`
+depends on TME, and it is not in `make test`.
+
+Five things about that install are worth writing down, because none of them
+is in anyone's instructions:
+
+* **TME 0.8 has no `/dev/ptmx` support**, whatever its example configuration
+  says - there is no `ptsname()` call anywhere in it.  The pty has to be made
+  by the driver and the slave's path substituted into the config.
+* **Its tape only answers to the EMULEX identity** the example config's
+  comment tells you to remove.  Without `vendor EMULEX product "MT-02 QIC"`
+  the PROM prints `Boot: st(0,0,0)` and hangs for ever.
+* **`make -j` breaks it**: `all-local` copies `tme_generic.la` before it is
+  linked, and `tme-preopen.txt` is *appended to* on every build, so a stale
+  entry from a previous configure breaks the link afterwards.
+* **`zcat` does not leave a tape at the filemark**, so the next set has to
+  rewind and seek to its own file number rather than read straight on.
+* **The proto root ships `/dev/MAKEDEV` and no device nodes**, and SunOS's
+  `tar` refuses to archive special files, so the miniroot's `/dev` cannot be
+  copied across.  Without them `init` starts, cannot open a console, and says
+  nothing at all.
+
+And one about the layout: 4.1.1's kernel execs `/usr/etc/init`, and nothing
+mounts a separate `/usr` before that happens, so a split install panics with
+`panic: icode`.  Everything goes in one filesystem, which meant rewriting the
+label's partition table - and our own Sun-label code read back what SunOS had
+written, checksum and all, which is a free cross-check on
+`make-sun3-disk.py`.
+
 ### Where it stops
 
 Two faults are on the record and neither is understood.  Both are
