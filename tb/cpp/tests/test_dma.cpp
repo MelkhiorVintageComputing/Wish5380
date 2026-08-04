@@ -257,6 +257,50 @@ TEST(dma_a_block_reads_back_through_a_real_engine) {
   CHECK_EQ(msg, 0x00);
 }
 
+TEST(dma_a_target_that_answers_short_ends_the_transfer_and_interrupts) {
+  // SunOS asks a disk for 56 bytes of INQUIRY; a SCSI-1 disk answers with the
+  // standard 36 and goes to STATUS.  The transfer therefore ends on a phase
+  // mismatch with 20 bytes still outstanding, and not at terminal count -
+  // which is the case NetBSD never produces, because it always asks for
+  // exactly what it is going to get.  The chip has to interrupt here, or a
+  // driver waits for something that never comes: SunOS's si0 gave up and
+  // reset the bus.
+  env.power_on_reset();
+
+  CHECK_DRV(env.drv().select(env.cfg().target_id));
+  uint8_t identify = 0x80;
+  CHECK_EQ(env.drv().pio(sci::PH_MSG_OUT, &identify, nullptr, 1), size_t(1));
+  Bytes cdb{0x12, 0, 0, 0, 56, 0};                 // INQUIRY, 56 bytes wanted
+  CHECK_EQ(env.drv().pio(sci::PH_COMMAND, cdb.data(), nullptr, cdb.size()),
+           cdb.size());
+
+  CHECK(env.sim().run_until(
+      [&]() {
+        return (env.chip_read(sci::R_CSB) & sci::CSB_REQ) &&
+               sci::csb_to_phase(env.chip_read(sci::R_CSB)) == sci::PH_DATA_IN;
+      },
+      5 * MS));
+
+  env.chip_write(sci::R_TCR, sci::PH_DATA_IN);
+  env.chip_write(sci::R_MR, sci::MR_DMA);
+  env.chip_write(sci::R_ICR, 0);
+  env.chip_write(sci::R_SDIR, 0);
+
+  Env::Dma d = env.dma_in(56);
+  CHECK_MSG(d.moved == 36,
+            "the target gave " + std::to_string(d.moved) +
+                " bytes of INQUIRY where 36 was expected");
+
+  // The bus is in STATUS with REQ up and the engine has nothing left to do.
+  CHECK_EQ(sci::csb_to_phase(env.chip_read(sci::R_CSB)), sci::PH_STATUS);
+  uint8_t bsr = env.chip_read(sci::R_BSR);
+  CHECK_MSG((bsr & sci::BSR_PHASE_MATCH) == 0,
+            "the chip still thinks the phase matches");
+  CHECK_MSG(env.dut()->dut_irq_o != 0,
+            "the transfer ended on a phase mismatch and the chip did not "
+            "interrupt: bsr 0x" + std::to_string(int(bsr)));
+}
+
 TEST(dma_a_block_writes_through_a_real_engine) {
   env.power_on_reset();
   Bytes payload = random_block(512, 0xd11b);
