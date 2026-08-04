@@ -22,9 +22,9 @@ there is a card slot.
 
 ## Status
 
-The design is complete.  An unmodified Linux and an unmodified NetBSD both
-boot off it, one moving every byte with the CPU and the other with a DMA
-controller.  A driver
+The design is complete.  An unmodified Linux, an unmodified NetBSD and an
+unmodified SunOS 4.1.1 all boot off it, one moving every byte with the CPU
+and the other two with a DMA controller.  A driver
 reaches the Wishbone slave through the three windows a Macintosh expects,
 arbitrates and selects, and reads and writes blocks - either a byte at a time
 in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
@@ -67,8 +67,8 @@ derived from the clock rather than written down and the register spacing is an
 elaboration parameter, so the regression checks whichever build it was given
 rather than a nominal one.
 
-Beyond the regression, two guests drive the design in the two ways the chip can
-be driven.  An unmodified i386 Linux probes it with its own `g_NCR5380`,
+Beyond the regression, three guests drive the design in the two ways the chip
+can be driven.  An unmodified i386 Linux probes it with its own `g_NCR5380`,
 attaches `sda`, mounts an ext2 root filesystem off it and reads and writes
 files, all in programmed I/O.  And an unmodified NetBSD/sun3 boots off it on an
 emulated Sun-3/60, where the bytes move by real bus-master DMA instead: the
@@ -85,6 +85,23 @@ arbitrates, selects and attaches the disk -
 on a spare partition with `newfs`, writes a file into it and reads the same
 checksum back after an unmount and a remount.  That is the design writing
 under a driver that is not ours.
+
+A third guest is **SunOS 4.1.1**, which matters because its `si` is the
+driver Sun wrote for this exact board, and it uses the hardware in ways
+NetBSD does not:
+
+```
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+si0 at obio 0x140000 pri 2
+sd0 at si0 slave 0
+sd0:  <Awesome cyl 2046 alt 2 hd 16 sec 16>
+root on sd0a fstype 4.2
+```
+
+Every fault the co-simulation has found in the Sun-3 board model came from
+that driver rather than from NetBSD - three of them, all about transfers that
+do not end at terminal count, because SunOS asks a disk for more than it has
+and NetBSD never does.
 
 See [`cosim/`](cosim/README.md).
 
@@ -121,9 +138,9 @@ which question.  The two to start from:
 Then [`doc/target.md`](doc/target.md) for the disk, [`doc/sd.md`](doc/sd.md)
 for the card behind it, [`doc/drivers`](doc/drivers/README.md) for the vintage
 drivers and which of them is the authority on what, and
-[`cosim/`](cosim/README.md) for the two guests - an unmodified Linux and an
-unmodified NetBSD, one driving the chip byte by byte and the other through a
-real DMA controller.
+[`cosim/`](cosim/README.md) for the three guests - an unmodified Linux, an
+unmodified NetBSD and an unmodified SunOS 4.1.1, one driving the chip byte by
+byte and the other two through a real DMA controller.
 
 ## Layout
 

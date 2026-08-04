@@ -38,3 +38,10 @@ device can be correctly modelled, correctly mapped, and still be invisible:
 the PROM's probe writes one word to the board, takes a bus error, and reports
 "Device not found" without ever having read a register.  That was the first
 day of this work.
+
+The second carries three decisions about the board's status register that
+only a driver could settle, and all three came from SunOS rather than from
+NetBSD - `DMA_CONFLICT` never set, `DMA_IP` not raised at terminal count, and
+`DMA_ACTIVE` cleared when the chip stops asking rather than when the count
+runs out.  Its commit message argues each; `cosim/README.md` has the
+evidence.
