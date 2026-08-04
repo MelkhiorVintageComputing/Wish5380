@@ -1,4 +1,4 @@
-From 447acb7883a993417b7f52f6d14dcd2e11c02924 Mon Sep 17 00:00:00 2001
+From ce5ad3c6768885a555219a94bf681a6dc5aec791 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Mon, 3 Aug 2026 22:23:20 +0200
 Subject: [PATCH 3/3] hw/m68k/sun3: attach the onboard SCSI board

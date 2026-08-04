@@ -1,6 +1,6 @@
-From 2142eeac6626fea976d79e15dee3790a992d8912 Mon Sep 17 00:00:00 2001
+From 5d22027fca4c214f681b9f4d0e1377439f1e5de7 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
-Date: Tue, 4 Aug 2026 13:46:10 +0200
+Date: Wed, 5 Aug 2026 01:39:38 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
 
 The 3/60's SCSI is three things in one 32-byte register block: an NCR
@@ -41,13 +41,31 @@ clear and gives up with "DMA_ACTIVE still on", which is what a model
 that held the bit until terminal count produced - for ever.  NetBSD
 asks for exactly what it will get, so it never saw it.
 
+Knowing *when* the chip has stopped asking took three tries, and the
+two wrong answers are worth stating because each looks right alone:
+
+  * the chip's interrupt is a latch.  It stays asserted until the
+    driver reads register 7, so one left over from the command before
+    is asserted at the instant the next transfer starts, and a pump
+    that ended on it would abort transfers that had not begun.
+
+  * the phase match is momentary.  It is false in the window between
+    arming the UDC and writing the Target Command Register - every
+    driver here arms first - which wedges the PROM on its first read,
+    and it flickers during a transfer, which ended the PROM's boot
+    block read early and got "scsi: dma never completed".
+
+So both, and only after the chip has asked at least once: a transfer
+that has started, whose phase has gone, and whose chip has interrupted,
+is a transfer whose target has moved on.
+
 Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 857 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/sun3-si.c    | 889 +++++++++++++++++++++++++++++++++++++++++++
  hw/scsi/trace-events |   8 +
- 4 files changed, 873 insertions(+)
+ 4 files changed, 905 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -78,10 +96,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..c9b5477358
+index 0000000000..4c07af1080
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,889 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -263,6 +281,7 @@ index 0000000000..c9b5477358
 +    /* Sun's own logic. */
 +    uint16_t csr;
 +    uint16_t fifo_count;    /* bytes; the driver reads this as the residual */
++    bool saw_drq;           /* the chip has asked at least once this transfer */
 +    uint16_t fifo_data;     /* the leftover byte, in bits 15:8 */
 +    /* The VME-only registers, indexed by (offset - 8) / 2: written by any
 +     * driver that serves both boards, and ignored by this one. */
@@ -366,34 +385,64 @@ index 0000000000..c9b5477358
 +        uint8_t byte;
 +
 +        while (!s->f_drq(s->dev)) {
-+            /* The chip has nothing to hand over yet.  If it has interrupted,
-+             * the transfer is over as far as it is concerned - a phase
-+             * mismatch, END OF DMA - and no further request will come.
++            /* The chip has nothing to hand over yet.  The transfer is over
++             * when the target leaves the phase the chip was set up for: the
++             * chip stops recognising REQ, no further request will come, and
++             * the UDC - fed by a FIFO that has stopped asking - stops with
++             * it.  DMA ACTIVE goes away here and not only at terminal count,
++             * and the byte count is left as the residual for the driver to
++             * read.  SunOS waits for exactly this: si_cmdwait polls the CSR
++             * for DMA ACTIVE to clear and gives up with "DMA_ACTIVE still
++             * on".  A transfer that ends short - 56 bytes of INQUIRY asked
++             * for, 36 given - never reaches terminal count, so a model that
++             * held the bit until then hung every SunOS probe, while NetBSD,
++             * which asks for exactly what it will get, never noticed.
 +             *
-+             * The UDC stops with it.  It is fed by a FIFO that has stopped
-+             * asking, so DMA ACTIVE goes away here and not only at terminal
-+             * count, and the byte count is left as the residual for the
-+             * driver to read.  SunOS waits for exactly this: si_cmdwait
-+             * polls the CSR for DMA ACTIVE to clear and gives up with
-+             * "DMA_ACTIVE still on".  A transfer that ends short - 56 bytes
-+             * of INQUIRY asked for, 36 given - never reaches terminal count,
-+             * so a model that held the bit until then hung every SunOS
-+             * probe, while NetBSD, which asks for exactly what it will get,
-+             * never noticed.
++             * PHASE MATCH is the signal and the chip's interrupt is not.
++             * An interrupt is a *latch*, and it stays asserted until the
++             * driver reads register 7; one left over from the command before
++             * is asserted at the moment the next transfer starts, so a pump
++             * that ended on it aborted transfers before they had moved a
++             * byte.  That is what "si0: lost interrupt ... count= 8192
++             * (8192)" was: nothing moved, and the driver waited for an
++             * interrupt about a transfer that had never begun.
++             *
++             * But a mismatch only means "over" once the transfer has begun.
++             * The UDC is armed before the chip is told anything: every
++             * driver here starts the chain first and writes the Target
++             * Command Register after, so in that window TCR still holds the
++             * *last* transfer's phase and PHASE MATCH is false about a
++             * transfer that has not started.  Ending there wedges the PROM
++             * on its first read.  So wait for the chip to ask once, and take
++             * the mismatch as the end only after that.
 +             */
-+            if (s->f_irq(s->dev)) {
++#define BSR_PHASE_MATCH 0x08
++            bool matched = (s->f_read(s->dev, 5) & BSR_PHASE_MATCH) != 0;
++            /* Both signals, and neither alone.  The interrupt on its own is a
++             * latch left over from the command before.  The phase on its own
++             * is momentary - it is false between the chip being armed and the
++             * driver writing the Target Command Register, and it flickers
++             * during a transfer, which ended the PROM's boot block read early
++             * and got "scsi: dma never completed".  Together, after the chip
++             * has asked at least once, they mean the target has moved on. */
++            if (s->saw_drq && !matched && s->f_irq(s->dev)) {
 +                s->dma_running = false;
 +                s->csr &= ~SI_CSR_DMA_ACTIVE;
 +                trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
 +                return;
 +            }
 +            if (waited >= DRQ_WAIT_NS) {
++                /* Nothing asked for in a long time.  Give the emulator back
++                 * its thread; the pump is re-entered on the next register
++                 * access, and a transfer that has not started yet is waiting
++                 * for the driver to finish setting the chip up. */
 +                return;
 +            }
 +            s->f_run_ns(s->dev, DRQ_STEP_NS);
 +            waited += DRQ_STEP_NS;
 +        }
 +        waited = 0;
++        s->saw_drq = true;
 +
 +        if (last) {
 +            s->f_set_eop(s->dev, 1);
@@ -561,6 +610,7 @@ index 0000000000..c9b5477358
 +    s->udc_status &= ~(UDC_SR_TC | UDC_SR_NAC);
 +    s->head = 0;
 +    s->head_n = 0;
++    s->saw_drq = false;
 +    s->dma_running = true;
 +    s->csr |= SI_CSR_DMA_ACTIVE;
 +    s->csr &= ~(SI_CSR_DMA_IP | SI_CSR_DMA_BUS_ERR);

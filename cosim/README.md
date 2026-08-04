@@ -490,7 +490,7 @@ kept reading, and bit fifteen of it is `DMA_ACTIVE`.  `si_cmdwait` waits for
 that bit to *clear* - "DMA_ACTIVE still on" is its complaint - and the model
 dropped it only at terminal count, which a short answer never reaches.  On
 the real board the UDC is fed by a FIFO that has stopped asking and stops
-with it, leaving the byte count as the residual.  The fix is four lines in
+with it, leaving the byte count as the residual.  The fix is in
 `sun3_si_pump`, and the traces afterwards read:
 
 | residual | transfers |
@@ -499,6 +499,20 @@ with it, leaving the byte count as the residual.  The fix is four lines in
 | 14 bytes | 3 |
 | 20 bytes | 1 |
 | stalls | 0 |
+
+Knowing *when* the chip has stopped asking took three tries, and the two wrong
+answers are the useful part, because each is right on its own terms:
+
+| condition | what it breaks |
+|---|---|
+| the chip has interrupted | an interrupt is a **latch** - it stays asserted until the driver reads register 7, so one left over from the command before is asserted when the next transfer starts, and the pump aborts a transfer that has not begun |
+| the phase no longer matches | the phase is **momentary** - it is false between arming the UDC and writing the Target Command Register, which wedges the PROM's first read, and it flickers mid-transfer, which ended the boot block read early and got `scsi: dma never completed` |
+| either of those, on the four-millisecond timeout | the same two wrong answers by another route |
+| both, after the chip has asked once | boots |
+
+Each wrong version failed differently and visibly - `residual 32` of a 32-byte
+read, `count= 8192 (8192)`, `Boot: load failed` - which is the argument for
+running the thing after every attempt rather than reasoning about it twice.
 
 The short ones are the driver asking for more than the target has; everything
 else still moves whole.
@@ -519,10 +533,35 @@ block zero.
 
 ### Where it stops
 
-Three faults are on the record and none is understood.  All are intermittent,
-all smell of pacing rather than of the chip, and they are written down here
+Four faults are on the record and none is understood.  All but the first are
+intermittent, all smell of pacing rather than of the chip, and they are written down here
 rather than left in a commit message because an unexplained fault that nobody
 can find again is worth less than one that is.
+
+**`si0: lost interrupt`**, twice in a boot, reproducibly - it is the one fault
+here that happens every time.  The state it prints is the puzzle:
+
+```
+si0:  lost interrupt
+	csr= 0x607  bcr= 0  tcr= 0x1
+	cbsr= 0x6d (STATUS)  cdr= 0x0  mr= 0x2  bsr= 0x90
+	count= 0 (8192)
+```
+
+`count= 0` says the transfer *finished*; `bsr= 0x90` is END OF DMA and the
+chip's interrupt; `csr= 0x607` has `SBC_IP` set and `INTR_EN` on.  Everything
+the driver needs is there and it still says it lost the interrupt, so what is
+missing is the delivery of level 2 at the moment it happened rather than the
+state afterwards.  The board raises the line from `sun3_si_update_irq`, which
+runs after every register access and on the pacing timer, so the window to
+explain is between the chip asserting and one of those two running.  The
+driver recovers both times and `fsck` completes.
+
+It is not the DMA_ACTIVE fix above: the count is identical - twice - before
+and after that change, which is also what says the first theory about it (a
+stale interrupt aborting the next transfer) was wrong.  4.1.1's `si.c` would
+say what condition prints it, and the copy here is 3.4's, which does not have
+the message.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode
