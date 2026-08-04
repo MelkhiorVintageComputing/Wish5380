@@ -137,6 +137,16 @@ dd if=/dev/zero of=work/sun3/disk.img bs=1M count=16
 cosim/scripts/run-sun3.py 'b sd()' -- -trace 'sun3_si_*'
 ```
 
+Guest time counts guest instructions by default; `--icount` changes the rate
+and `--icount 0` hands it back to the wall clock.  There is a section on why
+below, and it is not a detail.
+
+The positional arguments are typed at the PROM's `>` and nowhere else.  Once
+the PROM has handed over, what to say depends on what the guest asks, which is
+what `-s 'PATTERN:=TEXT'` is for - the rules fire in the order given, once
+each, on a regular expression matched against the console as it arrives.  A
+run that drives a newfs from inside NetBSD is a stack of those.
+
 What a working run says:
 
 ```
@@ -177,11 +187,80 @@ memory with nothing left over and no bus error - the bytes coming from an SD
 card image by way of the SCSI target, across a REQ/ACK handshake the driver
 never touched.
 
-It is slow.  The core runs about sixteen times slower than the part it models,
-so loading the kernel takes twenty minutes of wall clock where a real 3/60
-took seconds.  Nothing is waiting on anything; it is simply that many bytes.
+### Where guest time comes from, which turned out to matter a great deal
 
-### Four things this cost, worth knowing before the next one
+The core runs far slower than the part it models, so the question of what the
+guest thinks the time is decides whether any of this works.  Left alone, QEMU
+runs its virtual clock off the wall clock: every blocking access into the
+Verilated chip lets guest time run away, the machine's own driver sees each
+command take an age, and the board's catch-up then spends simulation on time
+the guest never spent.  A boot to the NetBSD shell took about fifty minutes
+and moved bytes at 1.2 kB/s.
+
+`-icount shift=N` makes guest time count guest instructions instead - one
+instruction every 2^N nanoseconds - which is what a driver's timeout measures
+on real hardware.  The same boot then takes about five minutes.  The runner
+passes `shift=8` by default and `--icount 0` turns it off.
+
+**Eight is not a tuning constant, it is the machine.**  One instruction every
+256 ns is about four MIPS, which is a 20 MHz 68020.  At `shift=6` the guest
+runs four times faster than the real one while the chip does not, and NetBSD's
+probe of the disk's geometry starts failing - `sd0: drive offline`, then a
+fabricated geometry - on the same image that is read perfectly at `shift=8`.
+That is worth stating plainly because it looked for a while like a
+size-dependent capacity bug.  Every failing run happened to be a big disk
+*and* `shift=6`:
+
+| disk | guest clock | what NetBSD made of the disk |
+|---|---|---|
+| 16 MB | the wall clock | `16384 KB, 16 cyl, 64 head, 32 sec` |
+| 16 MB | `shift=6` | `drive offline` |
+| 16 MB | `shift=8` | `16384 KB, 16 cyl, 64 head, 32 sec` |
+| 32 MB | `shift=6` | `drive offline` |
+| 320 MB | `shift=6` | `drive offline` |
+| 320 MB | `shift=8` | `320 MB, 320 cyl, 64 head, 32 sec, 512 bytes/sect x 655360 sectors` |
+
+The two only came apart on the third and sixth rows.  The chip and the target
+answer READ CAPACITY correctly at 655360 blocks in the regression too, which
+is what said the fault was not there; and the last row is the other thing that
+needed proving, because a disk big enough for a SunOS 4.1.1 root and `/usr` is
+twenty times the one NetBSD boots from.
+
+### It writes, too
+
+Booting only ever reads.  The first thing that makes a real driver write is a
+filesystem, so `make-sun3-disk.py` leaves a spare partition and the run drives
+NetBSD into building one on it:
+
+```
+# newfs -s 16384 /dev/rsd0d
+/dev/rsd0d: 8.0MB (16384 sectors) block size 4096, fragment size 512
+	using 4 cylinder groups of 2.00MB, 512 blks, 960 inodes.
+super-block backups (for fsck_ffs -b #) at:
+32, 4128, 8224, 12320,
+# mount /dev/sd0d /mnt
+# dd if=/netbsd.sun3 of=/mnt/k bs=8192 count=8
+8+0 records in
+8+0 records out
+# cksum /mnt/k
+3755572741 65536 /mnt/k
+# umount /mnt
+# mount /dev/sd0d /mnt
+# cksum /mnt/k
+3755572741 65536 /mnt/k
+```
+
+The unmount is the point of the exercise: it forces everything back through
+the chip, and the checksum after the remount is computed from blocks that have
+been written to an SD card image and read back off it.  Until this, nothing
+had ever made the design write under a driver that was not ours.
+
+Both consoles are kept whole rather than in extracts:
+[`netbsd-sun3-boot.txt`](netbsd-sun3-boot.txt) and
+[`netbsd-sun3-newfs.txt`](netbsd-sun3-newfs.txt), each running to the end of
+what the machine printed rather than stopping at the good part.
+
+### Five things this cost, worth knowing before the next one
 
 **A device can be perfectly modelled, correctly mapped, and still invisible.**
 The Sun-3 MMU checks every translated physical address against a list of what
@@ -212,6 +291,19 @@ answered - does the chip interrupt at the end of a transfer when the driver has
 `dma_a_transfer_ends_by_interrupting_without_the_eop_enable` now says so, which
 is what moved the search off the RTL and onto the board.
 
+**Reaching terminal count is not an interrupt**, and the guest that was running
+could not tell us.  The board raised `SI_CSR_DMA_IP` at the end of every
+transfer, because both drivers arm the UDC's channel interrupt first and it
+seemed to follow.  NetBSD tolerates it: `si_intr` sees the bit, calls the main
+handler, finds the 5380 has already interrupted too, and gets on with it.  Sun's
+own driver does not - `siintr` tests `SI_CSR_DMA_IP` before anything else and,
+on this board, prints *"dma ip, unknown reason"* and fails the command.  A
+transfer that always set it would have failed every command SunOS ever issued,
+so the hardware does not set it, and now neither do we.  This one was found by
+reading a third driver rather than by running anything, which is the argument
+for keeping three: the guest you have will not complain about the thing it
+happens to forgive.
+
 ### The disk
 
 `cosim/scripts/make-sun3-disk.py` builds a bootable NetBSD/sun3 disk out of
@@ -238,6 +330,12 @@ What that produces, and why each piece is where it is:
 | 1-15 | `bootxx`, which the PROM loads whole and jumps into |
 | 32 on | NetBSD's miniroot, holding `/ufsboot` and `/netbsd.sun3` |
 
+`--size-mb` and `--swap-mb` decide the rest of the label: `a` is the miniroot,
+`b` is swap, `c` is the whole disk as the Sun convention requires, and `d` is
+whatever is left over.  Neither `b` nor `d` is needed to boot and both are
+needed to do anything afterwards - `d` is where a `newfs` goes, which is the
+first thing that makes a real driver *write*.
+
 **`bootxx` is not a filesystem reader.**  It carries a list of raw block
 numbers, and copies those blocks into memory and jumps to them; that is how
 the second stage gets loaded before anything in the machine understands FFS.
@@ -253,6 +351,34 @@ the `/netbsd.sun3` it extracts - which is large enough to need the indirect
 blocks - is a valid m68k ELF that says `NetBSD 10.1 (INSTALL)`.
 
 ### Where it stops
+
+Two faults are on the record and neither is understood.  Both are
+intermittent, both smell of pacing rather than of the chip, and both are
+written down here rather than left in a commit message because an unexplained
+fault that nobody can find again is worth less than one that is.
+
+**`si0: cmd timeout, targ=0, lun=0`**, once, exactly sixty seconds of guest
+time after root was mounted - the command's own timeout, so the command
+produced nothing at all rather than being slow.  NetBSD retried, the system
+carried on into userland, and a later traced boot of the same image did not
+reproduce it and showed no pump stall anywhere.  A command that returns
+nothing is either one the target never answered or one the pacing starved, and
+those are different bugs.
+
+**`Exception 0x7C at 0x0FEF8F44`**, once, immediately after `bootxx` had
+loaded the second stage and jumped into it.  Vector 31 is the level 7
+autovector, which on this machine is the memory-error and clock line; the
+address is inside the PROM.  The same image booted cleanly on the next run.
+The machine model already takes far more level 7s than a real 3/60 would,
+which is a property of the fork and not of this board, so the first thing to
+establish is whether a run without the board takes them too.
+
+Both appeared before the instruction counter was turned on, when guest time
+was following the wall clock and every command looked minutes long to the
+guest.  Neither has appeared in any run since.  That is a handful of runs and
+not a campaign, so it is a reason to retest rather than a diagnosis - but the
+one fault that *was* chased to the bottom, `sd0: drive offline`, turned out to
+be exactly this and nothing else, which is why they are filed together.
 
 ## Rules this directory follows
 

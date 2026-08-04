@@ -96,6 +96,9 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--size-mb', type=int, default=16,
                     help='whole disk; the filesystem keeps its own size')
+    ap.add_argument('--swap-mb', type=int, default=0,
+                    help='partition b, after the miniroot.  The kernel says '
+                         '"dumps on sd0b" whether or not one exists')
     args = ap.parse_args()
 
     fsdata = open(args.miniroot, 'rb').read()
@@ -125,9 +128,23 @@ def main():
         raise SystemExit('the filesystem is bigger than the disk')
     acyl = (fssec + percyl - 1) // percyl
 
+    # b is swap and d is whatever is left over.  Neither is needed to boot,
+    # and both are needed to do anything afterwards: a driver that only ever
+    # reads the blocks it was handed is not being asked much.  d is where a
+    # newfs goes, which is the first thing that makes a real driver write.
+    swapcyl = (args.swap_mb * 1024 * 1024 // SECTOR + percyl - 1) // percyl
+    if acyl + swapcyl > ncyl:
+        raise SystemExit('the miniroot and swap do not fit on the disk')
+    parts = {0: (0, acyl * percyl),                # a: the miniroot
+             2: (0, total)}                        # c: the whole disk
+    if swapcyl:
+        parts[1] = (acyl, swapcyl * percyl)        # b: swap
+    restcyl = ncyl - acyl - swapcyl
+    if restcyl:
+        parts[3] = (acyl + swapcyl, restcyl * percyl)   # d: the rest
+
     label = sun_label('Wish5380 NetBSD/sun3 miniroot', ncyl, ntracks, nsectors,
-                      {0: (0, acyl * percyl),      # a: the miniroot
-                       2: (0, total)})             # c: the whole disk
+                      parts)
 
     img = bytearray(total * SECTOR)
     img[0:len(fsdata)] = fsdata
@@ -143,8 +160,11 @@ def main():
 
     print('%s: %d MB, %d cylinders of %d x %d' %
           (args.out, total * SECTOR // (1024 * 1024), ncyl, ntracks, nsectors))
-    print('  a: %d sectors (the miniroot), c: %d sectors' %
-          (acyl * percyl, total))
+    for i, name in ((0, 'a, the miniroot'), (1, 'b, swap'), (2, 'c, the disk'),
+                    (3, 'd, the rest')):
+        if i in parts:
+            print('  %s: %d sectors at cylinder %d' %
+                  (name, parts[i][1], parts[i][0]))
     print('  bootxx: %d bytes at block 1' % len(boot))
     print('  %s: %d bytes, blocks %s of %d each' %
           (args.stage2, inode['size'], dblocks, fs.bsize))

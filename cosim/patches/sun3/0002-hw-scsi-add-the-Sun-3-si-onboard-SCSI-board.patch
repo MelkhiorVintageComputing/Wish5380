@@ -1,6 +1,6 @@
-From 14afd590d969b8ce061366204c026647509944fe Mon Sep 17 00:00:00 2001
+From 170bdf874a2d51a87d8f936d7349745f5bfcfe98 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
-Date: Mon, 3 Aug 2026 22:23:20 +0200
+Date: Tue, 4 Aug 2026 09:08:10 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
 
 The 3/60's SCSI is three things in one 32-byte register block: an NCR
@@ -21,13 +21,25 @@ Only the corner of the Am9516 that Sun uses is modelled: channel 1,
 word transfers, a one-shot chain of three register groups.  A model of
 the rest would be a model of code nobody runs.
 
+Two status bits are deliberately never set, and both took a driver to
+settle.  DMA_CONFLICT reports a real bus collision, and arming the UDC
+before programming the 5380 is the normal order, so a model that
+flagged every access during a transfer would condemn the drivers that
+exist.  DMA_IP is not raised at terminal count either: both NetBSD and
+SunOS arm the UDC's channel interrupt before every transfer, but
+SunOS's siintr tests DMA_IP before anything else and treats it as an
+error - "dma ip, unknown reason" - so hardware that raised it on a
+normal completion would have failed every transfer SunOS ever made.
+NetBSD forgives it, which is exactly why it needed a second driver to
+notice.
+
 Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 826 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/sun3-si.c    | 839 +++++++++++++++++++++++++++++++++++++++++++
  hw/scsi/trace-events |   8 +
- 4 files changed, 842 insertions(+)
+ 4 files changed, 855 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -58,10 +70,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..5ad63552f2
+index 0000000000..63b7f7725c
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,826 @@
+@@ -0,0 +1,839 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -147,7 +159,9 @@ index 0000000000..5ad63552f2
 +#define SI_CSR_FIFO_FULL    0x0800  /* r  */
 +#define SI_CSR_FIFO_EMPTY   0x0400  /* r  */
 +#define SI_CSR_SBC_IP       0x0200  /* r  the 5380 is interrupting */
-+#define SI_CSR_DMA_IP       0x0100  /* r  the UDC is interrupting */
++#define SI_CSR_DMA_IP       0x0100  /* r  the UDC is interrupting: an error
++                                     *    only, never terminal count - see
++                                     *    the end of sun3_si_pump() */
 +#define SI_CSR_SEND         0x0008  /* rw direction, 1 = to the device */
 +#define SI_CSR_INTR_EN      0x0004  /* rw gates both onto level 2 */
 +#define SI_CSR_FIFO_RES     0x0002  /* rw active low */
@@ -399,13 +413,24 @@ index 0000000000..5ad63552f2
 +
 +    if (s->fifo_count == 0 || (s->csr & SI_CSR_DMA_BUS_ERR)) {
 +        /* Terminal count, or a translation failure that forces the UDC's
-+         * external EOP.  Either way the transfer is over and the UDC
-+         * interrupts if it was told to. */
++         * external EOP.  Either way the transfer is over. */
 +        s->dma_running = false;
 +        s->csr &= ~SI_CSR_DMA_ACTIVE;
 +        trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
 +        s->udc_status |= UDC_SR_TC | UDC_SR_NAC;
-+        if (s->udc_status & UDC_SR_CIE) {
++
++        /*
++         * Reaching terminal count is not an interrupt.  Both drivers arm the
++         * UDC's channel interrupt before every transfer - Sun's comment on
++         * the command says "in case of error" - and SunOS then treats a DMA
++         * interrupt as exactly that: siintr tests DMA_IP before anything
++         * else and, on this board, prints "dma ip, unknown reason" and fails
++         * the command (doc/drivers/SunOS34/sundev/si.c, lines 1516-1553).
++         * Hardware that raised it at terminal count would have failed every
++         * transfer SunOS ever made, so it does not.  Only the error path
++         * interrupts, and the transfer's own end is the chip's business.
++         */
++        if ((s->csr & SI_CSR_DMA_BUS_ERR) && (s->udc_status & UDC_SR_CIE)) {
 +            s->udc_status |= UDC_SR_IP;
 +            s->csr |= SI_CSR_DMA_IP;
 +        }

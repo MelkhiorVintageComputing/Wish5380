@@ -12,6 +12,13 @@ watching it.
     run-sun3.py -w 'sd0' -q 'b sd()'        exit 1 unless "sd0" appears
     run-sun3.py --no-si                     without the board, for comparison
     run-sun3.py -- -d guest_errors          extra arguments for QEMU
+    run-sun3.py -s 'a):=a' 'b sd()'         answer a prompt the guest prints
+
+The positional commands are typed at the PROM's ">" and nothing else; -s is
+for everything after the PROM has handed over, where what to say depends on
+what the guest asked.  Each rule is `PATTERN:=TEXT`, they fire in the order
+given, once each, and the pattern is a Python regular expression matched
+against the console as it arrives.
 
 There is a script very like this one in the QEMU fork.  This is not a copy for
 its own sake: that one hardwires its own build directory and knows nothing
@@ -62,8 +69,17 @@ def main():
                                                   'libwish5380rtl.so'))
     ap.add_argument('--image', default=os.path.join(ROOT, 'work', 'sun3',
                                                     'disk.img'))
+    ap.add_argument('-s', '--send', action='append', default=[],
+                    metavar='PATTERN:=TEXT',
+                    help='type TEXT when PATTERN appears; may be repeated, '
+                         'and the rules fire in order, once each')
     ap.add_argument('--no-si', action='store_true',
                     help='leave the SCSI slot empty')
+    ap.add_argument('--icount', type=int, default=8, metavar='SHIFT',
+                    help='QEMU instruction counter: one instruction every '
+                         '2^SHIFT ns of guest time.  8 is about a real 3/60; '
+                         '0 turns it off and lets guest time follow the wall '
+                         'clock, which is neither fast nor faithful')
     ap.add_argument('--trace', action='store_true',
                     help='ask the RTL library for a waveform')
     # Split on "--" ourselves.  argparse consumes it and then hands the rest
@@ -89,11 +105,24 @@ def main():
         if os.path.exists(args.image):
             machine += f',si-image={args.image}'
 
+    # Guest time has to come from somewhere, and the wall clock is the wrong
+    # place: a Verilated 5380 answers far slower than the part, so a guest
+    # whose clock follows real time sees every command take an age and starts
+    # timing them out.  The instruction counter makes guest time count guest
+    # instructions instead, which is what a driver's timeout measures on real
+    # hardware.  A shift of eight is one instruction every 256 ns - about the
+    # four MIPS of a 20 MHz 68020, so the machine runs at roughly its own
+    # speed.  A smaller shift makes the guest faster than the real one and its
+    # probes start failing; that is a fault in the pacing and not in the chip.
+    clock = []
+    if args.icount:
+        clock = ['-icount', f'shift={args.icount},sleep=off']
+
     cmd = [args.qemu,
            '-M', machine, '-m', args.memory, '-bios', args.prom,
            '-display', 'none',
            '-serial', 'null', '-serial', 'null', '-serial', 'null',
-           '-serial', 'stdio'] + extra
+           '-serial', 'stdio'] + clock + extra
 
     env = dict(os.environ)
     if args.trace:
@@ -104,8 +133,16 @@ def main():
         os.execve(cmd[0], cmd, env)
         os._exit(1)
 
+    sendq = []
+    for rule in args.send:
+        if ':=' not in rule:
+            sys.exit(f'--send wants PATTERN:=TEXT, not {rule!r}')
+        pat, text = rule.split(':=', 1)
+        sendq.append((re.compile(pat.encode()), text))
+
     buf = b''
     log = b''
+    scanned = 0
     pending = list(args.commands)
     deadline = time.time() + args.timeout
     last_sent = None
@@ -138,9 +175,27 @@ def main():
                 os.write(fd, line.encode() + b'\r')
                 last_sent = time.time()
                 buf = b''
+            # A guest's prompt is not the PROM's: it can be anything, and it
+            # arrives whenever the machine gets there.  Only the head rule is
+            # armed, so a scripted exchange happens in the order it was
+            # written even if a later pattern would match sooner.
+            if sendq:
+                pat, text = sendq[0]
+                m = pat.search(log, scanned)
+                if m:
+                    time.sleep(0.3)
+                    os.write(fd, text.encode() + b'\r')
+                    last_sent = time.time()
+                    scanned = len(log)
+                    buf = b''
+                    sendq.pop(0)
+
             # Stop when the machine goes quiet, not a fixed time after the
             # last command: booting an operating system through a Verilated
             # chip takes minutes, and most of them are silent ones.
+            # A rule that never fires is a failed run and not a reason to
+            # keep waiting: the machine has stopped saying anything, so it is
+            # not about to ask.
             if not pending and last_sent and time.time() - last_out > args.idle:
                 break
     finally:
@@ -160,7 +215,9 @@ def main():
     missing = [p for p in args.wait_for if not re.search(p, text)]
     for p in missing:
         print(f'\nNOT SEEN: {p}', file=sys.stderr)
-    return 1 if missing else 0
+    for pat, _ in sendq:
+        print(f'\nNEVER PROMPTED: {pat.pattern.decode()}', file=sys.stderr)
+    return 1 if missing or sendq else 0
 
 
 if __name__ == '__main__':

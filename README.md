@@ -56,7 +56,7 @@ way and is on the path a Sun 3/60 takes.
 A prefix is counted once, against the block it is mostly about; the others
 beside it reach the same block through something else.  Two more prefixes are
 about the testbench rather than the design: `layout_` (7) pins the constants
-to the datasheet and to both driver headers, and `infra_` (5) checks the
+to the datasheet and to all three driver headers, and `infra_` (5) checks the
 clock, the reset and the accessors everything else stands on - if one of those
 fails, no other result means anything.
 
@@ -80,6 +80,11 @@ arbitrates, selects and attaches the disk -
 [   1.0000000] si0 at obio0 addr 0x140000 ipl 2: options=0xf
 [   3.1400030] sd0 at scsibus0 target 0 lun 0: <DOLBEAU, WISH5380 SD CARD, 0001> disk fixed
 ```
+
+- mounts its root filesystem off it, and, at a shell, builds a new filesystem
+on a spare partition with `newfs`, writes a file into it and reads the same
+checksum back after an unmount and a remount.  That is the design writing
+under a driver that is not ours.
 
 See [`cosim/`](cosim/README.md).
 
