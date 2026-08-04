@@ -35,18 +35,23 @@ scan is clean; cite the printed page, which is two less than the PDF page.
 **The drivers in `doc/drivers/` are the authority on sequencing** - what order
 a driver writes the registers in, how long it waits, which bits it polls, and
 what it assumes happens between two accesses.  `doc/drivers/README.md` indexes
-the passages that settle specific questions.  Two independent families are
-kept on purpose: where Linux's `NCR5380.c` and NetBSD's `ncr5380sbc.c` agree,
-the sequence is the chip's and not one author's habit.
+the passages that settle specific questions.  Three independent families are
+kept on purpose: where Linux's `NCR5380.c`, NetBSD's `ncr5380sbc.c` and Sun's
+`SunOS34/sundev/si.c` agree, the sequence is the chip's and not one author's
+habit.  Sun's is the odd one out and the useful one: not another reading of
+the databook but the code of the company that built the board, for the machine
+the co-simulation boots.  Its board header is *not* independent of NetBSD's -
+NetBSD's descends from it - so "both drivers agree" is a claim about the chip
+and not about the board.
 
-**The two driver headers agree with the datasheet and with each other on every
-bit.**  That is the comfortable case and is worth knowing, because the sibling
-project Wish7990 found a disagreement in the equivalent place.  If a future
-reading turns one up here, it goes in `doc/drivers/README.md` rather than
-being quietly resolved.
+**The three driver headers agree with the datasheet and with each other on
+every bit.**  That is the comfortable case and is worth knowing, because the
+sibling project Wish7990 found a disagreement in the equivalent place.  If a
+future reading turns one up here, it goes in `doc/drivers/README.md` rather
+than being quietly resolved.
 
-`tb/cpp/tests/test_layout.cpp` transcribes both headers a third time and pins
-our constants to them.  It exists before any engine, on purpose: Wish82586
+`tb/cpp/tests/test_layout.cpp` transcribes all three headers a fourth time and
+pins our constants to them.  It exists before any engine, on purpose: Wish82586
 wrote its command unit first and had to redo it when the layout turned out to
 be wrong.
 

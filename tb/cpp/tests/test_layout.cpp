@@ -7,12 +7,14 @@
 // two files copied from the same reading of a scan agree just as happily when
 // the reading was wrong.
 //
-// So this test transcribes the two driver headers - NetBSD's
-// `doc/drivers/NetBSD/ncr5380reg.h` and Linux's `doc/drivers/Linux/NCR5380.h` -
-// by hand, one more time, and checks all three against each other.  The
-// drivers are the useful cross-check because they are the software that
-// actually ran against the silicon: a wrong bit number in either of them
-// would have stopped a real machine from booting in 1988.
+// So this test transcribes the three driver headers - NetBSD's
+// `doc/drivers/NetBSD/ncr5380reg.h`, Linux's `doc/drivers/Linux/NCR5380.h` and
+// Sun's `doc/drivers/SunOS34/sundev/sireg.h` - by hand, one more time, and
+// checks all four against each other.  The drivers are the useful cross-check
+// because they are the software that actually ran against the silicon: a wrong
+// bit number in any of them would have stopped a real machine from booting in
+// 1988.  Sun's is the one written by the people who put the part on a board,
+// and it is the only one that writes both phase encodings out in full.
 //
 // The RTL is pinned separately, by `test_regs.cpp` driving the register file
 // with the names from `ncr5380.h` and checking what comes back.  Between the
@@ -162,6 +164,82 @@ constexpr uint8_t PHASE_SR_TO_TCR(uint8_t phase) { return uint8_t(phase >> 2); }
 }  // namespace linux_
 
 // ---------------------------------------------------------------------------
+// Transcribed from doc/drivers/SunOS34/sundev/sireg.h - the oldest of the
+// three, written in 1986 by the company that put the part on a board.  It
+// names no register numbers: it declares two structs of eight `u_char`, one
+// for reading and one for writing, and the addresses are the field order.
+// The offsets below are that order counted out.
+// ---------------------------------------------------------------------------
+namespace sunos {
+
+constexpr int sbc_cdr = 0, sbc_icr = 1, sbc_mr = 2, sbc_tcr = 3;
+constexpr int sbc_cbsr = 4, sbc_bsr = 5, sbc_idr = 6, sbc_clr = 7;
+
+constexpr int sbc_odr = 0, sbc_ser = 4, sbc_send = 5, sbc_trcv = 6;
+constexpr int sbc_ircv = 7;
+
+constexpr uint8_t SBC_ICR_RST = 0x80;
+constexpr uint8_t SBC_ICR_AIP = 0x40;
+constexpr uint8_t SBC_ICR_TEST = 0x40;
+constexpr uint8_t SBC_ICR_LA = 0x20;
+constexpr uint8_t SBC_ICR_DE = 0x20;
+constexpr uint8_t SBC_ICR_ACK = 0x10;
+constexpr uint8_t SBC_ICR_BUSY = 0x08;
+constexpr uint8_t SBC_ICR_SEL = 0x04;
+constexpr uint8_t SBC_ICR_ATN = 0x02;
+constexpr uint8_t SBC_ICR_DATA = 0x01;
+
+constexpr uint8_t SBC_MR_BDMA = 0x80;
+constexpr uint8_t SBC_MR_TRG = 0x40;
+constexpr uint8_t SBC_MR_EPC = 0x20;
+constexpr uint8_t SBC_MR_EPI = 0x10;
+constexpr uint8_t SBC_MR_EEI = 0x08;
+constexpr uint8_t SBC_MR_MBSY = 0x04;
+constexpr uint8_t SBC_MR_DMA = 0x02;
+constexpr uint8_t SBC_MR_ARB = 0x01;
+
+constexpr uint8_t SBC_TCR_REQ = 0x08;
+constexpr uint8_t SBC_TCR_MSG = 0x04;
+constexpr uint8_t SBC_TCR_CD = 0x02;
+constexpr uint8_t SBC_TCR_IO = 0x01;
+
+constexpr uint8_t TCR_COMMAND = SBC_TCR_CD;
+constexpr uint8_t TCR_MSG_OUT = SBC_TCR_MSG | SBC_TCR_CD;
+constexpr uint8_t TCR_DATA_OUT = 0;
+constexpr uint8_t TCR_STATUS = SBC_TCR_CD | SBC_TCR_IO;
+constexpr uint8_t TCR_MSG_IN = SBC_TCR_MSG | SBC_TCR_CD | SBC_TCR_IO;
+constexpr uint8_t TCR_DATA_IN = SBC_TCR_IO;
+constexpr uint8_t TCR_UNSPECIFIED = SBC_TCR_MSG;
+
+constexpr uint8_t SBC_CBSR_RST = 0x80;
+constexpr uint8_t SBC_CBSR_BSY = 0x40;
+constexpr uint8_t SBC_CBSR_REQ = 0x20;
+constexpr uint8_t SBC_CBSR_MSG = 0x10;
+constexpr uint8_t SBC_CBSR_CD = 0x08;
+constexpr uint8_t SBC_CBSR_IO = 0x04;
+constexpr uint8_t SBC_CBSR_SEL = 0x02;
+constexpr uint8_t SBC_CBSR_DBP = 0x01;
+
+constexpr uint8_t CBSR_PHASE_BITS = SBC_CBSR_CD | SBC_CBSR_MSG | SBC_CBSR_IO;
+constexpr uint8_t PHASE_COMMAND = SBC_CBSR_CD;
+constexpr uint8_t PHASE_MSG_OUT = SBC_CBSR_MSG | SBC_CBSR_CD;
+constexpr uint8_t PHASE_DATA_OUT = 0;
+constexpr uint8_t PHASE_STATUS = SBC_CBSR_CD | SBC_CBSR_IO;
+constexpr uint8_t PHASE_MSG_IN = SBC_CBSR_MSG | SBC_CBSR_CD | SBC_CBSR_IO;
+constexpr uint8_t PHASE_DATA_IN = SBC_CBSR_IO;
+
+constexpr uint8_t SBC_BSR_EDMA = 0x80;
+constexpr uint8_t SBC_BSR_RDMA = 0x40;
+constexpr uint8_t SBC_BSR_PERR = 0x20;
+constexpr uint8_t SBC_BSR_INTR = 0x10;
+constexpr uint8_t SBC_BSR_PMTCH = 0x08;
+constexpr uint8_t SBC_BSR_BERR = 0x04;
+constexpr uint8_t SBC_BSR_ATN = 0x02;
+constexpr uint8_t SBC_BSR_ACK = 0x01;
+
+}  // namespace sunos
+
+// ---------------------------------------------------------------------------
 
 TEST(layout_register_addresses) {
   (void)env;
@@ -192,6 +270,20 @@ TEST(layout_register_addresses) {
   CHECK_EQ(int(sci::R_SDTR), linux_::START_DMA_TARGET_RECEIVE_REG);
   CHECK_EQ(int(sci::R_RPI), linux_::RESET_PARITY_INTERRUPT_REG);
   CHECK_EQ(int(sci::R_SDIR), linux_::START_DMA_INITIATOR_RECEIVE_REG);
+
+  CHECK_EQ(int(sci::R_CSD), sunos::sbc_cdr);
+  CHECK_EQ(int(sci::R_ODR), sunos::sbc_odr);
+  CHECK_EQ(int(sci::R_ICR), sunos::sbc_icr);
+  CHECK_EQ(int(sci::R_MR), sunos::sbc_mr);
+  CHECK_EQ(int(sci::R_TCR), sunos::sbc_tcr);
+  CHECK_EQ(int(sci::R_CSB), sunos::sbc_cbsr);
+  CHECK_EQ(int(sci::R_SER), sunos::sbc_ser);
+  CHECK_EQ(int(sci::R_BSR), sunos::sbc_bsr);
+  CHECK_EQ(int(sci::R_SDS), sunos::sbc_send);
+  CHECK_EQ(int(sci::R_IDR), sunos::sbc_idr);
+  CHECK_EQ(int(sci::R_SDTR), sunos::sbc_trcv);
+  CHECK_EQ(int(sci::R_RPI), sunos::sbc_clr);
+  CHECK_EQ(int(sci::R_SDIR), sunos::sbc_ircv);
 }
 
 TEST(layout_initiator_command) {
@@ -218,6 +310,17 @@ TEST(layout_initiator_command) {
   CHECK_EQ(sci::ICR_SEL, linux_::ICR_ASSERT_SEL);
   CHECK_EQ(sci::ICR_ATN, linux_::ICR_ASSERT_ATN);
   CHECK_EQ(sci::ICR_DATA, linux_::ICR_ASSERT_DATA);
+
+  CHECK_EQ(sci::ICR_RST, sunos::SBC_ICR_RST);
+  CHECK_EQ(sci::ICR_AIP, sunos::SBC_ICR_AIP);
+  CHECK_EQ(sci::ICR_TEST, sunos::SBC_ICR_TEST);
+  CHECK_EQ(sci::ICR_LA, sunos::SBC_ICR_LA);
+  CHECK_EQ(sci::ICR_DIFF, sunos::SBC_ICR_DE);
+  CHECK_EQ(sci::ICR_ACK, sunos::SBC_ICR_ACK);
+  CHECK_EQ(sci::ICR_BSY, sunos::SBC_ICR_BUSY);
+  CHECK_EQ(sci::ICR_SEL, sunos::SBC_ICR_SEL);
+  CHECK_EQ(sci::ICR_ATN, sunos::SBC_ICR_ATN);
+  CHECK_EQ(sci::ICR_DATA, sunos::SBC_ICR_DATA);
 
   // The two positions where read and write are different registers.  If these
   // ever came out equal, the read/modify/write both drivers avoid would be
@@ -250,6 +353,15 @@ TEST(layout_mode) {
   CHECK_EQ(sci::MR_DMA, linux_::MR_DMA_MODE);
   CHECK_EQ(sci::MR_ARB, linux_::MR_ARBITRATE);
 
+  CHECK_EQ(sci::MR_BLOCK_DMA, sunos::SBC_MR_BDMA);
+  CHECK_EQ(sci::MR_TARGET, sunos::SBC_MR_TRG);
+  CHECK_EQ(sci::MR_PAR_CHK, sunos::SBC_MR_EPC);
+  CHECK_EQ(sci::MR_PAR_INTR, sunos::SBC_MR_EPI);
+  CHECK_EQ(sci::MR_EOP_INTR, sunos::SBC_MR_EEI);
+  CHECK_EQ(sci::MR_MON_BSY, sunos::SBC_MR_MBSY);
+  CHECK_EQ(sci::MR_DMA, sunos::SBC_MR_DMA);
+  CHECK_EQ(sci::MR_ARB, sunos::SBC_MR_ARB);
+
   // Every bit of Mode is implemented; nothing reads back as zero.
   CHECK_EQ(uint8_t(sci::MR_BLOCK_DMA | sci::MR_TARGET | sci::MR_PAR_CHK |
                    sci::MR_PAR_INTR | sci::MR_EOP_INTR | sci::MR_MON_BSY |
@@ -271,6 +383,13 @@ TEST(layout_target_command) {
   CHECK_EQ(sci::TCR_MSG, linux_::TCR_ASSERT_MSG);
   CHECK_EQ(sci::TCR_CD, linux_::TCR_ASSERT_CD);
   CHECK_EQ(sci::TCR_IO, linux_::TCR_ASSERT_IO);
+
+  CHECK_EQ(sci::TCR_REQ, sunos::SBC_TCR_REQ);
+  CHECK_EQ(sci::TCR_MSG, sunos::SBC_TCR_MSG);
+  CHECK_EQ(sci::TCR_CD, sunos::SBC_TCR_CD);
+  CHECK_EQ(sci::TCR_IO, sunos::SBC_TCR_IO);
+  // Sun's header does not carry LAST BYTE SENT at all.  That bit is the
+  // 53C80's (p. 54) and this header predates the CMOS part.
 
   // The phase lives in the bottom three bits; REQ sits just above them.
   CHECK_EQ(sci::TCR_PHASE_MASK,
@@ -298,7 +417,17 @@ TEST(layout_current_scsi_bus_status) {
   CHECK_EQ(sci::CSB_SEL, linux_::SR_SEL);
   CHECK_EQ(sci::CSB_DBP, linux_::SR_DBP);
 
+  CHECK_EQ(sci::CSB_RST, sunos::SBC_CBSR_RST);
+  CHECK_EQ(sci::CSB_BSY, sunos::SBC_CBSR_BSY);
+  CHECK_EQ(sci::CSB_REQ, sunos::SBC_CBSR_REQ);
+  CHECK_EQ(sci::CSB_MSG, sunos::SBC_CBSR_MSG);
+  CHECK_EQ(sci::CSB_CD, sunos::SBC_CBSR_CD);
+  CHECK_EQ(sci::CSB_IO, sunos::SBC_CBSR_IO);
+  CHECK_EQ(sci::CSB_SEL, sunos::SBC_CBSR_SEL);
+  CHECK_EQ(sci::CSB_DBP, sunos::SBC_CBSR_DBP);
+
   CHECK_EQ(sci::CSB_PHASE_MASK, linux_::PHASE_MASK);
+  CHECK_EQ(sci::CSB_PHASE_MASK, sunos::CBSR_PHASE_BITS);
 }
 
 TEST(layout_bus_and_status) {
@@ -323,6 +452,15 @@ TEST(layout_bus_and_status) {
   CHECK_EQ(sci::BSR_ATN, linux_::BASR_ATN);
   CHECK_EQ(sci::BSR_ACK, linux_::BASR_ACK);
 
+  CHECK_EQ(sci::BSR_END_DMA, sunos::SBC_BSR_EDMA);
+  CHECK_EQ(sci::BSR_DRQ, sunos::SBC_BSR_RDMA);
+  CHECK_EQ(sci::BSR_PAR_ERR, sunos::SBC_BSR_PERR);
+  CHECK_EQ(sci::BSR_IRQ, sunos::SBC_BSR_INTR);
+  CHECK_EQ(sci::BSR_PHASE_MATCH, sunos::SBC_BSR_PMTCH);
+  CHECK_EQ(sci::BSR_BUSY_ERR, sunos::SBC_BSR_BERR);
+  CHECK_EQ(sci::BSR_ATN, sunos::SBC_BSR_ATN);
+  CHECK_EQ(sci::BSR_ACK, sunos::SBC_BSR_ACK);
+
   // Reading register 7 clears three bits and not the fourth: END OF DMA goes
   // away when MR_DMA is reset instead (p. 16), and a driver that expected the
   // acknowledge to clear it would spin.
@@ -343,6 +481,25 @@ TEST(layout_phases) {
   CHECK_EQ(sci::PH_STATUS, linux_::PHASE_SR_TO_TCR(linux_::PHASE_STATIN));
   CHECK_EQ(sci::PH_MSG_OUT, linux_::PHASE_SR_TO_TCR(linux_::PHASE_MSGOUT));
   CHECK_EQ(sci::PH_MSG_IN, linux_::PHASE_SR_TO_TCR(linux_::PHASE_MSGIN));
+
+  // Sun's header is the only one that writes both encodings out in full - the
+  // Target Command values a driver writes, and the Current SCSI Bus Status
+  // values it compares against - so it checks the shift of two from both ends
+  // rather than assuming it.
+  CHECK_EQ(sci::PH_DATA_OUT, sunos::TCR_DATA_OUT);
+  CHECK_EQ(sci::PH_DATA_IN, sunos::TCR_DATA_IN);
+  CHECK_EQ(sci::PH_COMMAND, sunos::TCR_COMMAND);
+  CHECK_EQ(sci::PH_STATUS, sunos::TCR_STATUS);
+  CHECK_EQ(sci::PH_MSG_OUT, sunos::TCR_MSG_OUT);
+  CHECK_EQ(sci::PH_MSG_IN, sunos::TCR_MSG_IN);
+  CHECK_EQ(sci::PH_UNSPEC_1, sunos::TCR_UNSPECIFIED);
+
+  CHECK_EQ(sci::phase_to_csb(sci::PH_DATA_OUT), sunos::PHASE_DATA_OUT);
+  CHECK_EQ(sci::phase_to_csb(sci::PH_DATA_IN), sunos::PHASE_DATA_IN);
+  CHECK_EQ(sci::phase_to_csb(sci::PH_COMMAND), sunos::PHASE_COMMAND);
+  CHECK_EQ(sci::phase_to_csb(sci::PH_STATUS), sunos::PHASE_STATUS);
+  CHECK_EQ(sci::phase_to_csb(sci::PH_MSG_OUT), sunos::PHASE_MSG_OUT);
+  CHECK_EQ(sci::phase_to_csb(sci::PH_MSG_IN), sunos::PHASE_MSG_IN);
 
   // NetBSD extracts the phase from the same register the same way.
   CHECK_EQ(sci::PH_COMMAND, netbsd::bus_phase(netbsd::SCI_BUS_CD));
