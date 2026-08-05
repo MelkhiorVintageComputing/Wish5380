@@ -20,7 +20,7 @@ machine the co-simulation actually boots is an i386 Linux, because every Mac
 emulator needs a ROM a script cannot fetch; `cosim/README.md` argues that at
 length, and it is the question everyone asks first.
 
-The design is complete.  All 114 tests pass on both boards at three clock
+The design is complete.  All 118 tests pass on both boards at three clock
 rates, and an unmodified Linux mounts a filesystem off it.
 
 ### Where answers come from
@@ -35,22 +35,29 @@ scan is clean; cite the printed page, which is two less than the PDF page.
 **The drivers in `doc/drivers/` are the authority on sequencing** - what order
 a driver writes the registers in, how long it waits, which bits it polls, and
 what it assumes happens between two accesses.  `doc/drivers/README.md` indexes
-the passages that settle specific questions.  Three independent families are
-kept on purpose: where Linux's `NCR5380.c`, NetBSD's `ncr5380sbc.c` and Sun's
-`SunOS34/sundev/si.c` agree, the sequence is the chip's and not one author's
-habit.  Sun's is the odd one out and the useful one: not another reading of
+the passages that settle specific questions.  Four independent families are
+kept on purpose: where Linux's `NCR5380.c`, NetBSD's `ncr5380sbc.c`, Sun's
+`SunOS34/sundev/si.c` and EmuTOS's `scsi.c` agree, the sequence is the chip's
+and not one author's habit.  Sun's is the odd one out and the useful one: not another reading of
 the databook but the code of the company that built the board, for the machine
 the co-simulation boots.  Its board header is *not* independent of NetBSD's -
 NetBSD's descends from it - so "both drivers agree" is a claim about the chip
 and not about the board.
 
-**The three driver headers agree with the datasheet and with each other on
+EmuTOS's is the odd one out in a different way: written in 2018 rather than
+the eighties, small, and polled from top to bottom with no interrupt handler
+at all.  It is the easiest of the four to read a sequence out of, and it is
+the only one that gives the register order at two spacings - the TT's two and
+the Falcon's one - which is what shows the spacing is the board's and the
+order is the part's.
+
+**The four driver headers agree with the datasheet and with each other on
 every bit.**  That is the comfortable case and is worth knowing, because the
 sibling project Wish7990 found a disagreement in the equivalent place.  If a
 future reading turns one up here, it goes in `doc/drivers/README.md` rather
 than being quietly resolved.
 
-`tb/cpp/tests/test_layout.cpp` transcribes all three headers a fourth time and
+`tb/cpp/tests/test_layout.cpp` transcribes all four a fifth time and
 pins our constants to them.  It exists before any engine, on purpose: Wish82586
 wrote its command unit first and had to redo it when the layout turned out to
 be wrong.
@@ -73,6 +80,8 @@ make clean
 
 make -C cosim/rtl check # drive the Verilated core through a driver's own
                         # sequences, with no emulator in the loop
+cosim/scripts/run-tt.py # an Atari TT under EmuTOS: the cheapest of the three
+                        # co-simulated machines, and a whole boot in a minute
 ```
 
 `make test` must stay green on **both boards**.  Green means 0 failed; pending
@@ -313,6 +322,11 @@ not a Macintosh, which is the question everyone asks first.
 `make -C cosim/rtl check` is the thing to run before blaming the RTL: it drives
 the shared library through the driver's own sequences with no emulator in the
 loop, so a fault has two places to be instead of four.
+
+There are three co-simulated machines - an ISA card in Linux, a Sun-3/60 under
+NetBSD and SunOS, and an Atari TT under EmuTOS.  The TT is by far the cheapest
+to run and the quickest to say something, so it is the one to reach for first
+when a change might have broken a driver's view of the chip.
 
 The library reuses `sim`, `wb`, `util` and `sd_card` from `tb/cpp` unchanged.
 A co-simulation with its own bus model would drift from the regression and stop

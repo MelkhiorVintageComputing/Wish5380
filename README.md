@@ -22,9 +22,10 @@ there is a card slot.
 
 ## Status
 
-The design is complete.  An unmodified Linux, an unmodified NetBSD and an
-unmodified SunOS 4.1.1 all boot off it, one moving every byte with the CPU
-and the other two with a DMA controller.  A driver
+The design is complete.  An unmodified Linux, an unmodified NetBSD, an
+unmodified SunOS 4.1.1 and an unmodified EmuTOS all mount a filesystem off it,
+one moving every byte with the CPU and the other three through three different
+DMA controllers.  A driver
 reaches the Wishbone slave through the three windows a Macintosh expects,
 arbitrates and selects, and reads and writes blocks - either a byte at a time
 in programmed I/O or through the pseudo-DMA aperture the Mac uses for speed -
@@ -43,7 +44,7 @@ of BSY.
 | `wb_5380`           | machine glue: three windows, byte lanes, pseudo-DMA   | `wb_` (15)             |
 | `wish5380`          | the part itself                                       | `sys_`, `bus_`         |
 | `sci_regs`          | the eight registers and the port they hide behind     | `reg_` (10)            |
-| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22), `dma_` (12) |
+| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22), `dma_` (15) |
 | `scsi_fabric`       | the wired-OR joining everything on the bus            | `two_` (8), `bus_`     |
 | `scsi_targ`         | a direct-access device, one per drive                 | `sys_`, `two_`, `sd_`  |
 | `blk_sd`, `sd_spi`  | an SD card in SPI mode                                | `sd_`                  |
@@ -56,11 +57,11 @@ way and is on the path a Sun 3/60 takes.
 A prefix is counted once, against the block it is mostly about; the others
 beside it reach the same block through something else.  Two more prefixes are
 about the testbench rather than the design: `layout_` (7) pins the constants
-to the datasheet and to all three driver headers, and `infra_` (5) checks the
-clock, the reset and the accessors everything else stands on - if one of those
-fails, no other result means anything.
+to the datasheet and to all four drivers' own declarations, and `infra_` (5)
+checks the clock, the reset and the accessors everything else stands on - if
+one of those fails, no other result means anything.
 
-All 115 pass, with none pending, in six builds: two boards - the Macintosh,
+All 118 pass, with none pending, in six builds: two boards - the Macintosh,
 with its registers sixteen bytes apart, and a generic ISA card with them one
 byte apart - at each of 7.8 MHz, 50 MHz and 125 MHz.  The part's delays are
 derived from the clock rather than written down and the register spacing is an
@@ -103,6 +104,26 @@ that driver rather than from NetBSD - three of them, all about transfers that
 do not end at terminal count, because SunOS asks a disk for more than it has
 and NetBSD never does.
 
+A fourth is **EmuTOS on an Atari TT**, which is the free TOS the Atari never
+had, and a third machine after the ISA card and the Sun.  Its driver takes no
+interrupts at all - it arms Atari's DMA chip and spins on the MFP until the
+5380 raises its line - so it is the one guest that depends on End of Process
+and the END OF DMA bit that follows it:
+
+```
+                    EmuTOS Version:     1.4
+                    Machine:            Atari TT
+                    GEMDOS drives:      ABC
+
+the 5380 is a replica and the disk is a memory card
+and it wrote that back to C:\WROTE.TXT
+```
+
+`C` is a FAT partition found by reading the card's own partition table; the
+line under it was printed by a program that EmuTOS found in `C:\AUTO`, read
+off the chip and ran; and the line under *that* is the same journey backwards,
+checked afterwards on the host by parsing the card image.
+
 See [`cosim/`](cosim/README.md).
 
 ## Building and testing
@@ -138,9 +159,10 @@ which question.  The two to start from:
 Then [`doc/target.md`](doc/target.md) for the disk, [`doc/sd.md`](doc/sd.md)
 for the card behind it, [`doc/drivers`](doc/drivers/README.md) for the vintage
 drivers and which of them is the authority on what, and
-[`cosim/`](cosim/README.md) for the three guests - an unmodified Linux, an
-unmodified NetBSD and an unmodified SunOS 4.1.1, one driving the chip byte by
-byte and the other two through a real DMA controller.
+[`cosim/`](cosim/README.md) for the four guests - an unmodified Linux, an
+unmodified NetBSD, an unmodified SunOS 4.1.1 and an unmodified EmuTOS, one
+driving the chip byte by byte and the other three through three different DMA
+controllers.
 
 ## Layout
 

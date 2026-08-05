@@ -11,6 +11,7 @@ nothing in `src/` or `tb/` is derived from them.  They are here to be read.
 | `NetBSD-atari/` | NetBSD/atari's own `ncr5380.c`, a second, independent driver by a different author |
 | `SunOS34/`      | Sun's own `si` driver for the Sun-3 board, in its three flavours: the kernel's (`sundev/`), the standalone one the boot programs link (`sunstand/`), and the boot monitor's (`mon3/`) |
 | `SunOS412/`     | the same driver five years later, from SunOS 4.1.2.  Kept for one reason: it is the version whose diagnostics the co-simulation prints, and 3.4's has neither of them |
+| `EmuTOS/`       | `bios/scsi.c`, the free TOS's driver for the Atari TT and Falcon.  The only one written this century, and the one the Hatari co-simulation boots |
 
 ## Which source is the authority on what
 
@@ -48,7 +49,15 @@ different people, so where they agree on a sequence, the sequence is the
 chip's and not one author's habit.  `NetBSD-atari/ncr5380.c` is a third,
 written by Leo Weppelman, and is useful for the same reason.
 
-## The three driver headers agree with the datasheet, and with each other
+`EmuTOS/scsi.c` is a fifth and the most recent by two decades - Roger Burrows,
+2018 - and it is useful for a reason none of the others are.  It is small and
+polled from top to bottom: no interrupt handler, no state machine, no
+disconnect.  `scsi_arbitrate` and `scsi_select` are twenty lines each and can
+be read straight through, which makes it the best place to *start* reading
+about a sequence before going to Linux's for the cases it handles and EmuTOS
+does not.
+
+## The four driver headers agree with the datasheet, and with each other
 
 `NetBSD/ncr5380reg.h`, `Linux/NCR5380.h` and `SunOS34/sundev/sireg.h` are
 independent transcriptions of the same databook - the NetBSD one traces back
@@ -76,6 +85,12 @@ datasheet calls it:
 | ENABLE EOP INTERRUPT      | `SCI_MODE_DMA_IE`       | `MR_ENABLE_EOP_INTR`     | `SBC_MR_EEI`     | NetBSD names it for the DMA completion it usually signals |
 | TEST MODE (ICR bit 6, w)  | `SCI_ICMD_TEST`         | `ICR_TRI_STATE`          | `SBC_ICR_TEST`   | Linux names it for its effect: all output drivers float |
 | LOST ARBITRATION          | `SCI_ICMD_LST`          | `ICR_ARBITRATION_LOST`   | `SBC_ICR_LA`     | |
+
+EmuTOS is not in that table because it names nothing: it writes the hex
+literal with a comment beside it - `SCSI_BASE->icr = 0x80; /* assert RST */`.
+That makes it a weaker witness on vocabulary and an unusually direct one on
+values, and `tb/cpp/tests/test_layout.cpp` transcribes the literals with the
+comments attached.
 
 ## Two places a driver comment disagrees with the datasheet
 
@@ -105,9 +120,13 @@ there, and both driver families work around it in their own way:
 * Linux never reads the register to modify it, keeping what it last wrote;
 * SunOS reads it and masks off the one bit it has just been looking at -
   `icr = *icrp & ~SBC_ICR_AIP` in `si_arb_sel`, three times over
-  (`SunOS34/sundev/si.c` lines 1084, 1086, 1108).
+  (`SunOS34/sundev/si.c` lines 1084, 1086, 1108);
+* EmuTOS never modifies it after reading either.  It reads the register only
+  to test AIP and LOST ARBITRATION - `while(!(get_icr_reg()&0x40))` and
+  `} while(get_icr_reg()&0x20);` in `scsi_arbitrate` - and every write is a
+  fresh value or an and/or against a literal it chose.
 
-Three independent workarounds for the same fault is about as strong a signal
+Four independent workarounds for the same fault is about as strong a signal
 as reference software can give that the fault is real, so the replica
 reproduces it rather than fixing it.
 `reg_initiator_command_reads_arbitration_not_what_was_written` pins it.
@@ -216,6 +235,35 @@ appear to work.  This is also the answer to a question the co-simulation
 raised and did not settle: `si0: lost interrupt` is printed by `si_deque`
 *after* a request has already timed out, when the CSR shows `SBC_IP` - it is
 the driver's explanation for a timeout and not an independent fault.
+
+## What EmuTOS confirms about arbitration
+
+Two of the decisions in `CLAUDE.md`'s faithfulness list are about what the
+chip deliberately does *not* do during arbitration, and they are the two most
+tempting to get wrong, because a replica that "helped" would look better and
+break the drivers.  EmuTOS confirms both, independently and thirty years after
+the fact:
+
+* **Arbitration is lost only to another device's SEL** (p. 12).  A driver
+  asserts SEL itself while still arbitrating.  EmuTOS writes
+  `put_icr_reg(0x0c)` - assert BSY and SEL together - and only *then*
+  `and_mode_reg(0xfe)` to clear ARBITRATE, in that order, in
+  `scsi_arbitrate`.  Linux does the same with `ICR_ASSERT_SEL |
+  ICR_ASSERT_BSY`.  A chip that counted its own SEL as a lost arbitration
+  would break selection outright in both.
+
+* **The chip does not decide who won.**  It reports AIP and LOST ARBITRATION
+  and nothing else; comparing IDs against the data bus is the driver's job.
+  EmuTOS does it in three lines - read Current SCSI Data, subtract its own
+  bit, and go round again if anything higher is still there:
+
+  ```c
+  temp = get_data_reg();          /* read active bus */
+  temp -= hostid_bit;             /* remove ourselves */
+  } while((temp > hostid_bit) || (get_icr_reg()&0x20));
+  ```
+
+  which is Linux's `id_higher_mask` test arrived at by a different route.
 
 ## The 53C80 is the CMOS part, and adds one bit
 

@@ -1,0 +1,604 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Wed, 5 Aug 2026 15:07:46 +0200
+Subject: [PATCH] Drive the TT's SCSI from a Verilated NCR 5380
+
+Replace both halves of Hatari's SCSI at once: the eight registers come from
+a Verilated wish5380 loaded at run time, and so does the disk, which is a
+SCSI target of its own with an SD card behind it.  Hatari's own model and its
+command-level disk are left out of the path entirely - a co-simulation that
+kept the emulator's disk would only be testing the emulator's disk.
+
+Enabled by setting WISH5380_LIB to the shared library and WISH5380_SD to the
+card image.  With either unset nothing changes and Hatari's own model runs,
+which is what the existing --scsi tests still exercise.
+
+The seam is two functions, because the TT's is: the machine reaches the chip
+through eight byte-wide registers at 0xff8780, two apart and on the odd byte,
+and that is the whole of what it can do to it.
+
+What needed writing rather than forwarding is the DMA controller, since the
+TT has one and the 5380 does not.  Hatari's own loop asks the emulated device
+how many bytes it holds and moves exactly that many; nothing can do that here,
+because the target is inside the Verilated core and answers through REQ like
+a real one.  So the loop ends the way the hardware's does - when the count
+runs out, or when the target leaves the phase the chip was set up for, which
+PHASE MATCH reports and the chip's interrupt does not.  An interrupt is a
+latch and may be left over from the command before.
+
+It also packs bytes into longwords the way the TT's DMA chip does, leaving
+whatever does not fill one in the residue register at 0xff8710.  That is not
+decoration: EmuTOS's cleanup_tt_dma() reads the low two bits of the final
+pointer to find out how many bytes are still in there and copies them to
+memory itself, so a controller that had written them already and left the
+residue empty would give it a short read it could not see.
+
+No timer is needed to keep the core moving, which the Sun-3 co-simulation
+does need.  EmuTOS polls the chip's own registers while it waits for
+selection and for REQ, so a little core time bought with each register access
+carries it forward; and for the data phases the pump has already run the
+whole transfer to completion inside the register write that started it, so
+the interrupt is there before the first poll looks for it.
+---
+ src/CMakeLists.txt      |   4 +
+ src/includes/wish5380.h |  27 +++
+ src/ncr5380.c           |  21 ++
+ src/wish5380.c          | 426 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 478 insertions(+)
+ create mode 100644 src/includes/wish5380.h
+ create mode 100644 src/wish5380.c
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index e0fd05f..499180a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -64,6 +64,7 @@ set(SOURCES
+ 	tos.c
+ 	vdi.c
+ 	video.c
++	wish5380.c
+ 	wavFormat.c
+ 	xbios.c
+ 	ymFormat.c)
+@@ -305,6 +306,9 @@ endif(ENABLE_LIBRETRO)
+ 
+ target_link_libraries(${APP_NAME} ${SDL2_LIBRARIES})
+ 
++# The Verilated 5380 is loaded at run time, not linked against.
++target_link_libraries(${APP_NAME} ${CMAKE_DL_LIBS})
++
+ if(Math_FOUND AND NOT APPLE)
+ 	target_link_libraries(${APP_NAME} ${MATH_LIBRARY})
+ endif()
+diff --git a/src/includes/wish5380.h b/src/includes/wish5380.h
+new file mode 100644
+index 0000000..1bf7c9c
+--- /dev/null
++++ b/src/includes/wish5380.h
+@@ -0,0 +1,27 @@
++/*
++ * Hatari - a Verilated NCR 5380 in place of the software model
++ *
++ * This file is distributed under the GNU General Public License, version 2
++ * or at your option any later version. Read the file gpl.txt for details.
++ */
++
++#ifndef HATARI_WISH5380_H
++#define HATARI_WISH5380_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* Set WISH5380_LIB to the shared library and WISH5380_SD to the card image;
++ * without both, everything below does nothing and Hatari's own model runs. */
++bool Wish5380_Init(void);
++void Wish5380_UnInit(void);
++bool Wish5380_Enabled(void);
++
++uint8_t Wish5380_ReadByte(int reg);
++void Wish5380_WriteByte(int reg, uint8_t val);
++
++/* The TT's DMA controller, moving bytes between ST RAM and the chip one DRQ
++ * at a time.  Called where Hatari's own bulk loop would have run. */
++void Wish5380_DmaTransfer(void);
++
++#endif
+diff --git a/src/ncr5380.c b/src/ncr5380.c
+index 7a879f1..a431464 100644
+--- a/src/ncr5380.c
++++ b/src/ncr5380.c
+@@ -30,6 +30,7 @@ const char NCR5380_fileid[] = "Hatari ncr5380.c";
+ #include "stMemory.h"
+ #include "newcpu.h"
+ #include "tos.h"
++#include "wish5380.h"
+ 
+ #define WITH_NCR5380 1
+ 
+@@ -1023,6 +1024,11 @@ bool Ncr5380_Init(void)
+ 	nScsiPartitions = 0;
+ 	bScsiEmuOn = false;
+ 
++	/* A Verilated chip brings its own disk with it, so none of Hatari's
++	 * own SCSI devices are set up and nothing below runs. */
++	if (Wish5380_Init())
++		return true;
++
+ 	memset(&ScsiBus, 0, sizeof(ScsiBus));
+ 	ScsiBus.typestr = "SCSI";
+ 	ScsiBus.buffer_size = 512;
+@@ -1058,6 +1064,11 @@ void Ncr5380_UnInit(void)
+ #if WITH_NCR5380
+ 	int i;
+ 
++	if (Wish5380_Enabled()) {
++		Wish5380_UnInit();
++		return;
++	}
++
+ 	for (i = 0; i < MAX_SCSI_DEVS; i++)
+ 	{
+ 		HDC_UnInitDevice(&ScsiBus.devs[i]);
+@@ -1101,6 +1112,10 @@ void Ncr5380_Reset(void)
+ void Ncr5380_WriteByte(int addr, uint8_t byte)
+ {
+ #if WITH_NCR5380
++	if (Wish5380_Enabled()) {
++		Wish5380_WriteByte(addr, byte);
++		return;
++	}
+ 	ncr5380_bput(&ncr_soft_scsi, addr, byte);
+ #endif
+ }
+@@ -1111,6 +1126,8 @@ void Ncr5380_WriteByte(int addr, uint8_t byte)
+ uint8_t Ncr5380_ReadByte(int addr)
+ {
+ #if WITH_NCR5380
++	if (Wish5380_Enabled())
++		return Wish5380_ReadByte(addr);
+ 	return ncr5380_bget(&ncr_soft_scsi, addr);
+ #else
+ 	return 0;
+@@ -1156,6 +1173,10 @@ void Ncr5380_IoMemTT_ReadByte(void)
+ 
+ void Ncr5380_TT_DMA_Ctrl_WriteWord(void)
+ {
++	if (Wish5380_Enabled()) {
++		Wish5380_DmaTransfer();
++		return;
++	}
+ 	if (IoMem[0xff8715] & 2)
+ 		dma_check(&ncr_soft_scsi);
+ }
+diff --git a/src/wish5380.c b/src/wish5380.c
+new file mode 100644
+index 0000000..f793c55
+--- /dev/null
++++ b/src/wish5380.c
+@@ -0,0 +1,426 @@
++/*
++ * Hatari - a Verilated NCR 5380 in place of the software model
++ *
++ * Copyright 2026 Romain Dolbeau
++ *
++ * This file is distributed under the GNU General Public License, version 2
++ * or at your option any later version. Read the file gpl.txt for details.
++ *
++ *
++ * What this replaces, and what it does not
++ * ----------------------------------------
++ *
++ * Hatari models the 5380 in software and puts a command-level SCSI disk behind
++ * it.  This file replaces both at once: the eight registers come from a
++ * Verilated wish5380, and so does the disk, which is a SCSI target of its own
++ * with an SD card underneath.  Nothing of Hatari's SCSI stack is left in the
++ * path, which is the point - a co-simulation that kept the emulator's disk
++ * would only be testing the emulator's disk.
++ *
++ * The seam is small because the TT's is: the machine reaches the chip through
++ * eight byte-wide registers at 0xff8780, two apart and on the odd byte, and
++ * that is all it can do to it.  A board with a pseudo-DMA aperture or a bus
++ * master would need more.
++ *
++ *
++ * The DMA controller
++ * ------------------
++ *
++ * The TT has one and the 5380 does not, so the loop below is the DMA chip:
++ * it holds the address and the count, watches DRQ, and answers each one with
++ * an acknowledge cycle.  The chip never sees an address during those cycles
++ * and does not want one (p. 6).
++ *
++ * Hatari's own loop asks the emulated device how many bytes it has and moves
++ * exactly that many.  Nothing here can do that - the target is inside the
++ * Verilated core and will say what it has to say through REQ like a real one -
++ * so the loop ends the way the hardware's does: when the count runs out, or
++ * when the target leaves the phase the chip was set up for.
++ *
++ * That second ending is the one that matters.  EmuTOS asks for whole sectors
++ * and usually gets them, but its cleanup_tt_dma() exists precisely because a
++ * transfer can stop short, and the residue it reads back has to be the one the
++ * hardware would have left.
++ *
++ *
++ * Time
++ * ----
++ *
++ * The core is only advanced while something is happening, and here that needs
++ * no timer at all - which is a real simplification over the Sun-3, where the
++ * driver waits on its own DMA controller and the emulator has to keep the core
++ * moving underneath it.
++ *
++ * EmuTOS polls: it reads the 5380's status registers while it waits for
++ * selection and for REQ, so a little core time bought with each register
++ * access carries it forward.  For the data phases it arms the DMA chip and
++ * then waits on the interrupt, and by that time the pump below has already run
++ * the whole transfer to completion inside the register write that started it.
++ * So the interrupt is there before the first poll looks for it.
++ */
++const char WISH5380_fileid[] = "Hatari wish5380.c";
++
++#include <dlfcn.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++
++#include "main.h"
++#include "configuration.h"
++#include "ioMem.h"
++#include "log.h"
++#include "mfp.h"
++#include "stMemory.h"
++#include "wish5380.h"
++
++#define WISH_RTL_ABI 2
++
++typedef struct WishRtl WishRtl;
++
++static struct {
++	void *handle;
++	WishRtl *core;
++
++	uint32_t (*abi)(void);
++	WishRtl *(*new_)(const char *image, uint32_t blocks);
++	void (*free_)(WishRtl *r);
++	void (*flush)(WishRtl *r);
++	int (*reset)(WishRtl *r);
++	void (*write)(WishRtl *r, int reg, uint8_t val);
++	uint8_t (*read)(WishRtl *r, int reg);
++	int (*irq)(WishRtl *r);
++	int (*drq)(WishRtl *r);
++	uint8_t (*dack_read)(WishRtl *r);
++	void (*dack_write)(WishRtl *r, uint8_t val);
++	void (*set_eop)(WishRtl *r, int asserted);
++	void (*run_ns)(WishRtl *r, uint64_t ns);
++	uint64_t (*time_ns)(WishRtl *r);
++	uint32_t (*blocks)(WishRtl *r);
++	int (*ready)(WishRtl *r);
++
++	bool irq_line;
++	bool armed;
++} wish;
++
++/* Core time bought by one register access.  A driver polling a status
++ * register has to make progress, and this is what pays for it. */
++#define STEP_PER_ACCESS_NS	1000
++
++/* How long the pump will wait for one byte before deciding the transfer has
++ * ended.  EmuTOS's own patience is 3 seconds of 200 Hz ticks; anything short
++ * of that only makes the co-simulation stricter than the guest. */
++#define DRQ_WAIT_NS		(2 * 1000 * 1000)
++#define DRQ_STEP_NS		200
++
++/* Bus and Status Register, p. 15.  The pump reads it directly because PHASE
++ * MATCH is the only thing that tells it the target has moved on. */
++#define BSR_PHASE_MATCH		0x08
++
++/* Mode Register, p. 13.  Read back rather than remembered, because the chip
++ * refuses this bit while BSY is false (p. 14) and a controller that assumed
++ * the write had stuck would start a transfer the chip is not in. */
++#define MR_DMA_MODE		0x02
++
++/* The TT DMA chip's control byte at 0xff8715: direction in bit 0, enable in
++ * bit 1.  0x80 reads back as a bus error, which EmuTOS polls for. */
++#define TT_DMA_ENABLE		0x02
++
++static bool Wish5380_Load(const char *path)
++{
++	wish.handle = dlopen(path, RTLD_NOW);
++	if (!wish.handle) {
++		Log_Printf(LOG_ERROR, "wish5380: %s\n", dlerror());
++		return false;
++	}
++
++#define SYM(field, name)						\
++	do {								\
++		*(void **)&wish.field = dlsym(wish.handle, name);	\
++		if (!wish.field) {					\
++			Log_Printf(LOG_ERROR,				\
++				   "wish5380: no %s in %s\n", name, path); \
++			return false;					\
++		}							\
++	} while (0)
++
++	SYM(abi, "wish_rtl_abi");
++	SYM(new_, "wish_rtl_new");
++	SYM(free_, "wish_rtl_free");
++	SYM(flush, "wish_rtl_flush");
++	SYM(reset, "wish_rtl_reset");
++	SYM(write, "wish_rtl_write");
++	SYM(read, "wish_rtl_read");
++	SYM(irq, "wish_rtl_irq");
++	SYM(drq, "wish_rtl_drq");
++	SYM(dack_read, "wish_rtl_dack_read");
++	SYM(dack_write, "wish_rtl_dack_write");
++	SYM(set_eop, "wish_rtl_set_eop");
++	SYM(run_ns, "wish_rtl_run_ns");
++	SYM(time_ns, "wish_rtl_time_ns");
++	SYM(blocks, "wish_rtl_blocks");
++	SYM(ready, "wish_rtl_ready");
++#undef SYM
++
++	if (wish.abi() != WISH_RTL_ABI) {
++		Log_Printf(LOG_ERROR, "wish5380: library is ABI %u, want %u\n",
++			   wish.abi(), WISH_RTL_ABI);
++		return false;
++	}
++	return true;
++}
++
++static void Wish5380_Flush(void)
++{
++	if (wish.core)
++		wish.flush(wish.core);
++}
++
++bool Wish5380_Init(void)
++{
++	const char *lib = getenv("WISH5380_LIB");
++	const char *sd = getenv("WISH5380_SD");
++	uint32_t blocks = 0;
++	struct stat st;
++
++	if (wish.core)
++		return true;
++	if (!lib || !sd)
++		return false;
++
++	if (!Wish5380_Load(lib))
++		return false;
++
++	/* The card is as big as the file behind it.  Asking for fewer blocks
++	 * than the image holds would give the guest a disk whose last sectors
++	 * exist on the host and not on the card. */
++	if (stat(sd, &st) == 0 && st.st_size >= 512)
++		blocks = st.st_size / 512;
++
++	wish.core = wish.new_(sd, blocks);
++	if (!wish.core) {
++		Log_Printf(LOG_ERROR, "wish5380: cannot open card image %s\n", sd);
++		return false;
++	}
++
++	/* Blocks until the card has finished initialising, which is what a
++	 * machine that runs a self test before probing SCSI would see. */
++	if (!wish.reset(wish.core)) {
++		Log_Printf(LOG_ERROR, "wish5380: the card did not come up\n");
++		return false;
++	}
++
++	/* What the guest writes has to survive the run, and Hatari does not
++	 * always come down through Main_UnInit - --run-vbls calls exit()
++	 * where it stands.  A card that quietly dropped everything written
++	 * to it would make a co-simulation that only ever proved reads, and
++	 * look exactly like one that had proved both. */
++	atexit(Wish5380_Flush);
++
++	Log_Printf(LOG_INFO, "wish5380: %s, %u blocks, driving the 5380\n",
++		   sd, wish.blocks(wish.core));
++	return true;
++}
++
++void Wish5380_UnInit(void)
++{
++	if (!wish.core)
++		return;
++	wish.flush(wish.core);
++	wish.free_(wish.core);
++	wish.core = NULL;
++	dlclose(wish.handle);
++	wish.handle = NULL;
++}
++
++bool Wish5380_Enabled(void)
++{
++	return wish.core != NULL;
++}
++
++/*
++ * The interrupt line, as the TT wires it: the chip's IRQ output goes to the
++ * MFP's GPIP 7, and EmuTOS spins on that bit rather than taking a vector.
++ *
++ * It is sent on every access because the core's line moves on its own - a
++ * transfer completing, a phase changing - and there is nothing else here that
++ * would notice.  Hatari's own model only ever raises the line and never lowers
++ * it; a replica that did the same would let a driver see a stale interrupt
++ * from the previous command and act on it.
++ */
++static void Wish5380_SyncIrq(void)
++{
++	bool now = wish.irq(wish.core) != 0;
++
++	if (now == wish.irq_line)
++		return;
++	wish.irq_line = now;
++	if (Config_IsMachineTT())
++		MFP_GPIP_Set_Line_Input(pMFP_TT, MFP_TT_GPIP_LINE_SCSI_NCR,
++					now ? MFP_GPIP_STATE_HIGH
++					    : MFP_GPIP_STATE_LOW);
++}
++
++uint8_t Wish5380_ReadByte(int reg)
++{
++	uint8_t val;
++
++	if (reg > 7)			/* Hatari's fake DMA port; unused here */
++		return 0;
++	val = wish.read(wish.core, reg);
++	wish.run_ns(wish.core, STEP_PER_ACCESS_NS);
++	Wish5380_SyncIrq();
++	return val;
++}
++
++void Wish5380_WriteByte(int reg, uint8_t val)
++{
++	if (reg > 7)
++		return;
++	wish.write(wish.core, reg, val);
++	wish.run_ns(wish.core, STEP_PER_ACCESS_NS);
++	Wish5380_SyncIrq();
++
++	/* Registers 5 and 7 are the two writes that start a DMA transfer -
++	 * send and initiator receive (p. 16) - and they only do so if the
++	 * chip took DMA mode. */
++	if ((reg == 5 || reg == 7)
++	    && (wish.read(wish.core, 2) & MR_DMA_MODE)) {
++		wish.armed = true;
++		Wish5380_DmaTransfer();
++	}
++}
++
++/* Where the TT's DMA chip keeps its address and count: four bytes each, high
++ * byte first, on the odd addresses of 0xff8701..0xff870f. */
++static uint32_t Wish5380_DmaAddr(void)
++{
++	return (uint32_t)IoMem[0xff8701] << 24 | (uint32_t)IoMem[0xff8703] << 16
++	     | (uint32_t)IoMem[0xff8705] << 8  | IoMem[0xff8707];
++}
++
++static uint32_t Wish5380_DmaLen(void)
++{
++	return (uint32_t)IoMem[0xff8709] << 24 | (uint32_t)IoMem[0xff870b] << 16
++	     | (uint32_t)IoMem[0xff870d] << 8  | IoMem[0xff870f];
++}
++
++static void Wish5380_SetDmaAddrAndLen(uint32_t addr, uint32_t len)
++{
++	IoMem[0xff8701] = addr >> 24;
++	IoMem[0xff8703] = addr >> 16;
++	IoMem[0xff8705] = addr >> 8;
++	IoMem[0xff8707] = addr;
++	IoMem[0xff8709] = len >> 24;
++	IoMem[0xff870b] = len >> 16;
++	IoMem[0xff870d] = len >> 8;
++	IoMem[0xff870f] = len;
++}
++
++/*
++ * Wait for the chip to ask for the next byte.
++ *
++ * Returns true if DRQ came.  It does not come if the target has left the
++ * phase, and that is a normal end and not an error: the chip stops
++ * recognising REQ, so no further request will ever arrive and a controller
++ * that kept waiting would wait for ever.  PHASE MATCH is what says so, and
++ * the chip's interrupt is not - an interrupt is a latch and may be left over
++ * from the command before.
++ */
++static bool Wish5380_WaitDrq(void)
++{
++	uint64_t waited = 0;
++
++	while (!wish.drq(wish.core)) {
++		if (!(wish.read(wish.core, 5) & BSR_PHASE_MATCH))
++			return false;
++		if (waited >= DRQ_WAIT_NS)
++			return false;
++		wish.run_ns(wish.core, DRQ_STEP_NS);
++		waited += DRQ_STEP_NS;
++	}
++	return true;
++}
++
++void Wish5380_DmaTransfer(void)
++{
++	uint32_t addr = Wish5380_DmaAddr();
++	uint32_t len = Wish5380_DmaLen();
++	/* Bit 0 of the control byte is the direction and bit 1 enables the
++	 * chip, which is why EmuTOS writes 0x00 then 0x02 to read and 0x01
++	 * then 0x03 to write - it sets the direction before it starts. */
++	bool sending = (IoMem[0xff8715] & 0x01) != 0;
++	uint32_t done = 0;
++	uint8_t pack[4];
++	int packed = 0;
++	int i;
++
++	/* Both halves have to be ready, and EmuTOS sets them up in the order
++	 * that makes the DMA chip ready first.  Whichever write comes second
++	 * is the one that gets here with both true; the other returns. */
++	if (!wish.armed || !(IoMem[0xff8715] & TT_DMA_ENABLE))
++		return;
++	wish.armed = false;
++
++	if (!len)
++		return;
++
++	if (!STMemory_CheckAreaType(addr, len, ABFLAG_RAM | ABFLAG_ROM)) {
++		Log_Printf(LOG_WARN, "wish5380: DMA outside RAM at 0x%x+%u\n",
++			   addr, len);
++		return;
++	}
++
++	while (done < len) {
++		if (!Wish5380_WaitDrq())
++			break;
++
++		/* End of Process, asserted across the last acknowledge cycle.
++		 * It is what sets END OF DMA and, with the interrupt enabled,
++		 * what EmuTOS's wait_dma_complete() is waiting for. */
++		if (done + 1 == len)
++			wish.set_eop(wish.core, 1);
++
++		if (sending) {
++			wish.dack_write(wish.core,
++					STMemory_ReadByte(addr + done));
++		} else {
++			/* The TT's DMA chip packs bytes and writes whole
++			 * longwords, so a byte only reaches memory once the
++			 * one it shares its longword with has arrived.  What
++			 * is still in the packer at the end stays there, and
++			 * EmuTOS's cleanup_tt_dma() is what fetches it: the
++			 * low two bits of the final pointer say how many
++			 * bytes, and the residue register holds them. */
++			pack[packed++] = wish.dack_read(wish.core);
++			if (((addr + done + 1) & 3) == 0) {
++				for (i = 0; i < packed; i++)
++					STMemory_WriteByte(addr + done + 1
++							   - packed + i,
++							   pack[i]);
++				packed = 0;
++			}
++		}
++		done++;
++
++		if (done == len)
++			wish.set_eop(wish.core, 0);
++	}
++
++	for (i = 0; i < packed; i++)
++		IoMem[0xff8710 + i] = pack[i];
++
++	/* Let the transfer's own interrupt settle - a phase change at the end
++	 * of the data takes a little longer to reach the pin than the last
++	 * byte took to cross the port. */
++	if (!wish.irq(wish.core))
++		wish.run_ns(wish.core, DRQ_WAIT_NS / 8);
++
++	/* What the driver reads back afterwards has to be what the hardware
++	 * would have left: the address advanced by what moved, and the count
++	 * holding the residue.  EmuTOS's cleanup_tt_dma() reads both. */
++	Wish5380_SetDmaAddrAndLen(addr + done, len - done);
++	Wish5380_SyncIrq();
++
++	if (done != len)
++		Log_Printf(LOG_DEBUG, "wish5380: DMA short, %u of %u\n",
++			   done, len);
++}

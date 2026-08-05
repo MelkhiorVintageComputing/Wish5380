@@ -1,8 +1,8 @@
 # Co-simulation
 
 The regression in `tb/` checks the design against a model of what the drivers
-do.  This checks it against drivers themselves, on two machines that use the
-chip in the two ways it can be used:
+do.  This checks it against drivers themselves, on three machines that use the
+chip in the ways it can be used:
 
 * **An ISA card in an i386 Linux guest** - programmed I/O, every byte carried
   across the register port by the CPU.  Linux's own `g_NCR5380` finds it and
@@ -12,10 +12,15 @@ chip in the two ways it can be used:
   guests boot on it: NetBSD/sun3, which also builds a filesystem and writes
   to it; SunOS 4.1.1, driven by the driver Sun wrote for this board; and the
   3/60 boot PROM itself, which reads the label before either of them exists.
+* **The SCSI controller of an Atari TT** - DMA again, but by Atari's own chip
+  and a driver that takes no interrupts at all.  EmuTOS mounts a FAT
+  filesystem off the card, runs a program out of `C:\AUTO`, and writes a file
+  back.
 
-The third one earned its keep.  **Every fault the co-simulation has found in
-the Sun-3 board model came from SunOS and not from NetBSD**, because the two
-drivers use the hardware differently and NetBSD forgives what SunOS does not:
+The Sun-3's second guest earned its keep.  **Every fault the co-simulation has
+found in the Sun-3 board model came from SunOS and not from NetBSD**, because
+the two drivers use the hardware differently and NetBSD forgives what SunOS
+does not:
 
 | bit | what it took | what NetBSD does |
 |---|---|---|
@@ -37,6 +42,9 @@ cosim/scripts/fetch-qemu.sh      # download, verify, unpack, apply patches/
 cosim/scripts/build-qemu.sh      # i386-softmmu only, into work/qemu-install
 cosim/scripts/build-guest.sh     # an i386 Linux, and a card image for it
 cosim/scripts/run-cosim.py       # the verdict
+
+cosim/scripts/build-hatari.sh    # the Atari TT, and the EmuTOS that drives it
+cosim/scripts/run-tt.py          # its verdict
 ```
 
 Everything downloaded, built or generated lands in `work/`, which is not in
@@ -88,11 +96,11 @@ recording.
 here.**  Every Mac emulator needs a Mac ROM, which is copyrighted and cannot be
 fetched by a script.  A co-simulation nobody else can run is not one.
 
-**Hatari would have worked and cannot be built here.**  It models the 5380 at
-the register level, and EmuTOS is free, so an Atari TT guest is a real
-possibility - but building Hatari needs SDL2 headers, and these scripts do not
-install packages.  It is the first thing to try if a second guest is ever
-wanted.
+**Hatari was blocked on SDL2 headers, and is now the third machine.**  It
+models the 5380 at the register level and EmuTOS is free, so the Atari TT was
+always the obvious second lineage; what stopped it was that building Hatari
+needs SDL2 development headers and these scripts do not install packages.  Once
+those were present it took an afternoon.  See *The Atari TT* below.
 
 **NetBSD has no plain 5380 ISA driver.**  Its `sea` driver at
 `sys/dev/isa/seagate.c` is for the Seagate ST-01/02, whose control and status
@@ -643,11 +651,140 @@ not a campaign, so it is a reason to retest rather than a diagnosis - but the
 one fault that *was* chased to the bottom, `sd0: drive offline`, turned out to
 be exactly this and nothing else, which is why they are filed together.
 
+## The Atari TT
+
+A third machine, and the cheapest of the three to reach - which is the first
+thing worth recording about it, because the Sun-3 cost five days and this cost
+one afternoon.
+
+```sh
+cosim/scripts/build-hatari.sh                   # Hatari, patched, plus EmuTOS
+cosim/scripts/run-tt.py                         # boot it
+cosim/scripts/run-tt.py --stock                 # Hatari's own 5380, to compare
+cosim/scripts/run-tt.py -w 'drives:      ABC'   # exit 1 if it does not mount
+```
+
+### Why it was cheap
+
+Everything that made the Sun-3 expensive is absent here.  There is no MMU with
+a whitelist of physical addresses to be added to, no DVMA and no IOMMU, no boot
+PROM to be argued with, no proprietary install media, and no second emulator
+needed to build a disk that the first one could then boot.  Above all there is
+**a free operating system that a script can fetch**: EmuTOS is GPL and its
+release images are a download away, which is the exact criterion that ruled the
+Macintosh out and sent this project to a Sun in the first place.
+
+The emulator was cheap too.  Hatari models the 5380 at register level already -
+`src/ncr5380.c`, derived from WinUAE - so the seam was there to be cut rather
+than built.  The whole change is one new file and eleven lines in theirs.
+
+### What the machine looks like from the chip's side
+
+The TT presents the eight registers at `0xff8780`, **two bytes apart and on the
+odd byte**.  That is a third spacing after the Macintosh's sixteen and the ISA
+card's one, and it costs the design nothing: `REG_STRIDE` already parameterises
+it and Hatari's own decode - `addr = IoAccessBaseAddress / 2 & 0x7`, taken only
+on odd addresses - undoes it before the library ever sees a register number.
+
+In front of the chip is Atari's DMA controller, at `0xff8701..0xff8715`: four
+bytes of address, four of count, a control byte whose bit 0 is the direction
+and bit 1 the enable, and a four-byte residue register.  It is a third distinct
+DMA arrangement after the Sun's Am9516 and the ISA card's nothing-at-all, and
+it has one habit neither of the others has: **it packs bytes into longwords and
+writes only whole ones**, leaving up to three behind.  EmuTOS's
+`cleanup_tt_dma()` reads the low two bits of the final pointer to find out how
+many, and copies them out of the residue register itself.  A controller that
+had written them to memory already and left the residue empty would give it a
+short read that it has no way to detect.
+
+### The driver is polled, all the way down
+
+`doc/drivers/EmuTOS/scsi.c` takes no interrupts.  It spins on the chip's status
+registers for selection and for REQ, and for the data phases it arms the DMA
+chip and then spins on the MFP's GPIP 7, which is where the TT wires the 5380's
+interrupt output:
+
+```c
+while(!(TT_MFP_BASE->gpip & 0x80))  /* until we get IRQ */
+```
+
+That is a genuinely different way of using the part from either of the other
+two - Linux carries every byte itself, SunOS takes an interrupt per phase - and
+it exercises one thing neither of them does: **End of Process**.  The interrupt
+EmuTOS is waiting for there is END OF DMA, set because the controller asserted
+EOP across the last acknowledge cycle (p. 16).
+
+It also makes the co-simulation simpler than the Sun-3's in a way worth
+stating, because the Sun-3 section spends a long time on the opposite problem.
+**No timer is needed to keep the core moving.**  A little core time bought with
+each register access carries the polling loops forward, and the data phases are
+run to completion inside the register write that starts them - so the interrupt
+is already there when the first poll looks for it.  There is no window in which
+the guest's clock advances while the core's does not, which is exactly the
+window the Sun-3's `sd0: I/O request timeout` lives in.
+
+### What it says when it works
+
+```
+                    EmuTOS Version:     1.4
+                    Machine:            Atari TT
+                    GEMDOS drives:      ABC
+
+the 5380 is a replica and the disk is a memory card
+and it wrote that back to C:\WROTE.TXT
+```
+
+`ABC` is the point: A and B are the floppy drives EmuTOS always offers, and C
+is the partition it found by reading the AHDI table and the FAT boot sector off
+the card.  The two lines after it are a program that was **not** in the ROM -
+`make-tt-disk.py` puts it in `C:\AUTO`, and EmuTOS found it in a directory,
+read it out of a data cluster, loaded it and jumped into it.  A filesystem
+read, a program load and an execution, all of which had to cross the replica to
+happen at all.
+
+The second line is the same journey backwards.  It matters on its own account:
+the receive and send directions of a DMA controller are not one piece of logic,
+and a lineage that only ever read would not know which of the two it had
+proved.  After the run the file is there in the card image and a FAT parser on
+the host can read it, which is the check `run-tt.py` cannot make from inside.
+
+### Two things that went wrong, both worth keeping
+
+**The pump must not end on the chip's interrupt.**  This is the same lesson the
+Sun-3 taught and it had to be applied here before it could be got wrong again:
+an interrupt is a *latch* and may be left over from the command before, so a
+transfer that tested it would end immediately, at zero bytes moved.  What says
+the target has moved on is PHASE MATCH, and the end condition is that a request
+was seen, the phase no longer matches, and only then that the chip has
+interrupted.
+
+**Nothing the guest wrote reached the card image at first**, and the run said
+nothing about it, because Hatari's `--run-vbls` calls `exit(0)` where it stands
+and never reaches `Main_UnInit`.  The transfers had all happened - the trace
+showed 2570 acknowledge cycles in the send direction - and the flush that would
+have made them permanent simply never ran.  The fix is an `atexit` handler, and
+the reason it is recorded here is the failure mode: a card that silently
+discarded every write looks exactly like a co-simulation that had proved reads
+and writes, because the guest is perfectly happy either way.  Only a check made
+from outside the guest can tell the two apart.
+
+### What it does not do
+
+There is no second drive on the bus - `rtl_top.sv` builds `TARGETS=1` - so the
+ID decode that `two_` covers in the regression is not exercised here.  There is
+no reselection, because EmuTOS never disconnects.  And EmuTOS is a BIOS rather
+than an operating system: it reads and writes a filesystem but it does not
+schedule, so nothing here puts the kind of sustained concurrent load on the
+chip that NetBSD's `fsck` does on the Sun-3.
+
 ## Rules this directory follows
 
 * No QEMU or Linux source, binaries or images in git.  They live in `work/`.
 * The Sun-3 fork is read-only to us.  Its tree is cloned into `work/`, our
   commits go on a branch there, and what is kept is `git format-patch` output.
+* Hatari is treated the same way, and for the same reason plus one more: it is
+  GPL-2+, so nothing of it may reach `src/` or `tb/`.  Its tree is cloned into
+  `work/hatari-src` and the one commit is kept as a patch.
 * QEMU changes exist only as patches against the released tarball, regenerated
   with `diff -ruN` against the pristine copy `fetch-qemu.sh` keeps beside it.
 * The guest is never patched.  If something only works with a modified guest,

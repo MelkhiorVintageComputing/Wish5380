@@ -45,3 +45,22 @@ NetBSD - `DMA_CONFLICT` never set, `DMA_IP` not raised at terminal count, and
 `DMA_ACTIVE` cleared when the chip stops asking rather than when the count
 runs out.  Its commit message argues each; `cosim/README.md` has the
 evidence.
+
+## `hatari/`
+
+An Atari TT whose SCSI controller is a Verilated wish5380 - the chip and the
+disk both, since Hatari's own SCSI device is left out of the path along with
+its 5380.  Applies to a checkout of Hatari's git tree, which
+`cosim/scripts/build-hatari.sh` clones into `work/hatari-src`; driven by
+`cosim/scripts/run-tt.py` with EmuTOS as the guest.
+
+One patch, and it is small because the seam is: the TT reaches the chip
+through eight byte-wide registers at `0xff8780`, two apart and on the odd
+byte, and that is the whole of what it can do to it.  What had to be written
+rather than forwarded is the DMA controller, because the TT has one and the
+5380 does not - including the habit of packing bytes into longwords and
+leaving up to three of them in a residue register, which EmuTOS reads back by
+hand and a controller that skipped it would silently short-change.
+
+Hatari is GPL-2+.  That is a stronger reason than usual to keep it at arm's
+length: nothing of it may reach `src/` or `tb/`, which are MIT.

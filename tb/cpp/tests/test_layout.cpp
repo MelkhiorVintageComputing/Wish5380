@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: MIT
 //
-// Our register model against the two independent ones.
+// Our register model against the four independent ones.
 //
 // `tb/cpp/ncr5380.h` is written from the datasheet.  So is `src/wish5380_pkg.sv`,
 // separately.  Neither is checked by simply agreeing with the other, because
 // two files copied from the same reading of a scan agree just as happily when
 // the reading was wrong.
 //
-// So this test transcribes the three driver headers - NetBSD's
-// `doc/drivers/NetBSD/ncr5380reg.h`, Linux's `doc/drivers/Linux/NCR5380.h` and
-// Sun's `doc/drivers/SunOS34/sundev/sireg.h` - by hand, one more time, and
-// checks all four against each other.  The drivers are the useful cross-check
-// because they are the software that actually ran against the silicon: a wrong
-// bit number in any of them would have stopped a real machine from booting in
-// 1988.  Sun's is the one written by the people who put the part on a board,
-// and it is the only one that writes both phase encodings out in full.
+// So this test transcribes four drivers' own declarations - NetBSD's
+// `doc/drivers/NetBSD/ncr5380reg.h`, Linux's `doc/drivers/Linux/NCR5380.h`,
+// Sun's `doc/drivers/SunOS34/sundev/sireg.h` and EmuTOS's
+// `doc/drivers/EmuTOS/scsi.c` - by hand, one more time, and checks all five
+// against each other.  The drivers are the useful cross-check because they are
+// the software that actually ran against the silicon: a wrong bit number in
+// any of them would have stopped a real machine from booting.
+//
+// Each brings something the others do not.  Sun's was written by the people
+// who put the part on a board, and is the only one that writes both phase
+// encodings out in full.  EmuTOS is the only one written this century, and the
+// only one that gives the register order twice at two different spacings - the
+// TT's two-apart-on-the-odd-byte and the Falcon's consecutive - which is what
+// makes the point that the spacing is the board's and the order is the
+// part's.
 //
 // The RTL is pinned separately, by `test_regs.cpp` driving the register file
 // with the names from `ncr5380.h` and checking what comes back.  Between the
@@ -240,6 +247,66 @@ constexpr uint8_t SBC_BSR_ACK = 0x01;
 }  // namespace sunos
 
 // ---------------------------------------------------------------------------
+// Transcribed from doc/drivers/EmuTOS/scsi.c - the newest of the four and the
+// only one not written in the eighties or nineties.  It names no bits at all:
+// it writes hex literals with a comment beside each, so what is transcribed
+// here is the literal and the comment's claim about it, which is the useful
+// half anyway.
+//
+// It gives the register order twice over, and at two different spacings.  The
+// TT's is a struct of eight registers each preceded by a pad byte, so two
+// apart and on the odd byte; the Falcon reaches the same eight through the
+// ACSI hardware at consecutive offsets from 0x88.  A third and a fourth
+// spacing beside the Macintosh's sixteen and the ISA card's one - and all
+// four decode the same eight registers in the same order, which is the
+// datasheet's point that the part decodes A0..A2 itself (p. 6).
+// ---------------------------------------------------------------------------
+namespace emutos {
+
+// The TT struct, counted out: each register is preceded by one pad byte, so
+// the register number is the offset divided by two.
+constexpr int data = 1 / 2, icr = 3 / 2, mode = 5 / 2, tcr = 7 / 2;
+constexpr int bus_status = 9 / 2, dma_status = 11 / 2, reset = 15 / 2;
+constexpr int select_enable = bus_status, dma_send = dma_status;
+constexpr int dma_initrecv = reset;
+
+// The Falcon's, which are absolute offsets from a base of 0x88.
+constexpr int fscsi_base = 0x88;
+constexpr int fscsi_data = 0x88 - fscsi_base;
+constexpr int fscsi_icr = 0x89 - fscsi_base;
+constexpr int fscsi_mode = 0x8a - fscsi_base;
+constexpr int fscsi_tcr = 0x8b - fscsi_base;
+constexpr int fscsi_bus_status = 0x8c - fscsi_base;
+constexpr int fscsi_dma_status = 0x8d - fscsi_base;
+constexpr int fscsi_reset = 0x8f - fscsi_base;
+
+constexpr uint8_t ICR_RST = 0x80;               // "assert RST"
+constexpr uint8_t ICR_AIP = 0x40;               // "wait for AIP bit to be set"
+constexpr uint8_t ICR_LA = 0x20;                // "retry if we lost arbitration"
+constexpr uint8_t ICR_BSY_SEL = 0x0c;           // "assert BSY, SEL"
+constexpr uint8_t ICR_ATN = 0x02;               // "assert ATN"
+constexpr uint8_t ICR_DATA = 0x01;              // "gate it onto bus"
+constexpr uint8_t ICR_NOT_BSY = 0xf7;           // "turn off BSY"
+
+constexpr uint8_t MR_DMA = 0x02;                // "set DMA mode, we are initiator"
+constexpr uint8_t MR_NOT_DMA = 0xfd;            // "disable DMA mode"
+constexpr uint8_t MR_ARBITRATE = 0x01;          // "set ARBITRATE bit"
+constexpr uint8_t MR_NOT_ARBITRATE = 0xfe;      // "clear ARBITRATE bit"
+
+constexpr uint8_t CSB_BSY = 0x40;               // "wait for BSY bit"
+constexpr uint8_t CSB_REQ = 0x20;               // "got REQ ?"
+
+constexpr uint8_t BSR_PHASE_MATCH = 0x08;       // "phase match"
+
+// "return (get_bus_status_reg()>>2) & 0x07" - the phase, read out of Current
+// SCSI Bus Status and shifted down to where the Target Command Register wants
+// it.  Linux writes the same shift as PHASE_SR_TO_TCR.
+constexpr uint8_t PHASE_SHIFT = 2;
+constexpr uint8_t PHASE_MASK = 0x07;
+
+}  // namespace emutos
+
+// ---------------------------------------------------------------------------
 
 TEST(layout_register_addresses) {
   (void)env;
@@ -284,6 +351,29 @@ TEST(layout_register_addresses) {
   CHECK_EQ(int(sci::R_SDTR), sunos::sbc_trcv);
   CHECK_EQ(int(sci::R_RPI), sunos::sbc_clr);
   CHECK_EQ(int(sci::R_SDIR), sunos::sbc_ircv);
+
+  CHECK_EQ(int(sci::R_CSD), emutos::data);
+  CHECK_EQ(int(sci::R_ICR), emutos::icr);
+  CHECK_EQ(int(sci::R_MR), emutos::mode);
+  CHECK_EQ(int(sci::R_TCR), emutos::tcr);
+  CHECK_EQ(int(sci::R_CSB), emutos::bus_status);
+  CHECK_EQ(int(sci::R_SER), emutos::select_enable);
+  CHECK_EQ(int(sci::R_BSR), emutos::dma_status);
+  CHECK_EQ(int(sci::R_SDS), emutos::dma_send);
+  CHECK_EQ(int(sci::R_RPI), emutos::reset);
+  CHECK_EQ(int(sci::R_SDIR), emutos::dma_initrecv);
+
+  // The same eight again at a different spacing, in the same file.  A part
+  // that decodes A0..A2 itself gives every board the same order (p. 6), and
+  // four boards at four spacings is as much evidence for that as this
+  // project can gather.
+  CHECK_EQ(int(sci::R_CSD), emutos::fscsi_data);
+  CHECK_EQ(int(sci::R_ICR), emutos::fscsi_icr);
+  CHECK_EQ(int(sci::R_MR), emutos::fscsi_mode);
+  CHECK_EQ(int(sci::R_TCR), emutos::fscsi_tcr);
+  CHECK_EQ(int(sci::R_CSB), emutos::fscsi_bus_status);
+  CHECK_EQ(int(sci::R_BSR), emutos::fscsi_dma_status);
+  CHECK_EQ(int(sci::R_RPI), emutos::fscsi_reset);
 }
 
 TEST(layout_initiator_command) {
@@ -321,6 +411,20 @@ TEST(layout_initiator_command) {
   CHECK_EQ(sci::ICR_SEL, sunos::SBC_ICR_SEL);
   CHECK_EQ(sci::ICR_ATN, sunos::SBC_ICR_ATN);
   CHECK_EQ(sci::ICR_DATA, sunos::SBC_ICR_DATA);
+
+  CHECK_EQ(sci::ICR_RST, emutos::ICR_RST);
+  CHECK_EQ(sci::ICR_AIP, emutos::ICR_AIP);
+  CHECK_EQ(sci::ICR_LA, emutos::ICR_LA);
+  CHECK_EQ(sci::ICR_ATN, emutos::ICR_ATN);
+  CHECK_EQ(sci::ICR_DATA, emutos::ICR_DATA);
+  // EmuTOS writes this one as a single literal rather than an or of two.
+  CHECK_EQ(uint8_t(sci::ICR_BSY | sci::ICR_SEL), emutos::ICR_BSY_SEL);
+  CHECK_EQ(uint8_t(~sci::ICR_BSY & 0xff), emutos::ICR_NOT_BSY);
+
+  // EmuTOS reads AIP and LOST ARBITRATION out of the same two positions it
+  // never writes, which is a fourth author working around the same fault.
+  CHECK_EQ(emutos::ICR_AIP, sunos::SBC_ICR_TEST);
+  CHECK_EQ(emutos::ICR_LA, sunos::SBC_ICR_DE);
 
   // The two positions where read and write are different registers.  If these
   // ever came out equal, the read/modify/write both drivers avoid would be
@@ -361,6 +465,13 @@ TEST(layout_mode) {
   CHECK_EQ(sci::MR_MON_BSY, sunos::SBC_MR_MBSY);
   CHECK_EQ(sci::MR_DMA, sunos::SBC_MR_DMA);
   CHECK_EQ(sci::MR_ARB, sunos::SBC_MR_ARB);
+
+  CHECK_EQ(sci::MR_DMA, emutos::MR_DMA);
+  CHECK_EQ(sci::MR_ARB, emutos::MR_ARBITRATE);
+  // EmuTOS clears these two by anding a literal complement rather than by
+  // naming the bit, so the complement is what there is to check.
+  CHECK_EQ(uint8_t(~sci::MR_DMA & 0xff), emutos::MR_NOT_DMA);
+  CHECK_EQ(uint8_t(~sci::MR_ARB & 0xff), emutos::MR_NOT_ARBITRATE);
 
   // Every bit of Mode is implemented; nothing reads back as zero.
   CHECK_EQ(uint8_t(sci::MR_BLOCK_DMA | sci::MR_TARGET | sci::MR_PAR_CHK |
@@ -426,6 +537,9 @@ TEST(layout_current_scsi_bus_status) {
   CHECK_EQ(sci::CSB_SEL, sunos::SBC_CBSR_SEL);
   CHECK_EQ(sci::CSB_DBP, sunos::SBC_CBSR_DBP);
 
+  CHECK_EQ(sci::CSB_BSY, emutos::CSB_BSY);
+  CHECK_EQ(sci::CSB_REQ, emutos::CSB_REQ);
+
   CHECK_EQ(sci::CSB_PHASE_MASK, linux_::PHASE_MASK);
   CHECK_EQ(sci::CSB_PHASE_MASK, sunos::CBSR_PHASE_BITS);
 }
@@ -460,6 +574,8 @@ TEST(layout_bus_and_status) {
   CHECK_EQ(sci::BSR_BUSY_ERR, sunos::SBC_BSR_BERR);
   CHECK_EQ(sci::BSR_ATN, sunos::SBC_BSR_ATN);
   CHECK_EQ(sci::BSR_ACK, sunos::SBC_BSR_ACK);
+
+  CHECK_EQ(sci::BSR_PHASE_MATCH, emutos::BSR_PHASE_MATCH);
 
   // Reading register 7 clears three bits and not the fourth: END OF DMA goes
   // away when MR_DMA is reset instead (p. 16), and a driver that expected the
@@ -500,6 +616,20 @@ TEST(layout_phases) {
   CHECK_EQ(sci::phase_to_csb(sci::PH_STATUS), sunos::PHASE_STATUS);
   CHECK_EQ(sci::phase_to_csb(sci::PH_MSG_OUT), sunos::PHASE_MSG_OUT);
   CHECK_EQ(sci::phase_to_csb(sci::PH_MSG_IN), sunos::PHASE_MSG_IN);
+
+  // EmuTOS states the shift as a shift, in the one line that turns Current
+  // SCSI Bus Status into a phase number: "(get_bus_status_reg()>>2) & 0x07".
+  // A fourth author arriving at the same two says it is the part's and not a
+  // convention any of them invented.
+  CHECK_EQ(int(emutos::PHASE_SHIFT), 2);
+  CHECK_EQ(sci::PH_DATA_OUT,
+           uint8_t(sci::phase_to_csb(sci::PH_DATA_OUT) >> emutos::PHASE_SHIFT
+                   & emutos::PHASE_MASK));
+  CHECK_EQ(sci::PH_MSG_IN,
+           uint8_t(sci::phase_to_csb(sci::PH_MSG_IN) >> emutos::PHASE_SHIFT
+                   & emutos::PHASE_MASK));
+  CHECK_EQ(sci::CSB_PHASE_MASK,
+           uint8_t(emutos::PHASE_MASK << emutos::PHASE_SHIFT));
 
   // NetBSD extracts the phase from the same register the same way.
   CHECK_EQ(sci::PH_COMMAND, netbsd::bus_phase(netbsd::SCI_BUS_CD));
