@@ -462,3 +462,77 @@ TEST(dma_the_chip_interrupts_promptly_after_the_last_byte) {
             "the chip took " + std::to_string(dt / 1000000) +
                 " us to interrupt, which is a window a driver can lose in");
 }
+
+TEST(dma_mode_with_an_unspecified_phase_interrupts_when_the_target_asks) {
+  // How SunOS arms itself between phases, from si.c's
+  // SET_UP_FOR_NEXT_INTR_AND_LEAVE:
+  //
+  //     SBC_WR.tcr = TCR_UNSPECIFIED;   // a phase that is not a phase
+  //     junk = SBC_RD.clr;              // clear any pending interrupt
+  //     SBC_WR.mr |= SBC_MR_DMA;        // DMA mode on - this is the arm
+  //
+  // No transfer is started.  The chip is in DMA mode looking for a phase it
+  // can never match, so whatever the target asks for next is a mismatch, and
+  // the mismatch is the interrupt.  The driver handles one phase per
+  // interrupt and leaves, so if this does not interrupt it never comes back
+  // and the command sits until its watchdog fires.
+  env.power_on_reset();
+
+  Env::Peer p;
+  p.bsy = true;
+  p.phase(sci::PH_DATA_IN);
+  env.drive_peer(p);
+  env.tick(2);
+
+  env.chip_write(sci::R_TCR, sci::PH_UNSPEC_1);
+  (void)env.chip_read(sci::R_RPI);
+  env.chip_write(sci::R_MR, sci::MR_DMA);
+  env.tick(2);
+  CHECK_MSG(env.dut()->dut_irq_o == 0, "armed and already interrupting");
+
+  // The target moves to STATUS and asks.
+  p = env.peer();
+  p.phase(sci::PH_STATUS);
+  p.req = true;
+  env.drive_peer(p);
+
+  CHECK_MSG(env.sim().run_until([&]() { return env.dut()->dut_irq_o != 0; },
+                                1 * MS),
+            "the target asked in a mismatched phase and the chip stayed "
+            "silent - a driver armed this way waits for ever");
+}
+
+TEST(dma_mode_does_not_interrupt_for_a_request_that_was_already_there) {
+  // The mismatch interrupt is an *edge*, and this is the datasheet's wording
+  // rather than a simplification: "if the DMA MODE bit is active and a phase
+  // mismatch occurs when REQ transitions from false to true, an interrupt is
+  // generated" (p. 22).  A request already standing when DMA mode is turned
+  // on has no transition, and the chip stays silent.
+  //
+  // A driver that arms itself this way has to cover the case, and SunOS does:
+  // si.c's SET_UP_FOR_NEXT_INTR_AND_LEAVE arms and then polls the Current
+  // SCSI Bus Status for REQ before it leaves, which is why the Current SCSI
+  // Bus Status reports the bus's own REQ and not one gated by phase match.
+  // Reproducing the edge is what makes that poll necessary rather than
+  // decorative, so a replica that interrupted here would let a driver that
+  // omitted the poll appear to work.
+  env.power_on_reset();
+
+  Env::Peer p;
+  p.bsy = true;
+  p.phase(sci::PH_STATUS);
+  p.req = true;                       // already asking, before any arming
+  env.drive_peer(p);
+  env.tick(4);
+
+  env.chip_write(sci::R_TCR, sci::PH_UNSPEC_1);
+  (void)env.chip_read(sci::R_RPI);
+  env.chip_write(sci::R_MR, sci::MR_DMA);
+  env.tick(20);
+
+  CHECK_MSG(env.dut()->dut_irq_o == 0,
+            "a request that was already there produced an interrupt");
+  // ...and the driver can still see it, which is what saves it.
+  CHECK_MSG(env.chip_read(sci::R_CSB) & sci::CSB_REQ,
+            "the bus status hid a request the driver has to poll for");
+}

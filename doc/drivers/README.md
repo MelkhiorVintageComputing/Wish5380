@@ -10,6 +10,7 @@ nothing in `src/` or `tb/` is derived from them.  They are here to be read.
 | `NetBSD/`       | `sys/dev/ic/ncr5380sbc.c` and its headers, the core shared by every NetBSD 5380 port, plus the Mac and Sun 3 attachments |
 | `NetBSD-atari/` | NetBSD/atari's own `ncr5380.c`, a second, independent driver by a different author |
 | `SunOS34/`      | Sun's own `si` driver for the Sun-3 board, in its three flavours: the kernel's (`sundev/`), the standalone one the boot programs link (`sunstand/`), and the boot monitor's (`mon3/`) |
+| `SunOS412/`     | the same driver five years later, from SunOS 4.1.2.  Kept for one reason: it is the version whose diagnostics the co-simulation prints, and 3.4's has neither of them |
 
 ## Which source is the authority on what
 
@@ -179,6 +180,42 @@ What the kernel driver settles that the other two families do not:
   not say that, the RTL does not require it, and no other driver mentions it.
   It reads like an empirical note about a real board, so it stays here rather
   than becoming a rule.
+
+## How SunOS arms itself between phases, and why the poll matters
+
+`SunOS412/si.c` is here for one passage.  `siintr` handles **one bus phase per
+interrupt** and then leaves through `SET_UP_FOR_NEXT_INTR_AND_LEAVE`, which
+arms the chip for whatever the target asks next:
+
+```c
+SBC_WR.tcr = TCR_UNSPECIFIED;   /* a phase that is not a phase */
+junk = SBC_RD.clr;              /* clear any pending interrupt */
+SBC_WR.mr |= SBC_MR_DMA;        /* DMA mode on - this is the arm */
+if (si_sbc_wait(&SBC_RD.cbsr, SBC_CBSR_REQ, si_phase_wait, 20, 1) == OK)
+        goto SYNCHRONIZE_PHASE; /* already asking - handle it here */
+/* else leave, and be interrupted when it does */
+```
+
+No transfer is started.  The chip sits in DMA mode looking for a phase it can
+never match, so the target's next request is a mismatch and the mismatch is
+the interrupt.  Two things about the part have to be right for that to work,
+and both are now pinned by tests:
+
+* **the mismatch interrupt is an edge.**  "If the DMA MODE bit is active and a
+  phase mismatch occurs when REQ transitions from false to true, an interrupt
+  is generated" (p. 22).  A request already standing when DMA mode goes on has
+  no transition and produces nothing -
+  `dma_mode_does_not_interrupt_for_a_request_that_was_already_there`.
+* **Current SCSI Bus Status reports the bus's own REQ**, not one gated by
+  phase match - which is what makes the driver's poll able to catch the case
+  the edge misses.
+
+The poll is therefore load-bearing rather than belt-and-braces, and a replica
+that interrupted on a standing request would let a driver that omitted it
+appear to work.  This is also the answer to a question the co-simulation
+raised and did not settle: `si0: lost interrupt` is printed by `si_deque`
+*after* a request has already timed out, when the CSR shows `SBC_IP` - it is
+the driver's explanation for a timeout and not an independent fault.
 
 ## The 53C80 is the CMOS part, and adds one bit
 

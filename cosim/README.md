@@ -566,10 +566,21 @@ The regression covers the textbook version of that sequence -
 `dma_a_block_reads_back_through_a_real_engine` ends a DMA read exactly this
 way, clears `MR` and then reads STATUS and MESSAGE IN - and it passes, as
 does `dma_the_chip_interrupts_promptly_after_the_last_byte`, which measures
-the chip raising IRQ **70 ns** after the last byte.  What differs is what
-SunOS does between steps 3 and 4, and settling that wants 4.1.1's `si.c` -
-the copy in `doc/drivers/` is 3.4's and has neither message - or a trace of
-the bus state through the stall.
+the chip raising IRQ **70 ns** after the last byte.  The driver's own source settles half of it.  `doc/drivers/SunOS412/si.c` is
+now here, and `si_deque` shows that **`lost interrupt` is printed after a
+request has already timed out**, when the CSR happens to show `SBC_IP`: it is
+the driver's explanation for the timeout, not an independent fault, and the
+command in the dump is simply whichever was current.  `siintr` handles one
+phase per interrupt and arms for the next with `TCR = TCR_UNSPECIFIED`,
+`MR |= SBC_MR_DMA` and *then a poll of the bus status for REQ* - and both
+halves of what that needs from the chip are now pinned by tests in
+`tb/cpp/tests/test_dma.cpp`, because the mismatch interrupt is an edge and a
+request already standing produces nothing.  The poll is what covers that, and
+it is the driver's, not ours.
+
+What is still open is why the poll does not save it here.  Answering that
+wants the register *reads* in the trace, which is the heavy one - everything
+so far has traced writes.
 
 Four readings of this fault were wrong before that one, and they are worth
 listing because each was a plausible story that a measurement killed:
