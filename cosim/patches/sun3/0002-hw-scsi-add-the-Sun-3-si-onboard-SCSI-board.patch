@@ -1,4 +1,4 @@
-From 5d22027fca4c214f681b9f4d0e1377439f1e5de7 Mon Sep 17 00:00:00 2001
+From 3fa13e03d23bf7380ca1f78dfa2fe711e09b630b Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Wed, 5 Aug 2026 01:39:38 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
@@ -63,9 +63,9 @@ Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 889 +++++++++++++++++++++++++++++++++++++++++++
- hw/scsi/trace-events |   8 +
- 4 files changed, 905 insertions(+)
+ hw/scsi/sun3-si.c    | 896 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/trace-events |   9 +
+ 4 files changed, 913 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -96,10 +96,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..4c07af1080
+index 0000000000..c3388a688d
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,896 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -282,6 +282,7 @@ index 0000000000..4c07af1080
 +    uint16_t csr;
 +    uint16_t fifo_count;    /* bytes; the driver reads this as the residual */
 +    bool saw_drq;           /* the chip has asked at least once this transfer */
++    const char *irq_who;    /* what ran update_irq, for the trace */
 +    uint16_t fifo_data;     /* the leftover byte, in bits 15:8 */
 +    /* The VME-only registers, indexed by (offset - 8) / 2: written by any
 +     * driver that serves both boards, and ignored by this one. */
@@ -335,6 +336,7 @@ index 0000000000..4c07af1080
 +
 +    if (level != s->irq_level) {
 +        s->irq_level = level;
++        trace_sun3_si_irq(level, s->csr, s->irq_who ? s->irq_who : "?");
 +        qemu_set_irq(s->irq, level);
 +    }
 +}
@@ -717,6 +719,7 @@ index 0000000000..4c07af1080
 +            val = s->vme[(addr - 8) / 2];
 +            break;
 +        case 0x18:
++            s->irq_who = "csr-read";
 +            sun3_si_update_irq(s);
 +            s->csr &= ~(SI_CSR_FIFO_FULL | SI_CSR_FIFO_EMPTY);
 +            /* The FIFO is empty exactly when there is nothing left to move;
@@ -736,6 +739,7 @@ index 0000000000..4c07af1080
 +    sun3_si_catch_up(s);
 +    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
 +    sun3_si_pump(s);
++    s->irq_who = "read";
 +    sun3_si_update_irq(s);
 +    trace_sun3_si_reg_read(addr, size, val);
 +    return val;
@@ -803,6 +807,7 @@ index 0000000000..4c07af1080
 +    sun3_si_catch_up(s);
 +    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
 +    sun3_si_pump(s);
++    s->irq_who = "write";
 +    sun3_si_update_irq(s);
 +}
 +
@@ -818,6 +823,8 @@ index 0000000000..4c07af1080
 +{
 +    Sun3SiState *s = opaque;
 +    uint16_t before = s->fifo_count;
++
++    s->irq_who = "timer";
 +
 +    sun3_si_catch_up(s);
 +    sun3_si_pump(s);
@@ -990,10 +997,10 @@ index 0000000000..4c07af1080
 +
 +type_init(sun3_si_register_types)
 diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
-index a8ac1e7f1d..707502ce7f 100644
+index a8ac1e7f1d..e4aae2a4d4 100644
 --- a/hw/scsi/trace-events
 +++ b/hw/scsi/trace-events
-@@ -392,3 +392,11 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
+@@ -392,3 +392,12 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
  scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
  scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
  scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
@@ -1005,6 +1012,7 @@ index a8ac1e7f1d..707502ce7f 100644
 +sun3_si_chain(uint32_t at, uint16_t rsel, uint32_t addr, uint16_t count) "table at 0x%06x rsel 0x%04x -> addr 0x%06x count %u words"
 +sun3_si_stalled(uint16_t resid, uint8_t csb, uint8_t bsr, int drq) "stalled with %u bytes left: csb 0x%02x bsr 0x%02x drq %d"
 +sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
++sun3_si_irq(int level, uint16_t csr, const char *who) "level 2 %d, csr 0x%04x, from %s"
 -- 
 2.39.5
 

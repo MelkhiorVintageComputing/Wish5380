@@ -550,18 +550,47 @@ si0:  lost interrupt
 
 `count= 0` says the transfer *finished*; `bsr= 0x90` is END OF DMA and the
 chip's interrupt; `csr= 0x607` has `SBC_IP` set and `INTR_EN` on.  Everything
-the driver needs is there and it still says it lost the interrupt, so what is
-missing is the delivery of level 2 at the moment it happened rather than the
-state afterwards.  The board raises the line from `sun3_si_update_irq`, which
-runs after every register access and on the pacing timer, so the window to
-explain is between the chip asserting and one of those two running.  The
-driver recovers both times and `fsck` completes.
+the driver needs is there and it still says it lost the interrupt.  The driver
+recovers every time and `fsck` completes clean.
 
-It is not the DMA_ACTIVE fix above: the count is identical - twice - before
-and after that change, which is also what says the first theory about it (a
-stale interrupt aborting the next transfer) was wrong.  4.1.1's `si.c` would
-say what condition prints it, and the copy here is 3.4's, which does not have
-the message.
+**It is not the board.**  That is worth five separate exclusions, all of them
+measured rather than argued, because the obvious readings of that dump are
+each wrong:
+
+* *not a lost chain start.*  The failing CDB is issued exactly once in the
+  run, and the trace has the UDC command, the chain - 4096 words to
+  `0xf02f60`, which is the `DMA addr= 0x2f60` the driver printed - and
+  `dma_done residual 0`.  The whole 8 KB moved.
+* *not a missing interrupt.*  `sun3_si_irq` traces the level-2 line whenever
+  it changes.  Over 1824 transfers every single completion is followed by the
+  line going high and the driver acknowledging it; the only gaps are in the
+  PROM's 160 transfers, where interrupts are disabled.
+* *not too few interrupts but too many.*  Sorted by shape, 1659 transfers
+  read `chain, done, raise/ack ×3`; the four odd ones have five or seven
+  pairs.  Extra cycles are the driver's recovery, which is a consequence of
+  the fault and not its cause.
+* *not the board clearing the latch behind the driver's back.*  A word-sized
+  read below address 8 would take registers 6 and 7 together and acknowledge
+  the interrupt as a side effect.  There are none in the trace.
+* *not the DMA_ACTIVE fix above.*  Two before that change and two after, with
+  the same 6008 transfers and the same clean `fsck` - which is also what says
+  the first theory about it, a stale interrupt aborting the next transfer,
+  was wrong.
+
+One board-side latency is real and is *not* being treated as the cause.  At
+the moment the last byte moves the chip has not raised IRQ yet - `csr 0x0407`
+at `dma_done`, no `SBC_IP` - so the line goes high on the next timer tick
+rather than at completion, up to 500 µs of virtual time later.  Removing that
+would be more faithful, but a SCSI command watchdog is seconds and half a
+millisecond cannot trip one, so changing the board on that theory would be
+the fourth guess in a row rather than a fix.
+
+What is left is the pacing: this device blocks QEMU's thread inside one MMIO
+access for milliseconds of real time while stepping the core, and what that
+does to the guest's own sense of elapsed time is the one thing here nothing
+has instrumented.  Settling it wants the guest's clock at the moment the
+watchdog fires - or 4.1.1's `si.c`, which would name the condition that
+prints the message; the copy in `doc/drivers/` is 3.4's and does not have it.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode
