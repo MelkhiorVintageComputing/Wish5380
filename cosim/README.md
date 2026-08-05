@@ -578,22 +578,35 @@ halves of what that needs from the chip are now pinned by tests in
 request already standing produces nothing.  The poll is what covers that, and
 it is the driver's, not ours.
 
-What is still open is why the poll does not save it here.  Answering that
-wants the register *reads* in the trace, which is the heavy one - everything
-so far has traced writes.
+The poll is not the problem either, and tracing the register *reads* settles
+it.  The whole exchange after the data phase is clean:
 
-Four readings of this fault were wrong before that one, and they are worth
-listing because each was a plausible story that a measurement killed:
+```
+CSB 0x6d   STATUS, REQ      the driver reads the status byte, 0x00
+ICR 0x10 / 0x00             ACK
+CSB 0x4d -> 0x7d            REQ drops, target moves to MESSAGE IN and asks
+TCR=4, read reg 7, MR=2     the arm
+CSB 0x7d                    the poll - and it sees REQ
+...message byte read and acknowledged...
+CSB 0x00                    BUS FREE: the target disconnected
+ODR 0x80, MR=1, ICR 0x40    arbitration for the next command
+```
 
-| reading | what killed it |
-|---|---|
-| the chip failed to interrupt on the phase mismatch | a test written before touching the RTL passed |
-| a lost chain start | the chain is in the trace, 4096 words to the address the driver printed |
-| the board never delivered level 2 | a trace on the line: every completion raises it, 1824 of 1824 |
-| the interrupt arrived a timer tick late | raising it at completion instead fixed the latency and not the fault |
+Status, message, disconnect: the command finishes properly and the driver
+goes straight on to the next one.  **The stall is between two commands, not
+inside either**, and the whole window holds ninety-five register accesses -
+the driver is not spinning on anything, it is idle.
 
-The latency was real and the fix for it is kept - the line now goes up in the
-same guest microsecond as the last byte - but it is not what this was.
+So nothing on the SCSI side is wrong.  What is left is guest timekeeping: the
+virtual clock advancing about two minutes - 118.5 s in one run, 117.4 s in
+another - while the machine is idle between commands, with `catch_up`
+faithfully burning the same two minutes of core time to follow it.  Two
+minutes trivially exceeds `sd`'s I/O timeout, which is what fires, and `si`
+then prints its "lost interrupt" explanation.
+
+Pinning that wants a timestamp on *every* register access rather than on
+chain and completion events, so the jump can be located between two adjacent
+accesses instead of inferred from the space between them.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode
