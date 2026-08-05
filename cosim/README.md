@@ -533,64 +533,56 @@ block zero.
 
 ### Where it stops
 
-Four faults are on the record and none is understood.  All but the first are
-intermittent, all smell of pacing rather than of the chip, and they are written down here
+Four faults are on the record and none is fully explained, though the first
+is now narrowed to one exchange.  All but the first are intermittent, and they are written down here
 rather than left in a commit message because an unexplained fault that nobody
 can find again is worth less than one that is.
 
-**`si0: lost interrupt`**, twice in a boot, reproducibly - it is the one fault
-here that happens every time.  The state it prints is the puzzle:
+**`sd0: I/O request timeout` / `si0: lost interrupt`**, once or twice in a
+boot, reproducibly.  It is named after the wrong thing: the interrupt is not
+lost, and the command in the dump is not the one that failed.
 
-```
-si0:  lost interrupt
-	csr= 0x607  bcr= 0  tcr= 0x1
-	cbsr= 0x6d (STATUS)  cdr= 0x0  mr= 0x2  bsr= 0x90
-	count= 0 (8192)
-```
+Tracing the level-2 line, the guest's clock and the core's clock together,
+and finding the failing CDB in the same stream, the sequence is:
 
-`count= 0` says the transfer *finished*; `bsr= 0x90` is END OF DMA and the
-chip's interrupt; `csr= 0x607` has `SBC_IP` set and `INTR_EN` on.  Everything
-the driver needs is there and it still says it lost the interrupt.  The driver
-recovers every time and `fsck` completes clean.
+1. the data phase completes perfectly - 8192 bytes, 16 µs of guest time,
+   `residual 0`;
+2. the interrupt is raised in the *same guest microsecond* as the completion
+   and the driver acknowledges it;
+3. the driver runs its end-of-command sequence - `TCR` to unspecified,
+   `MR = 0`, a FIFO reset;
+4. the target sits in STATUS with REQ asserted, holding BSY;
+5. **nothing happens for 117 seconds of guest time**, with both clocks
+   advancing together, so it is real elapsed time and not a pacing artefact;
+6. the disk driver's request watchdog fires and `si` dumps whatever command
+   is current - which is why the CDB in it looks innocent.
 
-**It is not the board.**  That is worth five separate exclusions, all of them
-measured rather than argued, because the obvious readings of that dump are
-each wrong:
+So the fault is a stall in the STATUS handshake *after* the data phase, not
+anything to do with delivering an interrupt.  Note step 3: with `MR_DMA`
+clear the chip no longer interrupts on a phase change, so a driver waiting
+for an interrupt about STATUS rather than polling for it would wait for ever.
 
-* *not a lost chain start.*  The failing CDB is issued exactly once in the
-  run, and the trace has the UDC command, the chain - 4096 words to
-  `0xf02f60`, which is the `DMA addr= 0x2f60` the driver printed - and
-  `dma_done residual 0`.  The whole 8 KB moved.
-* *not a missing interrupt.*  `sun3_si_irq` traces the level-2 line whenever
-  it changes.  Over 1824 transfers every single completion is followed by the
-  line going high and the driver acknowledging it; the only gaps are in the
-  PROM's 160 transfers, where interrupts are disabled.
-* *not too few interrupts but too many.*  Sorted by shape, 1659 transfers
-  read `chain, done, raise/ack ×3`; the four odd ones have five or seven
-  pairs.  Extra cycles are the driver's recovery, which is a consequence of
-  the fault and not its cause.
-* *not the board clearing the latch behind the driver's back.*  A word-sized
-  read below address 8 would take registers 6 and 7 together and acknowledge
-  the interrupt as a side effect.  There are none in the trace.
-* *not the DMA_ACTIVE fix above.*  Two before that change and two after, with
-  the same 6008 transfers and the same clean `fsck` - which is also what says
-  the first theory about it, a stale interrupt aborting the next transfer,
-  was wrong.
+The regression covers the textbook version of that sequence -
+`dma_a_block_reads_back_through_a_real_engine` ends a DMA read exactly this
+way, clears `MR` and then reads STATUS and MESSAGE IN - and it passes, as
+does `dma_the_chip_interrupts_promptly_after_the_last_byte`, which measures
+the chip raising IRQ **70 ns** after the last byte.  What differs is what
+SunOS does between steps 3 and 4, and settling that wants 4.1.1's `si.c` -
+the copy in `doc/drivers/` is 3.4's and has neither message - or a trace of
+the bus state through the stall.
 
-One board-side latency is real and is *not* being treated as the cause.  At
-the moment the last byte moves the chip has not raised IRQ yet - `csr 0x0407`
-at `dma_done`, no `SBC_IP` - so the line goes high on the next timer tick
-rather than at completion, up to 500 µs of virtual time later.  Removing that
-would be more faithful, but a SCSI command watchdog is seconds and half a
-millisecond cannot trip one, so changing the board on that theory would be
-the fourth guess in a row rather than a fix.
+Four readings of this fault were wrong before that one, and they are worth
+listing because each was a plausible story that a measurement killed:
 
-What is left is the pacing: this device blocks QEMU's thread inside one MMIO
-access for milliseconds of real time while stepping the core, and what that
-does to the guest's own sense of elapsed time is the one thing here nothing
-has instrumented.  Settling it wants the guest's clock at the moment the
-watchdog fires - or 4.1.1's `si.c`, which would name the condition that
-prints the message; the copy in `doc/drivers/` is 3.4's and does not have it.
+| reading | what killed it |
+|---|---|
+| the chip failed to interrupt on the phase mismatch | a test written before touching the RTL passed |
+| a lost chain start | the chain is in the trace, 4096 words to the address the driver printed |
+| the board never delivered level 2 | a trace on the line: every completion raises it, 1824 of 1824 |
+| the interrupt arrived a timer tick late | raising it at completion instead fixed the latency and not the fault |
+
+The latency was real and the fix for it is kept - the line now goes up in the
+same guest microsecond as the last byte - but it is not what this was.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode

@@ -1,4 +1,4 @@
-From 3fa13e03d23bf7380ca1f78dfa2fe711e09b630b Mon Sep 17 00:00:00 2001
+From b5705e2864fd5ca10d1ae3514619e0ccf9e4a4b8 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Wed, 5 Aug 2026 01:39:38 +0200
 Subject: [PATCH 2/3] hw/scsi: add the Sun-3 "si" onboard SCSI board
@@ -63,9 +63,9 @@ Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
 ---
  hw/scsi/Kconfig      |   6 +
  hw/scsi/meson.build  |   2 +
- hw/scsi/sun3-si.c    | 896 +++++++++++++++++++++++++++++++++++++++++++
- hw/scsi/trace-events |   9 +
- 4 files changed, 913 insertions(+)
+ hw/scsi/sun3-si.c    | 960 +++++++++++++++++++++++++++++++++++++++++++
+ hw/scsi/trace-events |  10 +
+ 4 files changed, 978 insertions(+)
  create mode 100644 hw/scsi/sun3-si.c
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
@@ -96,10 +96,10 @@ index 69fde0cf84..29adf48134 100644
  specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
 diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
 new file mode 100644
-index 0000000000..c3388a688d
+index 0000000000..355aec5fef
 --- /dev/null
 +++ b/hw/scsi/sun3-si.c
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,960 @@
 +/*
 + * Sun-3 "si" SCSI interface, onboard (OBIO) flavour - 3/50 and 3/60.
 + *
@@ -283,6 +283,8 @@ index 0000000000..c3388a688d
 +    uint16_t fifo_count;    /* bytes; the driver reads this as the residual */
 +    bool saw_drq;           /* the chip has asked at least once this transfer */
 +    const char *irq_who;    /* what ran update_irq, for the trace */
++    uint64_t clamped;       /* catch-ups cut short by MAX_CATCH_UP_NS */
++    int64_t core0, guest0;  /* clocks when the core was first run */
 +    uint16_t fifo_data;     /* the leftover byte, in bits 15:8 */
 +    /* The VME-only registers, indexed by (offset - 8) / 2: written by any
 +     * driver that serves both boards, and ignored by this one. */
@@ -318,7 +320,27 @@ index 0000000000..c3388a688d
 +    void (*f_dack_write)(WishRtl *, uint8_t);
 +    void (*f_set_eop)(WishRtl *, int);
 +    void (*f_run_ns)(WishRtl *, uint64_t);
++    uint64_t (*f_time_ns)(WishRtl *);
 +};
++
++/*
++ * How far the core has fallen behind the guest.
++ *
++ * catch_up runs the core to virtual time but never by more than
++ * MAX_CATCH_UP_NS at a stroke, so a guest that advances further than that
++ * between two accesses leaves the core permanently behind - and a transfer
++ * that is prompt in the core's own time is late in the guest's, which is
++ * exactly what a driver watchdog measures.  Both clocks start together the
++ * first time the core is run; the difference is what this reports.
++ */
++static void sun3_si_clock(Sun3SiState *s, const char *what)
++{
++    int64_t guest = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->guest0;
++    int64_t core = (int64_t)s->f_time_ns(s->dev) - s->core0;
++
++    trace_sun3_si_clock(what, guest / 1000, core / 1000,
++                        (guest - core) / 1000, s->clamped);
++}
 +
 +static void sun3_si_update_irq(Sun3SiState *s)
 +{
@@ -337,6 +359,9 @@ index 0000000000..c3388a688d
 +    if (level != s->irq_level) {
 +        s->irq_level = level;
 +        trace_sun3_si_irq(level, s->csr, s->irq_who ? s->irq_who : "?");
++        if (level) {
++            sun3_si_clock(s, "irq-raised");
++        }
 +        qemu_set_irq(s->irq, level);
 +    }
 +}
@@ -362,8 +387,38 @@ index 0000000000..c3388a688d
 +    }
 +    if (delta > MAX_CATCH_UP_NS) {
 +        delta = MAX_CATCH_UP_NS;
++        s->clamped++;
 +    }
 +    s->f_run_ns(s->dev, delta);
++}
++
++/*
++ * Let the chip finish having its say.
++ *
++ * A transfer ends when the last byte moves, but the chip raises its interrupt
++ * a little after that - it has to see the target leave the phase first.  If
++ * the line is only reconsidered on the next pacing tick, the guest waits up
++ * to TIMER_PERIOD_NS of *its* time for an interrupt about a transfer that,
++ * measured on its own clock, took four microseconds: the whole 8 kilobytes
++ * costs about 4 us of guest time and 34 ms of the core's, because the core
++ * runs inside one blocking access during which the guest executes nothing.
++ * An interrupt a hundred transfer-lengths late is what a driver calls lost.
++ *
++ * So step the core on a little at the end of a transfer until it asserts.
++ * The bound is generous compared with the microsecond or so it really takes,
++ * and costs nothing when the chip has already done it.
++ */
++#define SETTLE_STEP_NS  1000
++#define SETTLE_MAX_NS   (200 * 1000)
++
++static void sun3_si_settle(Sun3SiState *s)
++{
++    uint64_t waited = 0;
++
++    while (!s->f_irq(s->dev) && waited < SETTLE_MAX_NS) {
++        s->f_run_ns(s->dev, SETTLE_STEP_NS);
++        waited += SETTLE_STEP_NS;
++    }
 +}
 +
 +/*
@@ -431,6 +486,7 @@ index 0000000000..c3388a688d
 +                s->dma_running = false;
 +                s->csr &= ~SI_CSR_DMA_ACTIVE;
 +                trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
++                sun3_si_settle(s);
 +                return;
 +            }
 +            if (waited >= DRQ_WAIT_NS) {
@@ -494,6 +550,8 @@ index 0000000000..c3388a688d
 +        s->dma_running = false;
 +        s->csr &= ~SI_CSR_DMA_ACTIVE;
 +        trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
++        sun3_si_settle(s);
++        sun3_si_clock(s, "done");
 +        s->udc_status |= UDC_SR_TC | UDC_SR_NAC;
 +
 +        /*
@@ -609,6 +667,7 @@ index 0000000000..c3388a688d
 +
 +    s->dma_addr = (((uint32_t)addr_hi & 0xff00) << 8) | addr_lo;
 +    trace_sun3_si_chain(at, rsel, s->dma_addr, s->udc_count);
++    sun3_si_clock(s, "chain");
 +    s->udc_status &= ~(UDC_SR_TC | UDC_SR_NAC);
 +    s->head = 0;
 +    s->head_n = 0;
@@ -907,6 +966,7 @@ index 0000000000..c3388a688d
 +    GET(f_dack_write, "wish_rtl_dack_write");
 +    GET(f_set_eop, "wish_rtl_set_eop");
 +    GET(f_run_ns, "wish_rtl_run_ns");
++    GET(f_time_ns, "wish_rtl_time_ns");
 +#undef GET
 +
 +    if (s->f_abi() != WISH_RTL_ABI) {
@@ -961,6 +1021,10 @@ index 0000000000..c3388a688d
 +    qemu_add_exit_notifier(&sun3_si_exit.notifier);
 +
 +    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    /* Both clocks start here: the card is already up, so what accumulates
++     * after this is the divergence the pacing causes and nothing else. */
++    s->guest0 = s->last_ns;
++    s->core0 = (int64_t)s->f_time_ns(s->dev);
 +    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sun3_si_tick, s);
 +    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
 +}
@@ -997,10 +1061,10 @@ index 0000000000..c3388a688d
 +
 +type_init(sun3_si_register_types)
 diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
-index a8ac1e7f1d..e4aae2a4d4 100644
+index a8ac1e7f1d..0233b29f01 100644
 --- a/hw/scsi/trace-events
 +++ b/hw/scsi/trace-events
-@@ -392,3 +392,12 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
+@@ -392,3 +392,13 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
  scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
  scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
  scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
@@ -1013,6 +1077,7 @@ index a8ac1e7f1d..e4aae2a4d4 100644
 +sun3_si_stalled(uint16_t resid, uint8_t csb, uint8_t bsr, int drq) "stalled with %u bytes left: csb 0x%02x bsr 0x%02x drq %d"
 +sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
 +sun3_si_irq(int level, uint16_t csr, const char *who) "level 2 %d, csr 0x%04x, from %s"
++sun3_si_clock(const char *what, int64_t guest_us, int64_t core_us, int64_t lag_us, uint64_t clamped) "%s: guest %"PRId64" us, core %"PRId64" us, core is %"PRId64" us behind, %"PRIu64" clamped"
 -- 
 2.39.5
 

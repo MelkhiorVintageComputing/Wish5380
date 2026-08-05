@@ -415,3 +415,50 @@ TEST(dma_a_transfer_ends_by_interrupting_without_the_eop_enable) {
                                 20 * MS),
             "the transfer ended and the chip never interrupted");
 }
+
+TEST(dma_the_chip_interrupts_promptly_after_the_last_byte) {
+  // How long after the last byte of a DMA read does the chip raise IRQ?
+  //
+  // It matters because of what happens in the co-simulation: a driver that
+  // polls the board, sees the transfer finished and clears the Mode
+  // Register's DMA bit is racing the chip's own interrupt, and if it wins
+  // the interrupt never comes at all - the phase mismatch is only an
+  // interrupt source while DMA mode is set.  On the real part the last
+  // acknowledge and the phase change are the same instant and no driver can
+  // get between them.  Here the answer decides how long the board has to let
+  // the chip settle before it hands the machine back.
+  env.power_on_reset();
+
+  CHECK_DRV(env.drv().select(env.cfg().target_id));
+  uint8_t identify = 0x80;
+  CHECK_EQ(env.drv().pio(sci::PH_MSG_OUT, &identify, nullptr, 1), size_t(1));
+  Bytes cdb{0x08, 0, 0, 7, 16, 0};                 // READ(6), sixteen blocks
+  CHECK_EQ(env.drv().pio(sci::PH_COMMAND, cdb.data(), nullptr, cdb.size()),
+           cdb.size());
+
+  CHECK(env.sim().run_until(
+      [&]() {
+        return (env.chip_read(sci::R_CSB) & sci::CSB_REQ) &&
+               sci::csb_to_phase(env.chip_read(sci::R_CSB)) == sci::PH_DATA_IN;
+      },
+      5 * MS));
+
+  env.chip_write(sci::R_TCR, sci::PH_DATA_IN);
+  env.chip_write(sci::R_MR, sci::MR_DMA);
+  env.chip_write(sci::R_ICR, 0);
+  env.chip_write(sci::R_SDIR, 0);
+
+  Env::Dma d = env.dma_in(16 * 512);
+  CHECK_EQ(d.moved, size_t(16 * 512));
+
+  // The last byte has moved.  Time how long the interrupt takes from here.
+  u64 t0 = env.sim().time_ps();
+  bool got = env.sim().run_until([&]() { return env.dut()->dut_irq_o != 0; },
+                                 50 * MS);
+  u64 dt = env.sim().time_ps() - t0;
+  CHECK_MSG(got, "the chip never interrupted after the last byte");
+  note("interrupt came " + std::to_string(dt / 1000) + " ns after the last byte");
+  CHECK_MSG(dt < 1 * MS,
+            "the chip took " + std::to_string(dt / 1000000) +
+                " us to interrupt, which is a window a driver can lose in");
+}
