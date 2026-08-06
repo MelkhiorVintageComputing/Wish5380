@@ -163,17 +163,35 @@ cosim/scripts/run-sun3.py 'b sd()' -- -trace 'sun3_si_*'
 cosim/scripts/make-sun3-disk.py --miniroot work/netbsd/miniroot.fs \
     --bootxx work/netbsd/usr/mdec/bootxx --out work/sun3/disk.img \
     --size-mb 320 --swap-mb 32
-cosim/scripts/run-sun3.py --image work/sun3/disk.img 'b sd() netbsd.sun3'
+cosim/scripts/run-sun3.py --image work/sun3/disk.img -t 1500 -i 900 \
+    'b sd() netbsd.sun3'
 
-# SunOS, whose disk is made under TME first - see below
+# SunOS, whose disk is made under TME first - see below.  The image is the
+# one the TME configuration writes, and it is where TME left it.
 cosim/scripts/run-tme.py SUN3-emulex -s '>:=b st()' ...
-cosim/scripts/run-sun3.py --image work/sun3/sunos.img 'b sd()'
+cosim/scripts/run-sun3.py --image work/tme-run/sun3-disk.img -t 3400 -i 1800 \
+    'b sd()'
 ```
 
 A run that has to survive a long silence - `fsck` says nothing for minutes -
-wants `-i` raised; the default gives up after three.  And if something else
-on the machine sweeps up emulators with `pkill -f qemu-system-m68k`, point
-`--qemu` at a copy under another name.
+wants `-i` raised; it gives up after a minute by default, and `-t` ends the
+whole run after ten.  And if something else on the machine sweeps up emulators
+with `pkill -f qemu-system-m68k`, point `--qemu` at a copy under another name.
+
+**Both defaults are far too small for a guest that boots an operating
+system**, and the two guests are not in the same class:
+
+| guest | what works | how far it gets |
+|---|---|---|
+| NetBSD 10.1 INSTALL | `-t 1500 -i 900` | root on `sd0a`, ffs, sysinst's prompt and a root shell |
+| SunOS 4.1.1 | `-t 3400 -i 1800` | `sd0 at si0 slave 0`, root, swap and dump, `/usr/etc/init`, `checking filesystems` |
+
+SunOS is the expensive one and the kernel load is why: `vmunix` is 893160
+bytes and every one of them crosses the Verilated chip, which on its own
+outruns a total of 1500 seconds.  A run cut short there looks like a hang and
+is not one - the last thing on the console is `Boot: vmunix` and a spinner,
+and the spinner writes no newline, so a line-based idle detector sees silence
+while the machine is working.  Raise `-i` before concluding anything from it.
 
 Guest time counts guest instructions by default; `--icount` changes the rate
 and `--icount 0` hands it back to the wall clock.  There is a section on why
@@ -431,6 +449,13 @@ runs the 4.1.1 installer against a disk image, its own `installboot` puts the
 boot block on, and the finished image is what QEMU boots on the Verilated
 chip.  `cosim/scripts/run-tme.py` drives it.  Nothing in `src/` or `tb/`
 depends on TME, and it is not in `make test`.
+
+The image is named by the TME configuration rather than by any option, so it
+is wherever that says: `work/tme-run/SUN3-emulex` gives `disk0` the file
+`sun3-disk.img`, relative to the directory TME runs in, and `--image
+work/tme-run/sun3-disk.img` is what to hand `run-sun3.py` afterwards.  Its
+first block is a Sun label and begins with the disk's own name in ASCII, which
+is the quickest way to tell a finished image from an empty one.
 
 Five things about that install are worth writing down, because none of them
 is in anyone's instructions:
