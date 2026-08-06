@@ -23,7 +23,7 @@ diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/meson.
 diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/ncr5380-isa.c work/qemu-src/hw/scsi/ncr5380-isa.c
 --- a/hw/scsi/ncr5380-isa.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/hw/scsi/ncr5380-isa.c	2026-08-03 18:07:00.323755586 +0200
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,283 @@
 +/*
 + * An ISA card carrying an NCR 5380, backed by the Verilated wish5380.
 + *
@@ -64,8 +64,16 @@ diff -ruN '--exclude=*.orig' '--exclude=*.rej' work/qemu-pristine/hw/scsi/ncr538
 +#define TYPE_NCR5380_ISA "ncr5380-isa"
 +OBJECT_DECLARE_SIMPLE_TYPE(Ncr5380IsaState, NCR5380_ISA)
 +
-+/* Must match cosim/rtl/wish_rtl.h. */
-+#define WISH_RTL_ABI 1
++/* Must match cosim/rtl/wish_rtl.h.
++ *
++ * ABI 2 added the DMA handshake - wish_rtl_drq, dack_read, dack_write and
++ * set_eop - for the Sun-3's Am9516.  This card resolves none of them and never
++ * will: an ISA 5380 card has no DMA controller in front of it, so the driver
++ * moves every byte itself and polls the DRQ bit in the Bus and Status Register
++ * instead.  The number is bumped rather than the check loosened, because a
++ * card that accepted any ABI at all would load a library whose register
++ * functions had changed underneath it. */
++#define WISH_RTL_ABI 2
 +typedef struct WishRtl WishRtl;
 +
 +/* How far the core is stepped for each register access, and how often and how
