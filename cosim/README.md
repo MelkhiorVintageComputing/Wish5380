@@ -166,12 +166,20 @@ cosim/scripts/make-sun3-disk.py --miniroot work/netbsd/miniroot.fs \
 cosim/scripts/run-sun3.py --image work/sun3/disk.img -t 1500 -i 900 \
     'b sd() netbsd.sun3'
 
-# SunOS, whose disk is made under TME first - see below.  The image is the
-# one the TME configuration writes, and it is where TME left it.
-cosim/scripts/run-tme.py SUN3-emulex -s '>:=b st()' ...
-cosim/scripts/run-sun3.py --image work/tme-run/sun3-disk.img -t 3400 -i 1800 \
+# SunOS, whose disk is built under TME from the install tape - see below
+cosim/scripts/make-sun3-sunos-disk.sh
+cosim/scripts/run-sun3.py --image work/tme-run/sun3-80s.img -t 14000 -i 5000 \
     'b sd()'
 ```
+
+**Restore the image from `work/sun3/sunos-80s-pristine.img` between runs.**  A
+co-simulation that exits cleanly writes the card back over the image it was
+given - `wish_rtl_free` calls `wish_rtl_flush` - while one that is killed does
+not, because `run-sun3.py` ends QEMU with `SIGKILL`.  So whether a run mutates
+its own input depends on how it happened to die, which is no basis for
+comparing two runs.  `run-cosim.py` already avoids this for the ISA card by
+copying to `card-run.img` and keeping it only for `--keep`; the Sun-3 path has
+no such copy yet, and until it does the copy is the caller's job.
 
 A run that has to survive a long silence - `fsck` says nothing for minutes -
 wants `-i` raised; it gives up after a minute by default, and `-t` ends the
@@ -451,11 +459,68 @@ chip.  `cosim/scripts/run-tme.py` drives it.  Nothing in `src/` or `tb/`
 depends on TME, and it is not in `make test`.
 
 The image is named by the TME configuration rather than by any option, so it
-is wherever that says: `work/tme-run/SUN3-emulex` gives `disk0` the file
-`sun3-disk.img`, relative to the directory TME runs in, and `--image
-work/tme-run/sun3-disk.img` is what to hand `run-sun3.py` afterwards.  Its
-first block is a Sun label and begins with the disk's own name in ASCII, which
-is the quickest way to tell a finished image from an empty one.
+is wherever that says - `disk0` gets a filename relative to the directory TME
+runs in.  Its first block is a Sun label and begins with the disk's own name
+in ASCII, which is the quickest way to tell a finished image from an empty
+one.
+
+### The disk that is used now, and why it is small
+
+`cosim/scripts/make-sun3-sunos-disk.sh` builds it end to end from the tape.
+It is a **Quantum ProDrive 80S** - the geometry `/etc/format.dat` gives for
+that drive, 832 data cylinders by 6 heads by 34 sectors, so 204 sectors a
+cylinder and 82.9 MB.  Its *sample partition table* in the same file is not
+used: that block assumes 256 sectors per cylinder and does not reconcile with
+the `disk_type` printed directly above it.
+
+| part | cyl | blocks | size | use |
+|---|---|---|---|---|
+| a | 0 | 137088 | 66.9 MB | `/` |
+| b | 672 | 32640 | 15.9 MB | swap, and the miniroot the installer plants |
+| c | 0 | 169728 | 82.9 MB | whole disk |
+
+Small on purpose.  `newfs` scales the inode count with the size of the
+filesystem and fsck's cost is mostly the inode scan, so 62 MB carries about
+29000 free inodes where 200 MB carried about 100000 - for the same 30 MB of
+content.
+
+**There is one filesystem and there cannot be two.**  The sun3 proto root on
+this tape is a *diskless client's*: its stock `/etc/fstab` is
+`server:/rootdir / nfs`, its `/sbin` is an empty directory, and `/etc/mount`,
+`/etc/fsck`, `/etc/umount` and `/bin` are all symlinks into `/usr`.  Nothing
+on it can run before `/usr` is mounted.  A diskless kernel mounts `/usr` over
+NFS from bootparams before it execs init; a local disk has no equivalent, so
+a split install dies in `panic: icode` having mounted nothing.  Seeding
+`/sbin` from the miniroot does not rescue it either - every miniroot binary is
+dynamically linked against `/usr/lib/ld.so`.  This is a property of the media,
+not a partitioning mistake, and it is worth knowing before anyone tries the
+conventional `a`/`b`/`g` layout again.
+
+So there is no `/usr` line in fstab.  What there is instead is one changed
+line in `/etc/rc.single`, whose `mount -o remount /usr` fails on a machine
+with no separate `/usr` and answers `exit 2` - which `/etc/rc.boot` turns into
+its own exit status and init reads as a failed single-user setup, stranding
+the boot.  An earlier image worked around that with an fstab entry pointing
+`/usr` at the root's own device; that is a fiction, and it also made fsck
+check `sd0a` twice under two names.
+
+**fsck is switched off in fstab**, by the sixth field - the pass number -
+which `fsck -p` uses to decide what to check at all.  Walking a 62 MB
+filesystem's inodes at the ~12 KB/s the Verilated chip sustains takes about
+2700 s, and the `sd0: I/O request timeout` fault fires during it, so the check
+was the whole of what stood between a boot and a prompt.  `/fastboot` is the
+other switch and is worse: `/etc/rc` removes it after one boot.  A clean
+shutdown buys nothing at all, because 4.1.1's `fsck` is 4.3BSD-derived and
+carries no clean-flag logic - `FILE SYSTEM STATE`, `FSCLEAN` and `fs_clean`
+are all absent from the binary - so it runs five phases however the filesystem
+was unmounted.  Skipping it is safe only because the image is rebuilt from the
+tape and restored from a pristine copy rather than maintained in place.
+
+With that done SunOS runs essentially the whole of `/etc/rc` off the chip:
+quotas, `portmap ypbind keyserv ypupdated routed`, `biod`, the system logger,
+`auditd sendmail statd lockd`, the link-editor cache, `/tmp`, and the standard
+daemons.  It is slow - hours, most of it network daemons timing out against a
+machine with no network - and no run has yet reached `login:`.
 
 Five things about that install are worth writing down, because none of them
 is in anyone's instructions:
@@ -566,7 +631,7 @@ block zero.
 
 ### Where it stops
 
-Four faults are on the record and none is fully explained, though the first
+Five faults are on the record and none is fully explained, though the first
 is now narrowed to one exchange.  All but the first are intermittent, and they are written down here
 rather than left in a commit message because an unexplained fault that nobody
 can find again is worth less than one that is.
@@ -640,6 +705,28 @@ then prints its "lost interrupt" explanation.
 Pinning that wants a timestamp on *every* register access rather than on
 chain and completion events, so the jump can be located between two adjacent
 accesses instead of inferred from the space between them.
+
+It still fires on the small ProDrive 80S disk, four times in one boot with
+three `lost interrupt`s beside them, and the driver recovered from every one.
+One of those dumps carries `last phase= 0x40 (DATA OUT) 8192` and a ten-byte
+CDB, where every earlier sighting had `0x4 (DATA IN)` and a six-byte READ.
+That *hints* the stall is not read-specific and the 8192-byte transfer is the
+common factor - but it is only a hint, because the paragraph above is exactly
+about the dump reporting whichever command was current rather than the one
+that failed, and the phase ring is the same dump.  Worth checking against a
+per-access timestamp; not worth believing before that.
+
+**`panic: ialloc: dup alloc`**, once, on a filesystem that is not corrupt.
+The panic named inode 1565 and killed the boot 20 s after `checking
+filesystems`; `fsck -y` under TME afterwards walked all five phases, changed
+nothing and reported `3571 files, 30715 used, 33108 free`.  The same image
+booted past that point both before and after.  It is only visible with fsck
+switched off in fstab - not because skipping the check causes it, but because
+the check had been repairing whatever it is, silently, every boot.  Nothing
+rules out the chip here: a lost or misapplied write during the boot's first
+writes would look exactly like this, and the co-simulation cannot have
+inherited the damage from a previous run, because a run that is killed never
+writes the image back at all.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode
