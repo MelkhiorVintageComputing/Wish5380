@@ -12,6 +12,7 @@ from.  The second is the authority and the first defers to it.
 | where does a register sit in a machine's address space | [`interface.md`](interface.md) |
 | what does the disk answer to | [`target.md`](target.md) |
 | how does the card come up | [`sd.md`](sd.md) |
+| why does each drive get a whole card | [`storage.md`](storage.md) |
 | does a real driver actually work against this | [`../cosim/README.md`](../cosim/README.md) |
 | why is the RTL like that | the comment beside it, which cites the page |
 
@@ -22,6 +23,7 @@ from.  The second is the authority and the first defers to it.
 | [`interface.md`](interface.md) | **the contract between `src/` and `tb/`.**  The register port, the Wishbone slave and its three windows, the internal SCSI bus, and the delays a clockless part leaves a clocked replica to count.  Anything that changes one of those changes the RTL, the testbench and that document together |
 | [`target.md`](target.md) | the SCSI target behind the fabric: the command set it answers, three rules that are easy to get subtly wrong, and what it deliberately does not do |
 | [`sd.md`](sd.md) | the SD card behind the block interface: SPI mode, the order a card has to be brought up in, the two capacity layouts, and which CRC is checked and which is not |
+| [`storage.md`](storage.md) | one card per drive, and whether it should stay that way.  A survey of the five devices that solved this before us, and what of it is worth adopting.  Argument only - none of it is implemented |
 | [`../cosim/README.md`](../cosim/README.md) | co-simulation: an unmodified Linux booting off the RTL, and why the guest is not a Macintosh when the whole design was built for one |
 | [`drivers/README.md`](drivers/README.md) | which of the sources below is the authority on what, and the places two of them disagree |
 

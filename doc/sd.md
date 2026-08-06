@@ -4,6 +4,12 @@
 the SCSI target reaches storage through.  The target asks for one 512-byte
 block at a time and never sees a card.
 
+The whole card is one drive, and one drive is a whole card.  That is the
+simplest thing that works and not the only sensible thing; `doc/storage.md`
+records what the devices that solved this before us do instead, and why
+several drives on one card means several SCSI IDs rather than several logical
+units.
+
 SPI mode, not the native four-bit bus.  It is slower - one bit a clock rather
 than four - and 25 MHz of it is still comfortably above the 1.5 MB/s the NCR
 5380 can manage asynchronously, so the SCSI side is the bottleneck either way.

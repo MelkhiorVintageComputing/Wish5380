@@ -225,6 +225,12 @@ for a card - and what would let an SD 4-bit layer replace the SPI one without
 the block side noticing.  `doc/target.md` sets out the rest of the target's
 contract and `doc/sd.md` what is on the far side of this one.
 
+Each drive gets a whole card, and that is an assumption rather than a
+conclusion: a modern card holds many times a vintage disk, and every
+comparable device carves one card into several drives instead.
+`doc/storage.md` surveys what they do and argues what this design should
+adopt.  Nothing of it is implemented; this seam is where it would go.
+
 ## Four decisions with no silicon to be faithful to
 
 Everything above is what the datasheet or a driver settles.  These four had to
