@@ -4,7 +4,7 @@
 // target reaches storage through.
 //
 // The target asks for one 512-byte block at a time and never sees a card: it
-// starts a transfer, waits for `done_o`, and finds the block in the sector
+// starts a transfer, waits for `blk_o.done`, and finds the block in the sector
 // buffer this module fills or drains through its own port.  That is what lets
 // an SD 4-bit layer replace this one later without the SCSI side noticing,
 // and what lets the regression test SCSI without simulating a card.
@@ -40,19 +40,12 @@ module blk_sd #(
   input  logic rst_i,
 
   // ---- the block interface, as `scsi_targ` sees it -----------------------
-  input  logic        start_i,
-  input  logic        we_i,       // 1 = write the buffer to the card
-  input  logic [31:0] lba_i,
-  output logic        done_o,     // one cycle
-  output logic        err_o,      // valid with done_o
-  output logic        ready_o,    // the card is up and its size is known
-  output logic [31:0] count_o,    // capacity, in 512-byte blocks
-
-  // ---- the sector buffer, which lives in the target ----------------------
-  output logic        buf_we_o,
-  output logic [8:0]  buf_addr_o,
-  output logic [7:0]  buf_wdata_o,
-  input  logic [7:0]  buf_rdata_i,
+  //
+  // `doc/block.md` is the contract.  The sector buffer lives in the target,
+  // so `blk_i.buf_rdata` is the answer to `blk_o.buf_addr` and arrives one
+  // cycle after it.
+  input  blk_req_t blk_i,
+  output blk_rsp_t blk_o,
 
   // ---- the card ----------------------------------------------------------
   output logic sd_clk_o,
@@ -60,6 +53,32 @@ module blk_sd #(
   output logic sd_mosi_o,
   input  logic sd_miso_i
 );
+
+  // ---------------------------------------------------------------------------
+  // The response, assembled at the port.
+  //
+  // The sequencer drives these as ordinary signals and they are gathered into
+  // `blk_o` here, rather than the sequencer writing struct fields directly.
+  // Two of them come from continuous assignments and five from the state
+  // machine, and a struct with both kinds of driver on it is multiply driven
+  // as far as a linter is concerned even though no bit of it is.
+  // ---------------------------------------------------------------------------
+
+  logic        blk_done, blk_err, blk_ready;
+  logic [31:0] blk_count;
+  logic        sbuf_we;
+  logic [8:0]  sbuf_addr;
+  logic [7:0]  sbuf_wdata;
+
+  always_comb begin
+    blk_o.done      = blk_done;
+    blk_o.err       = blk_err;
+    blk_o.ready     = blk_ready;
+    blk_o.count     = blk_count;
+    blk_o.buf_we    = sbuf_we;
+    blk_o.buf_addr  = sbuf_addr;
+    blk_o.buf_wdata = sbuf_wdata;
+  end
 
   // ---------------------------------------------------------------------------
   // Clocking.
@@ -167,7 +186,7 @@ module blk_sd #(
   localparam logic [5:0] S_WR_RESP  = 6'd31;
   localparam logic [5:0] S_WR_BUSY  = 6'd32;
 
-  localparam logic [5:0] S_FINISH   = 6'd33;  // pulse done_o
+  localparam logic [5:0] S_FINISH   = 6'd33;  // pulse blk_done
   localparam logic [5:0] S_DEAD     = 6'd34;  // no usable card
 
   // The command helper, which every command above jumps into and comes back
@@ -204,7 +223,7 @@ module blk_sd #(
   logic [15:0] ms;             // milliseconds since the timeout was armed
   logic        ms_pulse;
 
-  assign ready_o = card_ready;
+  assign blk_ready = card_ready;
 
   // ---------------------------------------------------------------------------
   // Capacity, from the CSD.
@@ -240,7 +259,7 @@ module blk_sd #(
     end
   end
 
-  assign count_o = card_ready ? blocks : 32'd0;
+  assign blk_count = card_ready ? blocks : 32'd0;
 
   // ---------------------------------------------------------------------------
   // The next byte of a command, by position.
@@ -264,8 +283,8 @@ module blk_sd #(
 
   always_ff @(posedge clk_i) begin
     spi_go   <= 1'b0;
-    buf_we_o <= 1'b0;
-    done_o   <= 1'b0;
+    sbuf_we <= 1'b0;
+    blk_done   <= 1'b0;
 
     // One pulse per millisecond, which is what every timeout here is counted
     // in.  A card may take most of a second to finish initialising and a
@@ -297,9 +316,9 @@ module blk_sd #(
       v2         <= 1'b0;
       ccs        <= 1'b0;
       card_ready <= 1'b0;
-      err_o      <= 1'b0;
-      buf_addr_o <= '0;
-      buf_wdata_o <= '0;
+      blk_err      <= 1'b0;
+      sbuf_addr <= '0;
+      sbuf_wdata <= '0;
       tick_cnt   <= '0;
       ms         <= '0;
       ms_pulse   <= 1'b0;
@@ -503,13 +522,13 @@ module blk_sd #(
 
         // ---- idle -----------------------------------------------------------
         S_READY: begin
-          err_o <= 1'b0;
-          if (start_i) begin
+          blk_err <= 1'b0;
+          if (blk_i.start) begin
             // A high-capacity card is addressed by block, everything else by
             // byte offset.
-            cmd_arg <= ccs ? lba_i : (lba_i << 9);
+            cmd_arg <= ccs ? blk_i.lba : (blk_i.lba << 9);
             ms      <= '0;
-            st      <= we_i ? S_WR_CMD : S_RD_CMD;
+            st      <= blk_i.we ? S_WR_CMD : S_RD_CMD;
           end
         end
 
@@ -526,7 +545,7 @@ module blk_sd #(
         S_RD_CMD_R: begin
           ms <= '0;
           if (r1 != 8'h00) begin
-            err_o <= 1'b1;
+            blk_err <= 1'b1;
             st    <= S_FINISH;
           end else begin
             st <= S_RD_TOK;
@@ -539,15 +558,15 @@ module blk_sd #(
           if (spi_rx == 8'hfe) begin
             bcnt       <= '0;
             crc16      <= '0;
-            buf_addr_o <= '0;
+            sbuf_addr <= '0;
             st         <= S_RD_DAT;
             spi_tx     <= 8'hff;
             spi_go     <= 1'b1;
           end else if (spi_rx[7:4] == 4'h0) begin
-            err_o <= 1'b1;      // the card refused: address, or a bad sector
+            blk_err <= 1'b1;      // the card refused: address, or a bad sector
             st    <= S_FINISH;
           end else if (ms >= 16'd200) begin
-            err_o <= 1'b1;
+            blk_err <= 1'b1;
             st    <= S_FINISH;
           end else begin
             spi_tx <= 8'hff;
@@ -556,9 +575,9 @@ module blk_sd #(
         end
 
         S_RD_DAT: begin
-          buf_addr_o  <= bcnt[8:0];
-          buf_wdata_o <= spi_rx;
-          buf_we_o    <= 1'b1;
+          sbuf_addr  <= bcnt[8:0];
+          sbuf_wdata <= spi_rx;
+          sbuf_we    <= 1'b1;
           crc16       <= crc16_byte(crc16, spi_rx);
           bcnt        <= bcnt + 10'd1;
           if (bcnt == 10'd511) begin
@@ -582,7 +601,7 @@ module blk_sd #(
           crc16 <= crc16_byte(crc16, spi_rx);
           bcnt  <= bcnt + 10'd1;
           if (bcnt == 10'd1) begin
-            if (crc16_byte(crc16, spi_rx) != 16'h0000) err_o <= 1'b1;
+            if (crc16_byte(crc16, spi_rx) != 16'h0000) blk_err <= 1'b1;
             st <= S_FINISH;
           end else begin
             spi_tx <= 8'hff;
@@ -602,13 +621,13 @@ module blk_sd #(
 
         S_WR_CMD_R: begin
           if (r1 != 8'h00) begin
-            err_o <= 1'b1;
+            blk_err <= 1'b1;
             st    <= S_FINISH;
           end else begin
             // One idle byte between the response and the data packet, and the
             // buffer's address set so its registered read has settled long
             // before the first data byte is wanted.
-            buf_addr_o <= '0;
+            sbuf_addr <= '0;
             st         <= S_WR_PRE;
             spi_tx     <= 8'hff;
             spi_go     <= 1'b1;
@@ -625,20 +644,20 @@ module blk_sd #(
 
         S_WR_TOK: begin
           st     <= S_WR_DAT;
-          spi_tx <= buf_rdata_i;
+          spi_tx <= blk_i.buf_rdata;
           spi_go <= 1'b1;
-          crc16  <= crc16_byte(crc16, buf_rdata_i);
-          buf_addr_o <= 9'd1;
+          crc16  <= crc16_byte(crc16, blk_i.buf_rdata);
+          sbuf_addr <= 9'd1;
         end
 
         // The token byte carried data byte zero out with it, so this issues
         // bytes one to five hundred and eleven: five hundred and eleven
         // visits, the last of them with bcnt at 510.
         S_WR_DAT: begin
-          spi_tx     <= buf_rdata_i;
+          spi_tx     <= blk_i.buf_rdata;
           spi_go     <= 1'b1;
-          crc16      <= crc16_byte(crc16, buf_rdata_i);
-          buf_addr_o <= buf_addr_o + 9'd1;
+          crc16      <= crc16_byte(crc16, blk_i.buf_rdata);
+          sbuf_addr <= sbuf_addr + 9'd1;
           bcnt       <= bcnt + 10'd1;
           if (bcnt == 10'd510) begin
             bcnt <= '0;
@@ -662,11 +681,11 @@ module blk_sd #(
           // The data response token is xxx0sss1, and 010 in the middle means
           // the card took it.
           if ((spi_rx & 8'h11) == 8'h01) begin
-            if ((spi_rx & 8'h0e) != 8'h04) err_o <= 1'b1;
+            if ((spi_rx & 8'h0e) != 8'h04) blk_err <= 1'b1;
             ms <= '0;
             st <= S_WR_BUSY;
           end else if (ms >= 16'd200) begin
-            err_o <= 1'b1;
+            blk_err <= 1'b1;
             st    <= S_FINISH;
           end
           spi_tx <= 8'hff;
@@ -679,7 +698,7 @@ module blk_sd #(
           if (spi_rx != 8'h00) begin
             st <= S_FINISH;
           end else if (ms >= 16'd500) begin
-            err_o <= 1'b1;
+            blk_err <= 1'b1;
             st    <= S_FINISH;
           end else begin
             spi_tx <= 8'hff;
@@ -688,7 +707,7 @@ module blk_sd #(
         end
 
         S_FINISH: begin
-          done_o <= 1'b1;
+          blk_done <= 1'b1;
           st     <= S_READY;
         end
 
@@ -697,9 +716,9 @@ module blk_sd #(
         // and the driver says so instead of waiting for ever.
         S_DEAD: begin
           card_ready <= 1'b0;
-          if (start_i) begin
-            err_o  <= 1'b1;
-            done_o <= 1'b1;
+          if (blk_i.start) begin
+            blk_err  <= 1'b1;
+            blk_done <= 1'b1;
           end
         end
 

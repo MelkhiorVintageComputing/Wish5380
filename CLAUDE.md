@@ -112,6 +112,12 @@ changes the register map, the bus behaviour, the internal SCSI bus or the
 block back end has to change the RTL, the testbench and that document
 together.
 
+`doc/block.md` is the block back end's own contract, and it is the only
+interface here with no external authority behind it - Wishbone, SCSI, the SD
+protocol and the register map all have a specification somewhere, and that one
+was invented in this project.  It is where a second back end is written from,
+and where `doc/storage.md`'s extent work would land.
+
 Two files hold the same NCR 5380 constants and must be kept in step by hand:
 `src/wish5380_pkg.sv` (RTL) and `tb/cpp/ncr5380.h` (testbench).  They are
 deliberately independent - the testbench is not allowed to derive its
@@ -130,6 +136,12 @@ wish5380_sd                  the whole thing: a WB B4 slave and two card slots
 │   └── scsi_targ  x TARGETS a direct-access device each; see doc/target.md
 └── blk_sd -> sd_spi  x TARGETS  one SD card each; see doc/sd.md
 ```
+
+The seam between the two halves of that tree is `blk_req_t`/`blk_rsp_t`; see
+`doc/block.md`.  The Wishbone slave is `wb_req_t`/`wb_rsp_t` all the way down
+to `wb_5380`.  Both are packed structs and not SystemVerilog interfaces, for
+a toolchain reason recorded under *Tool quirks that will bite* - the short
+version is that interfaces make `make synth` pass without checking anything.
 
 `TARGETS` is one or two and two is the default.  A board carrying one drive
 leaves the second out entirely rather than wiring an empty slot to it: a
@@ -358,18 +370,41 @@ Every source file carries `SPDX-License-Identifier: MIT`.  The files under
 * Yosys 0.23 rejects `import pkg::*` in both module headers and module bodies,
   so RTL refers to package items as `wish5380_pkg::NAME`.  Keep it that way or
   `make synth` breaks.
+* **SystemVerilog interfaces and modports are unusable here, and one of the
+  two failures is silent.**  Icarus 11 raises a syntax error on any interface
+  port, so `make lint-icarus` does not run at all.  Yosys 0.23 does not
+  implement them: it invents implicitly declared wires for the fields, treats
+  the interface as an empty module, and elaborates a netlist in which the
+  instance is **not connected** - *without reporting an error*, so `make synth`
+  passes while checking nothing.  Every bundle that crosses a module boundary
+  is a pair of packed structs instead - `wb_req_t`/`wb_rsp_t`,
+  `blk_req_t`/`blk_rsp_t`, and `scsi_t`, which is one type because the bus is
+  wired-OR.  A port's `input`/`output` is what a modport would have given.
+  Do not "modernise" these into interfaces.
 * Icarus 11 aborts with an internal assertion - `elab_type.cc:86` - on any
   packed struct typedef declared **inside a package**, reached by a port or
-  not.  `scsi_t` is therefore declared at file scope at the bottom of
-  `wish5380_pkg.sv`, which Icarus accepts.  Do not move it into the package.
+  not.  All four struct types are therefore declared at file scope at the
+  bottom of `wish5380_pkg.sv`, which Icarus accepts.  Do not move them into
+  the package.
 * Yosys 0.23 also rejects `$bits(some_type)` and Icarus refuses a parameter
   whose type is a struct, which is why there is no `SCSI_W` or `SCSI_IDLE`
   constant beside `scsi_t`.
-* Verilator treats a packed struct as one signal, so a module whose struct
-  output depends on its struct input - which `sci_bus` is, because an
-  initiator only drives the data lines when the phase matches - trips
-  UNOPTFLAT even though no field depends on itself.  Synthesis sees the real,
-  acyclic netlist.
+* Neither Icarus nor Yosys accepts a `'{field: value}` assignment pattern, so
+  a struct is assembled field by field.  `'0` for a whole struct is fine and
+  is how an absent device's side is tied off.
+* Icarus 11 rejects a **variable part select of a struct member** - `dat_o =
+  wb_i.dat[8*lane +: 8]` gives "A reference to a wire or reg is not allowed in
+  a constant expression" - and accepts the identical select of a plain vector.
+  `wb_5380` copies the field to `wb_wdata` first.  Anything indexing a struct
+  field by a signal needs the same.
+* Verilator treats a packed struct as one signal, which has two consequences.
+  A module whose struct output depends on its struct input - which `sci_bus`
+  is, because an initiator only drives the data lines when the phase matches -
+  trips UNOPTFLAT even though no field depends on itself; synthesis sees the
+  real, acyclic netlist.  And a struct written by two processes, or by one
+  process and one continuous assignment, is multiply driven even though no bit
+  is - which is why `blk_sd`, `wb_5380` and `scsi_targ` each drive ordinary
+  local signals and gather them into the output struct in one place.
 * A mutation test on a parameterised module has to change the parameter at the
   level that *sets* it.  Changing `wb_5380`'s default proves nothing, because
   `wish5380_wb` overrides it.  And a mutation that leaves a signal unused

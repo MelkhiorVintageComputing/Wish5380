@@ -61,15 +61,8 @@ module wb_5380 #(
   // which bytes are meant.  Byte address is ADR * 4 + lane, which is the
   // little-endian lane convention; a big-endian host crosses the lanes in its
   // bridge, the same way a Sun crossed them in front of a LANCE.
-  input  logic        wb_cyc_i,
-  input  logic        wb_stb_i,
-  input  logic        wb_we_i,
-  input  logic [3:0]  wb_sel_i,
-  input  logic [29:0] wb_adr_i,
-  input  logic [31:0] wb_dat_i,
-  output logic [31:0] wb_dat_o,
-  output logic        wb_ack_o,
-  output logic        wb_err_o,
+  input  wb_req_t wb_i,
+  output wb_rsp_t wb_o,
 
   // ---- the part's microprocessor port ------------------------------------
   output logic       stb_o,
@@ -114,14 +107,33 @@ module wb_5380 #(
   localparam logic [DEC_W-1:0] M_REG = I_REG_MASK[DEC_W-1:0];
   localparam logic [DEC_W-1:0] M_PDMA = I_PDMA_MASK[DEC_W-1:0];
 
+  // The reply, assembled at the port.  `wb_dat` is combinational and the two
+  // handshake bits are registered, and a struct carrying both kinds of driver
+  // is multiply driven as far as a linter is concerned even though no bit is.
+  logic [31:0] wb_dat;
+  logic        wb_ack, wb_err;
+
+  // Icarus 11 rejects a variable part select of a *struct member* - `A
+  // reference to a wire or reg is not allowed in a constant expression` - and
+  // accepts the identical select of a plain vector.  The lane multiplexer
+  // below indexes by `lane`, so the write data gets a name of its own first.
+  logic [31:0] wb_wdata;
+  assign wb_wdata = wb_i.dat;
+
+  always_comb begin
+    wb_o.dat = wb_dat;
+    wb_o.ack = wb_ack;
+    wb_o.err = wb_err;
+  end
+
   logic [DEC_W-1:0] badr;                   // byte address of lane zero
-  assign badr = {wb_adr_i[DEC_W-3:0], 2'b00};
+  assign badr = {wb_i.adr[DEC_W-3:0], 2'b00};
 
   // The slave is four kibibytes.  Anything above that is the machine's own
   // decode and should never have been routed here, so it is a fault rather
   // than something to alias back into the register window.
   logic in_range;
-  assign in_range = (wb_adr_i[29:DEC_W-2] == '0);
+  assign in_range = (wb_i.adr[29:DEC_W-2] == '0);
 
   logic in_reg, in_hsk, in_dma;
   assign in_reg = in_range && ((badr & ~M_REG)  == A_REG);
@@ -132,17 +144,17 @@ module wb_5380 #(
   logic [1:0] first_lane;
   logic       any_lane;
   always_comb begin
-    any_lane   = (wb_sel_i != 4'b0000);
+    any_lane   = (wb_i.sel != 4'b0000);
     first_lane = 2'd0;
-    if      (wb_sel_i[0]) first_lane = 2'd0;
-    else if (wb_sel_i[1]) first_lane = 2'd1;
-    else if (wb_sel_i[2]) first_lane = 2'd2;
+    if      (wb_i.sel[0]) first_lane = 2'd0;
+    else if (wb_i.sel[1]) first_lane = 2'd1;
+    else if (wb_i.sel[2]) first_lane = 2'd2;
     else                  first_lane = 2'd3;
   end
 
   logic one_lane;
-  assign one_lane = (wb_sel_i == 4'b0001) || (wb_sel_i == 4'b0010) ||
-                    (wb_sel_i == 4'b0100) || (wb_sel_i == 4'b1000);
+  assign one_lane = (wb_i.sel == 4'b0001) || (wb_i.sel == 4'b0010) ||
+                    (wb_i.sel == 4'b0100) || (wb_i.sel == 4'b1000);
 
   // A register is one byte, and the eight of them are REG_STRIDE apart, so a
   // register access is a byte access whose offset divides exactly.
@@ -191,7 +203,7 @@ module wb_5380 #(
   logic [1:0] next_lane;
   logic       more;
   always_comb begin
-    left = wb_sel_i & ~((4'b1 << lane) | ((4'b1 << lane) - 4'b1));
+    left = wb_i.sel & ~((4'b1 << lane) | ((4'b1 << lane) - 4'b1));
     more = (left != 4'b0000);
     next_lane = 2'd0;
     if      (left[0]) next_lane = 2'd0;
@@ -200,7 +212,7 @@ module wb_5380 #(
     else              next_lane = 2'd3;
   end
 
-  assign wb_dat_o = rdata;
+  assign wb_dat = rdata;
 
   always_comb begin
     // An access is an event, not a level: the chip's registers 5, 6 and 7
@@ -209,9 +221,9 @@ module wb_5380 #(
     // in exactly one state, for exactly one clock, and never speculatively.
     stb_o  = (st == S_REG) || (st == S_XFER);
     dack_o = (st == S_XFER);
-    we_o   = wb_we_i;
+    we_o   = wb_i.we;
     adr_o  = (st == S_XFER) ? 3'd0 : reg_idx;
-    dat_o  = wb_dat_i[8*lane +: 8];
+    dat_o  = wb_wdata[8*lane +: 8];
   end
 
   always_ff @(posedge clk_i) begin
@@ -221,15 +233,15 @@ module wb_5380 #(
       hsk      <= 1'b0;
       rdata    <= '0;
       tcnt     <= '0;
-      wb_ack_o <= 1'b0;
-      wb_err_o <= 1'b0;
+      wb_ack <= 1'b0;
+      wb_err <= 1'b0;
     end else begin
-      wb_ack_o <= 1'b0;
-      wb_err_o <= 1'b0;
+      wb_ack <= 1'b0;
+      wb_err <= 1'b0;
 
       unique case (st)
         S_IDLE: begin
-          if (wb_cyc_i && wb_stb_i) begin
+          if (wb_i.cyc && wb_i.stb) begin
             rdata <= '0;
             lane  <= first_lane;
             tcnt  <= '0;
@@ -280,12 +292,12 @@ module wb_5380 #(
         end
 
         S_ACK: begin
-          wb_ack_o <= 1'b1;
+          wb_ack <= 1'b1;
           st <= S_END;
         end
 
         S_ERR: begin
-          wb_err_o <= 1'b1;
+          wb_err <= 1'b1;
           st <= S_END;
         end
 
@@ -293,7 +305,7 @@ module wb_5380 #(
         // master that held STB through the acknowledge would otherwise be
         // given a second access, and on this chip a second access is a second
         // strobe.
-        default: if (!(wb_cyc_i && wb_stb_i)) st <= S_IDLE;
+        default: if (!(wb_i.cyc && wb_i.stb)) st <= S_IDLE;
       endcase
     end
   end

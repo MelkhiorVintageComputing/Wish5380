@@ -14,6 +14,9 @@ module rtl_top (
   input  logic clk,
   input  logic rst,
 
+  // Flat, not the design's `wb_req_t` and `wb_rsp_t`: the C interface on the
+  // other side of these ports holds a pointer per signal, the same reason
+  // `tb/sv/tb_top.sv` takes them apart.
   input  logic        wb_cyc_i,
   input  logic        wb_stb_i,
   input  logic        wb_we_i,
@@ -45,6 +48,22 @@ module rtl_top (
   scsi_t peer;
   assign peer = '0;
 
+  wb_req_t wb_req;
+  wb_rsp_t wb_rsp;
+
+  always_comb begin
+    wb_req.cyc = wb_cyc_i;
+    wb_req.stb = wb_stb_i;
+    wb_req.we  = wb_we_i;
+    wb_req.sel = wb_sel_i;
+    wb_req.adr = wb_adr_i;
+    wb_req.dat = wb_dat_i;
+  end
+
+  assign wb_dat_o = wb_rsp.dat;
+  assign wb_ack_o = wb_rsp.ack;
+  assign wb_err_o = wb_rsp.err;
+
   // The second card slot, which this build has no drive for.  The pins exist
   // because the module has them; nothing is bonded to them.
   /* verilator lint_off UNUSEDSIGNAL */
@@ -65,15 +84,8 @@ module rtl_top (
   ) u_dut (
     .clk_i     (clk),
     .rst_i     (rst),
-    .wb_cyc_i  (wb_cyc_i),
-    .wb_stb_i  (wb_stb_i),
-    .wb_we_i   (wb_we_i),
-    .wb_sel_i  (wb_sel_i),
-    .wb_adr_i  (wb_adr_i),
-    .wb_dat_i  (wb_dat_i),
-    .wb_dat_o  (wb_dat_o),
-    .wb_ack_o  (wb_ack_o),
-    .wb_err_o  (wb_err_o),
+    .wb_i      (wb_req),
+    .wb_o      (wb_rsp),
     .irq_o     (irq_o),
     .drq_o     (drq_o),
     .eop_i     (eop_i),

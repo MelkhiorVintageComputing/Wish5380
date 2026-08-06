@@ -158,6 +158,67 @@ module tb_top #(
   output logic       rg_sdir_o
 );
 
+  // The Wishbone and block interfaces are packed structs inside the design and
+  // flat signals here, because the C++ models on the other side of these ports
+  // hold a pointer per signal.  Verilator presents a packed struct as one wide
+  // vector, so a model would have to slice bit ranges out of it - and a model
+  // that had to be told a field's position would drift from the RTL silently.
+  // The same reason `scsi_t` is taken apart below.
+
+  wb_req_t  wbs_req, sdb_req;
+  wb_rsp_t  wbs_rsp, sdb_rsp;
+  blk_req_t tg_req, tg1_req;
+  blk_rsp_t tg_rsp, tg1_rsp;
+
+  always_comb begin
+    wbs_req.cyc = wbs_cyc_i;
+    wbs_req.stb = wbs_stb_i;
+    wbs_req.we  = wbs_we_i;
+    wbs_req.sel = wbs_sel_i;
+    wbs_req.adr = wbs_adr_i;
+    wbs_req.dat = wbs_dat_i;
+
+    sdb_req.cyc = sdb_cyc_i;
+    sdb_req.stb = sdb_stb_i;
+    sdb_req.we  = sdb_we_i;
+    sdb_req.sel = sdb_sel_i;
+    sdb_req.adr = sdb_adr_i;
+    sdb_req.dat = sdb_dat_i;
+
+    tg_rsp.done      = tg_blk_done_i;
+    tg_rsp.err       = tg_blk_err_i;
+    tg_rsp.ready     = tg_blk_ready_i;
+    tg_rsp.count     = tg_blk_count_i;
+    tg_rsp.buf_we    = tg_bbuf_we_i;
+    tg_rsp.buf_addr  = tg_bbuf_addr_i;
+    tg_rsp.buf_wdata = tg_bbuf_wdata_i;
+
+    tg1_rsp.done      = tg1_blk_done_i;
+    tg1_rsp.err       = tg1_blk_err_i;
+    tg1_rsp.ready     = tg1_blk_ready_i;
+    tg1_rsp.count     = tg1_blk_count_i;
+    tg1_rsp.buf_we    = tg1_bbuf_we_i;
+    tg1_rsp.buf_addr  = tg1_bbuf_addr_i;
+    tg1_rsp.buf_wdata = tg1_bbuf_wdata_i;
+  end
+
+  assign wbs_dat_o = wbs_rsp.dat;
+  assign wbs_ack_o = wbs_rsp.ack;
+  assign wbs_err_o = wbs_rsp.err;
+  assign sdb_dat_o = sdb_rsp.dat;
+  assign sdb_ack_o = sdb_rsp.ack;
+  assign sdb_err_o = sdb_rsp.err;
+
+  assign tg_blk_start_o  = tg_req.start;
+  assign tg_blk_we_o     = tg_req.we;
+  assign tg_blk_lba_o    = tg_req.lba;
+  assign tg_bbuf_rdata_o = tg_req.buf_rdata;
+
+  assign tg1_blk_start_o  = tg1_req.start;
+  assign tg1_blk_we_o     = tg1_req.we;
+  assign tg1_blk_lba_o    = tg1_req.lba;
+  assign tg1_bbuf_rdata_o = tg1_req.buf_rdata;
+
   scsi_t peer_drive, bus;
 
   always_comb begin
@@ -192,40 +253,15 @@ module tb_top #(
   ) u_dut (
     .clk_i        (clk_i),
     .rst_i        (rst_i),
-    .wb_cyc_i     (wbs_cyc_i),
-    .wb_stb_i     (wbs_stb_i),
-    .wb_we_i      (wbs_we_i),
-    .wb_sel_i     (wbs_sel_i),
-    .wb_adr_i     (wbs_adr_i),
-    .wb_dat_i     (wbs_dat_i),
-    .wb_dat_o     (wbs_dat_o),
-    .wb_ack_o     (wbs_ack_o),
-    .wb_err_o     (wbs_err_o),
+    .wb_i         (wbs_req),
+    .wb_o         (wbs_rsp),
     .irq_o        (dut_irq_o),
     .drq_o        (dut_drq_o),
     .eop_i        (dut_eop_i),
-    .blk_start_o  (tg_blk_start_o),
-    .blk_we_o     (tg_blk_we_o),
-    .blk_lba_o    (tg_blk_lba_o),
-    .blk_done_i   (tg_blk_done_i),
-    .blk_err_i    (tg_blk_err_i),
-    .blk_ready_i  (tg_blk_ready_i),
-    .blk_count_i  (tg_blk_count_i),
-    .bbuf_we_i    (tg_bbuf_we_i),
-    .bbuf_addr_i  (tg_bbuf_addr_i),
-    .bbuf_wdata_i (tg_bbuf_wdata_i),
-    .bbuf_rdata_o (tg_bbuf_rdata_o),
-    .blk1_start_o  (tg1_blk_start_o),
-    .blk1_we_o     (tg1_blk_we_o),
-    .blk1_lba_o    (tg1_blk_lba_o),
-    .blk1_done_i   (tg1_blk_done_i),
-    .blk1_err_i    (tg1_blk_err_i),
-    .blk1_ready_i  (tg1_blk_ready_i),
-    .blk1_count_i  (tg1_blk_count_i),
-    .bbuf1_we_i    (tg1_bbuf_we_i),
-    .bbuf1_addr_i  (tg1_bbuf_addr_i),
-    .bbuf1_wdata_i (tg1_bbuf_wdata_i),
-    .bbuf1_rdata_o (tg1_bbuf_rdata_o),
+    .blk_o        (tg_req),
+    .blk_i        (tg_rsp),
+    .blk1_o       (tg1_req),
+    .blk1_i       (tg1_rsp),
     .bus_o        (bus),
     .peer_i       (peer_drive)
   );
@@ -246,15 +282,8 @@ module tb_top #(
   ) u_sd (
     .clk_i     (clk_i),
     .rst_i     (rst_i),
-    .wb_cyc_i  (sdb_cyc_i),
-    .wb_stb_i  (sdb_stb_i),
-    .wb_we_i   (sdb_we_i),
-    .wb_sel_i  (sdb_sel_i),
-    .wb_adr_i  (sdb_adr_i),
-    .wb_dat_i  (sdb_dat_i),
-    .wb_dat_o  (sdb_dat_o),
-    .wb_ack_o  (sdb_ack_o),
-    .wb_err_o  (sdb_err_o),
+    .wb_i      (sdb_req),
+    .wb_o      (sdb_rsp),
     .irq_o     (sd_irq_o),
     .drq_o     (sd_drq_o),
     .eop_i     (1'b0),

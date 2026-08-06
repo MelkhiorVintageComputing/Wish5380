@@ -189,3 +189,66 @@ typedef struct packed {
   logic [7:0] data;
   logic       dbp;
 } scsi_t;
+
+// ---------------------------------------------------------------------------
+// The Wishbone B4 classic slave port, in the two directions a slave sees.
+//
+// Here for the same reason `scsi_t` is: a bundle that crosses three module
+// boundaries unchanged is easier to get right as one named thing than as ten
+// ports repeated four times.  Wishbone is a published specification and needs
+// no local document; `doc/interface.md` records only what this design chose
+// within it - word addressing, the little-endian lane convention, and the
+// three windows.
+//
+// SystemVerilog interfaces with modports would be the textbook way to say
+// this.  They are not usable here: Icarus 11 raises a syntax error on any
+// interface port, and Yosys 0.23 does not implement them at all - it invents
+// implicitly declared wires for the interface's fields and elaborates a
+// netlist in which the instance is simply not connected, *without failing*.
+// A `make synth` that passes while checking nothing is worse than one that
+// breaks, so the design uses packed structs, which all three tools agree on.
+// ---------------------------------------------------------------------------
+typedef struct packed {
+  logic        cyc;
+  logic        stb;
+  logic        we;
+  logic [3:0]  sel;
+  logic [29:0] adr;
+  logic [31:0] dat;
+} wb_req_t;
+
+typedef struct packed {
+  logic [31:0] dat;
+  logic        ack;
+  logic        err;
+} wb_rsp_t;
+
+// ---------------------------------------------------------------------------
+// The block back end: what a SCSI target asks storage for, and what comes
+// back.  `doc/block.md` is this interface's contract - it is the one interface
+// in the design with no external authority behind it, so the handshake, the
+// buffer's ownership rule and the three ways a back end can fail silently are
+// all written down there.
+//
+// `blk_req_t` always flows from the target to the back end and `blk_rsp_t`
+// always the other way, whichever module is being looked at.  `buf_rdata` is
+// in the request because the sector buffer lives in the target: it is the
+// target answering the back end's read, and it travels with the rest of what
+// the target drives.
+// ---------------------------------------------------------------------------
+typedef struct packed {
+  logic        start;      // one cycle: begin a transfer
+  logic        we;         // 1 writes the buffer to the media, 0 fills it
+  logic [31:0] lba;        // valid with `start`
+  logic [7:0]  buf_rdata;  // the buffer's read port, one cycle behind `buf_addr`
+} blk_req_t;
+
+typedef struct packed {
+  logic        done;       // one cycle: the transfer is over
+  logic        err;        // only meaningful in the cycle `done` is high
+  logic        ready;      // media present and initialised
+  logic [31:0] count;      // capacity, in 512-byte blocks
+  logic        buf_we;
+  logic [8:0]  buf_addr;
+  logic [7:0]  buf_wdata;
+} blk_rsp_t;

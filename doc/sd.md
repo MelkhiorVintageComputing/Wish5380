@@ -2,7 +2,9 @@
 
 `src/blk_sd.sv`, over `src/sd_spi.sv`, is what sits behind the block interface
 the SCSI target reaches storage through.  The target asks for one 512-byte
-block at a time and never sees a card.
+block at a time and never sees a card.  `doc/block.md` is the interface itself,
+and is the thing to read before writing a second back end; this document is
+what is on the far side of it.
 
 The whole card is one drive, and one drive is a whole card.  That is the
 simplest thing that works and not the only sensible thing; `doc/storage.md`

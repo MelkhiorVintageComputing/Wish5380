@@ -31,15 +31,8 @@ module wish5380_sd #(
   input  logic rst_i,
 
   // ---- Wishbone B4 classic slave -----------------------------------------
-  input  logic        wb_cyc_i,
-  input  logic        wb_stb_i,
-  input  logic        wb_we_i,
-  input  logic [3:0]  wb_sel_i,
-  input  logic [29:0] wb_adr_i,
-  input  logic [31:0] wb_dat_i,
-  output logic [31:0] wb_dat_o,
-  output logic        wb_ack_o,
-  output logic        wb_err_o,
+  input  wb_req_t wb_i,
+  output wb_rsp_t wb_o,
 
   // ---- the part's own pins -----------------------------------------------
   output logic irq_o,
@@ -68,22 +61,16 @@ module wish5380_sd #(
   input  scsi_t peer_i
 );
 
-  logic        blk_start, blk_we, blk_done, blk_err, blk_ready;
-  logic [31:0] blk_lba, blk_count;
-  logic        bbuf_we;
-  logic [8:0]  bbuf_addr;
-  logic [7:0]  bbuf_wdata, bbuf_rdata;
+  blk_req_t blk_req;
+  blk_rsp_t blk_rsp;
 
   // The second drive's wires exist whether or not there is a second drive on
   // the end of them; with TARGETS of one the target block ties its side low
   // and nothing reads them back.
   /* verilator lint_off UNUSEDSIGNAL */
-  logic        blk1_start, blk1_we, blk1_done, blk1_err, blk1_ready;
-  logic [31:0] blk1_lba, blk1_count;
-  logic        bbuf1_we;
-  logic [8:0]  bbuf1_addr;
-  logic [7:0]  bbuf1_wdata, bbuf1_rdata;
+  blk_req_t blk1_req;
   /* verilator lint_on UNUSEDSIGNAL */
+  blk_rsp_t blk1_rsp;
 
   wish5380_wb #(
     .CLK_PERIOD_PS  (CLK_PERIOD_PS),
@@ -102,40 +89,15 @@ module wish5380_sd #(
   ) u_card (
     .clk_i        (clk_i),
     .rst_i        (rst_i),
-    .wb_cyc_i     (wb_cyc_i),
-    .wb_stb_i     (wb_stb_i),
-    .wb_we_i      (wb_we_i),
-    .wb_sel_i     (wb_sel_i),
-    .wb_adr_i     (wb_adr_i),
-    .wb_dat_i     (wb_dat_i),
-    .wb_dat_o     (wb_dat_o),
-    .wb_ack_o     (wb_ack_o),
-    .wb_err_o     (wb_err_o),
+    .wb_i         (wb_i),
+    .wb_o         (wb_o),
     .irq_o        (irq_o),
     .drq_o        (drq_o),
     .eop_i        (eop_i),
-    .blk_start_o  (blk_start),
-    .blk_we_o     (blk_we),
-    .blk_lba_o    (blk_lba),
-    .blk_done_i   (blk_done),
-    .blk_err_i    (blk_err),
-    .blk_ready_i  (blk_ready),
-    .blk_count_i  (blk_count),
-    .bbuf_we_i    (bbuf_we),
-    .bbuf_addr_i  (bbuf_addr),
-    .bbuf_wdata_i (bbuf_wdata),
-    .bbuf_rdata_o (bbuf_rdata),
-    .blk1_start_o  (blk1_start),
-    .blk1_we_o     (blk1_we),
-    .blk1_lba_o    (blk1_lba),
-    .blk1_done_i   (blk1_done),
-    .blk1_err_i    (blk1_err),
-    .blk1_ready_i  (blk1_ready),
-    .blk1_count_i  (blk1_count),
-    .bbuf1_we_i    (bbuf1_we),
-    .bbuf1_addr_i  (bbuf1_addr),
-    .bbuf1_wdata_i (bbuf1_wdata),
-    .bbuf1_rdata_o (bbuf1_rdata),
+    .blk_o        (blk_req),
+    .blk_i        (blk_rsp),
+    .blk1_o       (blk1_req),
+    .blk1_i       (blk1_rsp),
     .bus_o        (bus_o),
     .peer_i       (peer_i)
   );
@@ -145,17 +107,8 @@ module wish5380_sd #(
   ) u_sd (
     .clk_i       (clk_i),
     .rst_i       (rst_i),
-    .start_i     (blk_start),
-    .we_i        (blk_we),
-    .lba_i       (blk_lba),
-    .done_o      (blk_done),
-    .err_o       (blk_err),
-    .ready_o     (blk_ready),
-    .count_o     (blk_count),
-    .buf_we_o    (bbuf_we),
-    .buf_addr_o  (bbuf_addr),
-    .buf_wdata_o (bbuf_wdata),
-    .buf_rdata_i (bbuf_rdata),
+    .blk_i       (blk_req),
+    .blk_o       (blk_rsp),
     .sd_clk_o    (sd_clk_o),
     .sd_cs_n_o   (sd_cs_n_o),
     .sd_mosi_o   (sd_mosi_o),
@@ -169,33 +122,18 @@ module wish5380_sd #(
       ) u_sd1 (
         .clk_i       (clk_i),
         .rst_i       (rst_i),
-        .start_i     (blk1_start),
-        .we_i        (blk1_we),
-        .lba_i       (blk1_lba),
-        .done_o      (blk1_done),
-        .err_o       (blk1_err),
-        .ready_o     (blk1_ready),
-        .count_o     (blk1_count),
-        .buf_we_o    (bbuf1_we),
-        .buf_addr_o  (bbuf1_addr),
-        .buf_wdata_o (bbuf1_wdata),
-        .buf_rdata_i (bbuf1_rdata),
+        .blk_i       (blk1_req),
+        .blk_o       (blk1_rsp),
         .sd_clk_o    (sd1_clk_o),
         .sd_cs_n_o   (sd1_cs_n_o),
         .sd_mosi_o   (sd1_mosi_o),
         .sd_miso_i   (sd1_miso_i)
       );
     end else begin : g_no_sd1
-      assign blk1_done  = 1'b0;
-      assign blk1_err   = 1'b0;
-      assign blk1_ready = 1'b0;
-      assign blk1_count = '0;
-      assign bbuf1_we    = 1'b0;
-      assign bbuf1_addr  = '0;
-      assign bbuf1_wdata = '0;
-      assign sd1_clk_o   = 1'b0;
-      assign sd1_cs_n_o  = 1'b1;
-      assign sd1_mosi_o  = 1'b1;
+      assign blk1_rsp   = '0;
+      assign sd1_clk_o  = 1'b0;
+      assign sd1_cs_n_o = 1'b1;
+      assign sd1_mosi_o = 1'b1;
     end
   endgenerate
 

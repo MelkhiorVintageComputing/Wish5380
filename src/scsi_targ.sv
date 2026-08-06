@@ -50,19 +50,13 @@ module scsi_targ #(
   // A whole 512-byte block at a time, through the sector buffer below: the
   // back end fills it before a READ and drains it after a WRITE.  The SCSI
   // side and the back end never reach the buffer at the same time.
-  output logic        blk_start_o,   // one cycle: begin
-  output logic        blk_we_o,      // 1 = write the buffer to the media
-  output logic [31:0] blk_lba_o,
-  input  logic        blk_done_i,    // one cycle: finished
-  input  logic        blk_err_i,     // sampled with blk_done_i
-  input  logic        blk_ready_i,   // media present and initialised
-  input  logic [31:0] blk_count_i,   // capacity, in 512-byte blocks
-
-  // The back end's port into the sector buffer.
-  input  logic        bbuf_we_i,
-  input  logic [8:0]  bbuf_addr_i,
-  input  logic [7:0]  bbuf_wdata_i,
-  output logic [7:0]  bbuf_rdata_o
+  //
+  // `doc/block.md` is the contract.  The back end's port into the sector
+  // buffer travels in the same two structs - its address and write data
+  // arrive in `blk_i`, and the byte it reads leaves in `blk_o`, because the
+  // buffer is on this side.
+  output blk_req_t blk_o,
+  input  blk_rsp_t blk_i
 );
 
   // ---------------------------------------------------------------------------
@@ -128,11 +122,27 @@ module scsi_targ #(
   logic       a_we;
   logic [7:0] a_wdata, a_rdata;
 
+  // The back end's side of the buffer, and the request the state machine
+  // makes of it.  Both are gathered into `blk_o` below rather than written as
+  // struct fields where they are produced, because they come from two
+  // different `always_ff` blocks and a struct driven from two processes is
+  // multiply driven as far as a linter is concerned even though no bit is.
+  logic [7:0]  sbuf_rdata;
+  logic        blk_start, blk_we;
+  logic [31:0] blk_lba;
+
+  always_comb begin
+    blk_o.start     = blk_start;
+    blk_o.we        = blk_we;
+    blk_o.lba       = blk_lba;
+    blk_o.buf_rdata = sbuf_rdata;
+  end
+
   always_ff @(posedge clk_i) begin
     if (a_we) mem[a_addr] <= a_wdata;
-    if (bbuf_we_i) mem[bbuf_addr_i] <= bbuf_wdata_i;
-    a_rdata      <= mem[a_addr];
-    bbuf_rdata_o <= mem[bbuf_addr_i];
+    if (blk_i.buf_we) mem[blk_i.buf_addr] <= blk_i.buf_wdata;
+    a_rdata    <= mem[a_addr];
+    sbuf_rdata <= mem[blk_i.buf_addr];
   end
 
   // ---------------------------------------------------------------------------
@@ -230,7 +240,7 @@ module scsi_targ #(
   // ---------------------------------------------------------------------------
 
   logic [31:0] last_lba;
-  assign last_lba = (blk_count_i == 32'd0) ? 32'd0 : (blk_count_i - 32'd1);
+  assign last_lba = (blk_i.count == 32'd0) ? 32'd0 : (blk_i.count - 32'd1);
 
   logic [2:0] vend_i;
   logic [3:0] prod_i;
@@ -302,9 +312,9 @@ module scsi_targ #(
         unique case (idx[3:0])
           4'd0:  resp = 8'd11;               // length of what follows
           4'd3:  resp = 8'd8;                // block descriptor length
-          4'd5:  resp = blk_count_i[23:16];
-          4'd6:  resp = blk_count_i[15:8];
-          4'd7:  resp = blk_count_i[7:0];
+          4'd5:  resp = blk_i.count[23:16];
+          4'd6:  resp = blk_i.count[15:8];
+          4'd7:  resp = blk_i.count[7:0];
           4'd10: resp = 8'h02;               // 512 again
           default: resp = 8'h00;
         endcase
@@ -380,7 +390,7 @@ module scsi_targ #(
                      ((bus_i.data & ID_MASK) != 8'h00);
 
   logic media_fault;
-  assign media_fault = blk_done_i && blk_err_i;
+  assign media_fault = blk_i.done && blk_i.err;
 
   // ---------------------------------------------------------------------------
   // The sequencer
@@ -407,11 +417,11 @@ module scsi_targ #(
       sense_asc   <= 8'h00;
       sense_ascq  <= 8'h00;
       sense_lba   <= '0;
-      blk_start_o <= 1'b0;
-      blk_we_o    <= 1'b0;
-      blk_lba_o   <= '0;
+      blk_start <= 1'b0;
+      blk_we    <= 1'b0;
+      blk_lba   <= '0;
     end else begin
-      blk_start_o <= 1'b0;
+      blk_start <= 1'b0;
 
       // A bus reset outranks everything: release the bus and forget the
       // command.  This is the target's side of what the 5380 does with RST.
@@ -544,7 +554,7 @@ module scsi_targ #(
                 end
 
                 C_READ_CAPACITY: begin
-                  if (!blk_ready_i) begin
+                  if (!blk_i.ready) begin
                     sense_key  <= SK_NOT_READY;
                     sense_asc  <= ASC_MEDIUM_NOT_PRESENT;
                     sense_ascq <= 8'h00;
@@ -564,7 +574,7 @@ module scsi_targ #(
                 end
 
                 C_TEST_UNIT_READY: begin
-                  if (!blk_ready_i) begin
+                  if (!blk_i.ready) begin
                     sense_key  <= SK_NOT_READY;
                     sense_asc  <= ASC_MEDIUM_NOT_PRESENT;
                     sense_ascq <= 8'h00;
@@ -597,13 +607,13 @@ module scsi_targ #(
                     sense_ascq <= 8'h00;
                     status     <= ST_CHECK;
                     st         <= S_STATUS;
-                  end else if (!blk_ready_i) begin
+                  end else if (!blk_i.ready) begin
                     sense_key  <= SK_NOT_READY;
                     sense_asc  <= ASC_MEDIUM_NOT_PRESENT;
                     sense_ascq <= 8'h00;
                     status     <= ST_CHECK;
                     st         <= S_STATUS;
-                  end else if (({8'd0, cmd_blocks} + cmd_lba) > blk_count_i) begin
+                  end else if (({8'd0, cmd_blocks} + cmd_lba) > blk_i.count) begin
                     sense_key  <= SK_ILLEGAL_REQUEST;
                     sense_asc  <= ASC_LBA_OUT_OF_RANGE;
                     sense_ascq <= 8'h00;
@@ -616,9 +626,9 @@ module scsi_targ #(
                     resp_kind <= R_MEDIA;
                     xfer_len  <= 10'd512;
                     if (cdb_is_read) begin
-                      blk_lba_o   <= cmd_lba;
-                      blk_we_o    <= 1'b0;
-                      blk_start_o <= 1'b1;
+                      blk_lba   <= cmd_lba;
+                      blk_we    <= 1'b0;
+                      blk_start <= 1'b1;
                       st          <= S_RDWAIT;
                     end else begin
                       st <= S_DATAOUT;
@@ -638,7 +648,7 @@ module scsi_targ #(
               sense_lba  <= lba;
               status     <= ST_CHECK;
               st         <= S_STATUS;
-            end else if (blk_done_i) begin
+            end else if (blk_i.done) begin
               idx <= '0;
               hs  <= H_SETUP;
               st  <= S_DATAIN;
@@ -654,7 +664,7 @@ module scsi_targ #(
               sense_lba  <= lba;
               status     <= ST_CHECK;
               st         <= S_STATUS;
-            end else if (blk_done_i) begin
+            end else if (blk_i.done) begin
               if (blk_left == 24'd1) begin
                 st <= S_STATUS;
               end else begin
@@ -682,9 +692,9 @@ module scsi_targ #(
                   if (resp_kind == R_MEDIA && blk_left != 24'd1) begin
                     blk_left    <= blk_left - 24'd1;
                     lba         <= lba + 32'd1;
-                    blk_lba_o   <= lba + 32'd1;
-                    blk_we_o    <= 1'b0;
-                    blk_start_o <= 1'b1;
+                    blk_lba   <= lba + 32'd1;
+                    blk_we    <= 1'b0;
+                    blk_start <= 1'b1;
                     st          <= S_RDWAIT;
                   end else begin
                     st <= S_STATUS;
@@ -706,9 +716,9 @@ module scsi_targ #(
                 if (idx + 10'd1 == xfer_len) begin
                   idx <= '0;
                   if (resp_kind == R_MEDIA) begin
-                    blk_lba_o   <= lba;
-                    blk_we_o    <= 1'b1;
-                    blk_start_o <= 1'b1;
+                    blk_lba   <= lba;
+                    blk_we    <= 1'b1;
+                    blk_start <= 1'b1;
                     st          <= S_WRWAIT;
                   end else begin
                     st <= S_STATUS;

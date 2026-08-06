@@ -91,6 +91,21 @@ bus: an external DMA controller or the CPU itself moves every byte.  There is
 therefore no Wishbone master anywhere in this design, which is the single
 biggest difference from the sibling projects.
 
+It crosses module boundaries as two packed structs, `wb_req_t` and `wb_rsp_t`,
+declared beside `scsi_t` in `src/wish5380_pkg.sv`.  A SystemVerilog interface
+with modports is what this ought to be and is not usable: Icarus 11 will not
+parse an interface port and Yosys 0.23 elaborates one into a disconnected
+netlist without complaining, so `make synth` would pass while checking
+nothing.  `doc/block.md` sets that out in full, since the same reasoning
+governs the block back end.
+
+**The two testbench tops keep the signals flat** - `tb/sv/tb_top.sv` and
+`cosim/rtl/rtl_top.sv` both take the struct apart at their own ports.  The
+C++ models on the other side hold a pointer per signal, and Verilator
+presents a packed struct as one wide vector; a model that had to be told a
+field's bit position would drift from the RTL silently.  That is the same
+reason `scsi_t` is unpacked there, and it is a rule for anything added later.
+
 ### Three apertures, because the Mac has three
 
 NetBSD's `sbc_obio.c` names them (lines 60-74), and they are the model here:
@@ -209,7 +224,12 @@ one.  It is the only place the register file needs to see the bus at all, and
 
 ## The block back end
 
-`scsi_targ` reaches storage through a 512-byte sector buffer and four signals -
+**`doc/block.md` is this interface's own contract** - the handshake, the three
+rules a back end can break without anything reporting an error, and who owns
+the sector buffer when.  What follows is why it exists; that document is what
+it is.
+
+`scsi_targ` reaches storage through a 512-byte sector buffer and four fields -
 start, direction, block address, done - and never talks to a card itself.  The
 back end fills the buffer before a READ and drains it after a WRITE, through
 its own port on the same dual-ported memory; the two sides never touch it at

@@ -47,15 +47,8 @@ module wish5380_wb #(
   input  logic rst_i,
 
   // ---- Wishbone B4 classic slave -----------------------------------------
-  input  logic        wb_cyc_i,
-  input  logic        wb_stb_i,
-  input  logic        wb_we_i,
-  input  logic [3:0]  wb_sel_i,
-  input  logic [29:0] wb_adr_i,
-  input  logic [31:0] wb_dat_i,
-  output logic [31:0] wb_dat_o,
-  output logic        wb_ack_o,
-  output logic        wb_err_o,
+  input  wb_req_t wb_i,
+  output wb_rsp_t wb_o,
 
   // ---- the part's own pins -----------------------------------------------
   output logic irq_o,
@@ -64,32 +57,15 @@ module wish5380_wb #(
 
   // ---- the block back end behind each target -----------------------------
   //
-  // The second set is driven low and ignored when TARGETS is one.
-  output logic        blk_start_o,
-  output logic        blk_we_o,
-  output logic [31:0] blk_lba_o,
-  input  logic        blk_done_i,
-  input  logic        blk_err_i,
-  input  logic        blk_ready_i,
-  input  logic [31:0] blk_count_i,
-  input  logic        bbuf_we_i,
-  input  logic [8:0]  bbuf_addr_i,
-  input  logic [7:0]  bbuf_wdata_i,
-  output logic [7:0]  bbuf_rdata_o,
+  // One pair per drive; `doc/block.md` is the contract.  The second pair is
+  // driven low and ignored when TARGETS is one.
+  output blk_req_t blk_o,
+  input  blk_rsp_t blk_i,
 
-  // Nothing reads these when there is no second target to read them for.
+  // Nothing reads this when there is no second target to read it for.
+  output blk_req_t blk1_o,
   /* verilator lint_off UNUSEDSIGNAL */
-  output logic        blk1_start_o,
-  output logic        blk1_we_o,
-  output logic [31:0] blk1_lba_o,
-  input  logic        blk1_done_i,
-  input  logic        blk1_err_i,
-  input  logic        blk1_ready_i,
-  input  logic [31:0] blk1_count_i,
-  input  logic        bbuf1_we_i,
-  input  logic [8:0]  bbuf1_addr_i,
-  input  logic [7:0]  bbuf1_wdata_i,
-  output logic [7:0]  bbuf1_rdata_o,
+  input  blk_rsp_t blk1_i,
   /* verilator lint_on UNUSEDSIGNAL */
 
   // ---- the private SCSI bus, for debug -----------------------------------
@@ -118,15 +94,8 @@ module wish5380_wb #(
   ) u_glue (
     .clk_i    (clk_i),
     .rst_i    (rst_i),
-    .wb_cyc_i (wb_cyc_i),
-    .wb_stb_i (wb_stb_i),
-    .wb_we_i  (wb_we_i),
-    .wb_sel_i (wb_sel_i),
-    .wb_adr_i (wb_adr_i),
-    .wb_dat_i (wb_dat_i),
-    .wb_dat_o (wb_dat_o),
-    .wb_ack_o (wb_ack_o),
-    .wb_err_o (wb_err_o),
+    .wb_i     (wb_i),
+    .wb_o     (wb_o),
     .stb_o    (stb),
     .we_o     (we),
     .dack_o   (dack),
@@ -165,17 +134,8 @@ module wish5380_wb #(
     .rst_i        (rst_i),
     .drive_o      (targ_drive),
     .bus_i        (bus),
-    .blk_start_o  (blk_start_o),
-    .blk_we_o     (blk_we_o),
-    .blk_lba_o    (blk_lba_o),
-    .blk_done_i   (blk_done_i),
-    .blk_err_i    (blk_err_i),
-    .blk_ready_i  (blk_ready_i),
-    .blk_count_i  (blk_count_i),
-    .bbuf_we_i    (bbuf_we_i),
-    .bbuf_addr_i  (bbuf_addr_i),
-    .bbuf_wdata_i (bbuf_wdata_i),
-    .bbuf_rdata_o (bbuf_rdata_o)
+    .blk_o        (blk_o),
+    .blk_i        (blk_i)
   );
 
   // The second drive.  A board that carries one leaves it out entirely rather
@@ -195,24 +155,12 @@ module wish5380_wb #(
         .rst_i        (rst_i),
         .drive_o      (targ1_drive),
         .bus_i        (bus),
-        .blk_start_o  (blk1_start_o),
-        .blk_we_o     (blk1_we_o),
-        .blk_lba_o    (blk1_lba_o),
-        .blk_done_i   (blk1_done_i),
-        .blk_err_i    (blk1_err_i),
-        .blk_ready_i  (blk1_ready_i),
-        .blk_count_i  (blk1_count_i),
-        .bbuf_we_i    (bbuf1_we_i),
-        .bbuf_addr_i  (bbuf1_addr_i),
-        .bbuf_wdata_i (bbuf1_wdata_i),
-        .bbuf_rdata_o (bbuf1_rdata_o)
+        .blk_o        (blk1_o),
+        .blk_i        (blk1_i)
       );
     end else begin : g_no_targ1
-      assign targ1_drive  = '0;
-      assign blk1_start_o = 1'b0;
-      assign blk1_we_o    = 1'b0;
-      assign blk1_lba_o   = '0;
-      assign bbuf1_rdata_o = '0;
+      assign targ1_drive = '0;
+      assign blk1_o      = '0;
     end
   endgenerate
 

@@ -12,6 +12,7 @@ from.  The second is the authority and the first defers to it.
 | where does a register sit in a machine's address space | [`interface.md`](interface.md) |
 | what does the disk answer to | [`target.md`](target.md) |
 | how does the card come up | [`sd.md`](sd.md) |
+| what does storage look like to the target | [`block.md`](block.md) |
 | why does each drive get a whole card | [`storage.md`](storage.md) |
 | does a real driver actually work against this | [`../cosim/README.md`](../cosim/README.md) |
 | why is the RTL like that | the comment beside it, which cites the page |
@@ -22,6 +23,7 @@ from.  The second is the authority and the first defers to it.
 |---|---|
 | [`interface.md`](interface.md) | **the contract between `src/` and `tb/`.**  The register port, the Wishbone slave and its three windows, the internal SCSI bus, and the delays a clockless part leaves a clocked replica to count.  Anything that changes one of those changes the RTL, the testbench and that document together |
 | [`target.md`](target.md) | the SCSI target behind the fabric: the command set it answers, three rules that are easy to get subtly wrong, and what it deliberately does not do |
+| [`block.md`](block.md) | **the one interface in the design with no external authority behind it**, so it is written down here: the seam between `scsi_targ` and whatever holds the bytes.  The handshake, three rules a back end can break silently, who owns the sector buffer, and which parts of `storage.md` land on it |
 | [`sd.md`](sd.md) | the SD card behind the block interface: SPI mode, the order a card has to be brought up in, the two capacity layouts, and which CRC is checked and which is not |
 | [`storage.md`](storage.md) | one card per drive, and whether it should stay that way.  A survey of the five devices that solved this before us, and what of it is worth adopting.  Argument only - none of it is implemented |
 | [`../cosim/README.md`](../cosim/README.md) | co-simulation: an unmodified Linux booting off the RTL, and why the guest is not a Macintosh when the whole design was built for one |
@@ -35,7 +37,7 @@ from.  The second is the authority and the first defers to it.
 | [`NCR5380_design_manual_May85.pdf`](NCR5380_design_manual_May85.pdf) | the same manual ten months earlier, before the 53C80 appendix.  Kept as a check on the scan |
 | [`NCR53C400.pdf`](NCR53C400.pdf) | the 53C400, a 5380 with a block-move engine and a 128-byte buffer wrapped around it.  Not implemented; here because Linux's `g_NCR5380.c` supports one and the register names leak into `NCR5380.h` |
 | [`NCR_SCSI_Engineering_Notebook_Rev2_Oct85.pdf`](NCR_SCSI_Engineering_Notebook_Rev2_Oct85.pdf) | NCR's own application notes on SCSI bus behaviour, useful for the phases and the timings the chip leaves to software |
-| [`drivers/`](drivers/README.md) | unmodified drivers for the real chip, from three independent families - Linux, NetBSD, and Sun's own for the machine the co-simulation boots.  They keep their own licences; nothing in `src/` or `tb/` is derived from them |
+| [`drivers/`](drivers/README.md) | unmodified drivers for the real chip, from four independent families - Linux, NetBSD, Sun's own for the machine the co-simulation boots, and EmuTOS.  They keep their own licences; nothing in `src/` or `tb/` is derived from them |
 
 Both design manuals are scans from [bitsavers](https://www.bitsavers.org/components/ncr_symbios/scsi/5380/)
 and are legible throughout; the register sections in particular are clean.
