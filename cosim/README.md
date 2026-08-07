@@ -172,14 +172,15 @@ cosim/scripts/run-sun3.py --image work/tme-run/sun3-80s.img -t 14000 -i 5000 \
     'b sd()'
 ```
 
-**Restore the image from `work/sun3/sunos-80s-pristine.img` between runs.**  A
+**The guest writes to a copy**, `<image>-run.<ext>` beside the one `--image`
+names; `--keep` gives it the original instead.  That is not tidiness.  A
 co-simulation that exits cleanly writes the card back over the image it was
 given - `wish_rtl_free` calls `wish_rtl_flush` - while one that is killed does
-not, because `run-sun3.py` ends QEMU with `SIGKILL`.  So whether a run mutates
-its own input depends on how it happened to die, which is no basis for
-comparing two runs.  `run-cosim.py` already avoids this for the ISA card by
-copying to `card-run.img` and keeping it only for `--keep`; the Sun-3 path has
-no such copy yet, and until it does the copy is the caller's job.
+not, because `run-sun3.py` ends QEMU with `SIGKILL`.  So without the copy,
+whether a run changed what the next one started from depended on how it
+happened to die, which is no basis for comparing two runs of anything - least
+of all an intermittent fault.  `run-cosim.py` does the same for the ISA card's
+`card-run.img`.
 
 A run that has to survive a long silence - `fsck` says nothing for minutes -
 wants `-i` raised; it gives up after a minute by default, and `-t` ends the

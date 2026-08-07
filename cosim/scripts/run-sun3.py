@@ -20,6 +20,15 @@ what the guest asked.  Each rule is `PATTERN:=TEXT`, they fire in the order
 given, once each, and the pattern is a Python regular expression matched
 against the console as it arrives.
 
+**The guest writes to a copy**, `<image>-run.<ext>` beside the one --image
+names, so a run does not change what the next one starts from; --keep gives
+it the original instead.  This matters more than it looks: the library loads
+the image at startup and writes it back from wish_rtl_flush, so a run that
+ends cleanly rewrites the disk while a run that is killed does not - and this
+script kills QEMU.  Whether two runs of the same command started from the same
+disk therefore depended on how the first one happened to die.  run-cosim.py
+does the same thing for the ISA card's image and for the same reason.
+
 There is a script very like this one in the QEMU fork.  This is not a copy for
 its own sake: that one hardwires its own build directory and knows nothing
 about the shared library, and it is not ours to change.
@@ -35,6 +44,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import sys
 import time
 
@@ -69,6 +79,9 @@ def main():
                                                   'libwish5380rtl.so'))
     ap.add_argument('--image', default=os.path.join(ROOT, 'work', 'sun3',
                                                     'disk.img'))
+    ap.add_argument('--keep', action='store_true',
+                    help='let the guest write to --image itself, instead of '
+                         'to a copy beside it')
     ap.add_argument('-s', '--send', action='append', default=[],
                     metavar='PATTERN:=TEXT',
                     help='type TEXT when PATTERN appears; may be repeated, '
@@ -102,8 +115,21 @@ def main():
         if not os.path.exists(args.rtl):
             sys.exit(f'RTL library missing: {args.rtl} - make -C cosim/rtl')
         machine += f',si-rtl={args.rtl}'
-        if os.path.exists(args.image):
-            machine += f',si-image={args.image}'
+        image = args.image
+        if os.path.exists(image) and not args.keep:
+            # A run should not change what the next one starts from.  The
+            # library loads the image at startup and writes it back from
+            # wish_rtl_flush, which wish_rtl_free calls - so a run that ends
+            # cleanly rewrites the disk and a run that is killed does not,
+            # and this script kills QEMU.  Two runs of the same command were
+            # therefore not starting from the same disk, which is no way to
+            # chase an intermittent fault.
+            base, ext = os.path.splitext(image)
+            run = base + '-run' + ext
+            shutil.copyfile(image, run)
+            image = run
+        if os.path.exists(image):
+            machine += f',si-image={image}'
 
     # Guest time has to come from somewhere, and the wall clock is the wrong
     # place: a Verilated 5380 answers far slower than the part, so a guest

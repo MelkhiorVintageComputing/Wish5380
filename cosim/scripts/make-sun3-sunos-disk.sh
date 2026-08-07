@@ -177,6 +177,6 @@ echo
 echo "Boot it with:"
 echo "  cosim/scripts/run-sun3.py --image $RUNDIR/$IMG -t 14000 -i 5000 'b sd()'"
 echo
-echo "Restore from the pristine copy between runs.  A co-simulation that exits"
-echo "cleanly writes the image back; one that is killed does not, so what the"
-echo "next run starts from otherwise depends on how the last one died."
+echo "run-sun3.py writes to that image's -run copy rather than to the image"
+echo "itself, so every run starts from the same disk.  The pristine copy is"
+echo "the second line of defence, for whatever writes to the original anyway."
