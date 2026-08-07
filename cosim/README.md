@@ -173,14 +173,45 @@ cosim/scripts/run-sun3.py --image work/tme-run/sun3-80s.img -t 14000 -i 5000 \
 ```
 
 **The guest writes to a copy**, `<image>-run.<ext>` beside the one `--image`
-names; `--keep` gives it the original instead.  That is not tidiness.  A
-co-simulation that exits cleanly writes the card back over the image it was
-given - `wish_rtl_free` calls `wish_rtl_flush` - while one that is killed does
-not, because `run-sun3.py` ends QEMU with `SIGKILL`.  So without the copy,
-whether a run changed what the next one started from depended on how it
-happened to die, which is no basis for comparing two runs of anything - least
-of all an intermittent fault.  `run-cosim.py` does the same for the ISA card's
-`card-run.img`.
+names; `--keep` gives it the original instead, and `run-cosim.py` does the
+same for the ISA card's `card-run.img`.  That is not tidiness: a run's writes
+reach the disk image, so without the copy every run would change what the next
+one started from, which is no basis for comparing two runs of anything - least
+of all an intermittent fault.
+
+Getting those writes to arrive at all took two goes, and both wrong turns are
+worth knowing because each looked right.  The card is written back by
+`wish_rtl_flush`, which `wish_rtl_free` calls, which the board reaches through
+`qemu_add_exit_notifier` - **and an exit notifier does not run when the
+process is killed with signal 9**, which is what this script used to do.  So
+no Sun-3 guest's writes had ever reached an image, and `--keep` had never kept
+anything.  The teardown believed it was asking QEMU to quit first, by writing
+`Ctrl-a x` and sleeping 200 ms; that never had a hope either, because the
+console is `-serial stdio` and not `mon:stdio`, so there is no monitor on that
+line and the two bytes went to the guest as data.  The first fix replaced only
+the 200 ms with a proper wait and changed nothing, because the quit request
+was never delivered.  It sends `SIGTERM` now - which QEMU turns into an
+orderly shutdown that does run its exit notifiers - and waits for the process,
+draining the console so a QEMU blocked on a full pty cannot stall its own
+teardown.  `SIGKILL` remains the backstop.
+
+Checked against a full boot rather than a short one, which matters: a run
+stopped shortly after root is mounted changes 152 bytes and exercises almost
+nothing of a 170000-block writeback.  A boot all the way to the login prompt
+changes **1077695**, across logs, `utmp`, `mtab`, inode access times and the
+cylinder-group summaries, and the flushed image still holds its label, its
+partition table, its boot block, its `fstab` and its root directory, with
+`/vmunix`, `/usr/etc/init` and `/dev/console` all present and 30.1 MB used of
+62.3.  The original's checksum is unchanged; with `--keep` the named image
+changes and no copy is made.
+
+One consequence of the flush now working.  The run copy left behind is a
+**crash-consistent snapshot of a running system** - SunOS was multi-user when
+`SIGTERM` arrived, so its filesystem is legitimately dirty.  That is correct
+and not a defect, and it is harmless only because every run starts from a
+fresh copy of the original.  Booting that leftover copy directly, with fsck
+switched off by the fstab pass field, is precisely the situation that produced
+`panic: ialloc: dup alloc` under *Where it stops*.
 
 A run that has to survive a long silence - `fsck` says nothing for minutes -
 wants `-i` raised; it gives up after a minute by default, and `-t` ends the
@@ -193,7 +224,7 @@ system**, and the two guests are not in the same class:
 | guest | what works | how far it gets |
 |---|---|---|
 | NetBSD 10.1 INSTALL | `-t 1500 -i 900` | root on `sd0a`, ffs, sysinst's prompt and a root shell |
-| SunOS 4.1.1 | `-t 3400 -i 1800` | `sd0 at si0 slave 0`, root, swap and dump, `/usr/etc/init`, `checking filesystems` |
+| SunOS 4.1.1 | `-t 14000 -i 5000` | all of `/etc/rc` and a login prompt, in about four hours |
 
 SunOS is the expensive one and the kernel load is why: `vmunix` is 893160
 bytes and every one of them crosses the Verilated chip, which on its own
@@ -757,9 +788,12 @@ booted past that point both before and after.  It is only visible with fsck
 switched off in fstab - not because skipping the check causes it, but because
 the check had been repairing whatever it is, silently, every boot.  Nothing
 rules out the chip here: a lost or misapplied write during the boot's first
-writes would look exactly like this, and the co-simulation cannot have
-inherited the damage from a previous run, because a run that is killed never
-writes the image back at all.
+writes would look exactly like this, and the damage cannot have been inherited
+from an earlier run.  It could not then, because the writeback was broken at
+the time and no run had ever changed an image; and it cannot now, because
+every run starts from a fresh copy.  Four later boots from the same pristine
+image all reached a login prompt without it, so it is an outlier rather than
+something that happens on the way past `checking filesystems`.
 
 **`Can't invoke /usr/etc/init, error 2`**, on an image where that file
 demonstrably exists - `ffs.py` reads it straight out of the disk at inode
