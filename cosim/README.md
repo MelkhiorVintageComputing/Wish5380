@@ -516,11 +516,43 @@ are all absent from the binary - so it runs five phases however the filesystem
 was unmounted.  Skipping it is safe only because the image is rebuilt from the
 tape and restored from a pristine copy rather than maintained in place.
 
-With that done SunOS runs essentially the whole of `/etc/rc` off the chip:
-quotas, `portmap ypbind keyserv ypupdated routed`, `biod`, the system logger,
-`auditd sendmail statd lockd`, the link-editor cache, `/tmp`, and the standard
-daemons.  It is slow - hours, most of it network daemons timing out against a
-machine with no network - and no run has yet reached `login:`.
+With that done **SunOS 4.1.1 boots to a login prompt off the Verilated
+chip**, all of `/etc/rc` and out the other side:
+
+```
+starting rpc and net services: portmap ypbind keyserv ypupdated routed.
+starting additional services: biod.
+starting system logger
+starting local daemons: auditd sendmail statd lockd
+link-editor directory cache
+clearing /tmp
+standard daemons: update cron.
+starting network daemons: inetd printer.
+Thu Aug  6 18:51:07 GMT 2026
+
+Amnesiac login:
+```
+
+`Amnesiac` is SunOS's own default hostname when it cannot find one, which is
+correct for a machine with no `/etc/hostname.le0` and no NIS.
+
+It takes about four hours, and most of that is not storage: the network
+daemons each burn their timeouts against a machine with no network, and the
+`ypbind`, `sendmail` and `automount` stages account for the long silences.
+Two runs from the same pristine image tracked each other closely - root
+mounted at +138 s, `/etc/rc` starting at ~+2250 s, the local daemons at
+~+4330 s, the network daemons at ~+10500 s.
+
+**The prompt arrives with its high bit set** - `A\355\356e\363i\341c...` in
+the raw log - and it is not corruption.  `getty` sets the console to seven
+bits and a parity bit from `/etc/ttytab`, the emulated line carries all eight
+through, and the parity bit lands in the top one.  Mask it off and the text is
+clean ASCII.  Worth knowing before anyone reads the tail of a log and concludes
+the data path is dropping bits.
+
+Seven `I/O request timeout`s and six `lost interrupt`s along the way, all of
+them recovered from.  They cost real time and they are the first entry under
+*Where it stops*; they did not stop the boot.
 
 Five things about that install are worth writing down, because none of them
 is in anyone's instructions:
