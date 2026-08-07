@@ -53,6 +53,13 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 SUN3 = os.environ.get('SUN3_QEMU', os.path.join(ROOT, 'work', 'sun3-qemu'))
 FORK = os.environ.get('SUN3_FORK', os.path.expanduser('~/qemu-sun3'))
 
+# How long QEMU is given to quit of its own accord before it is killed.  This
+# is a flush window, not politeness: the library writes the card back over the
+# disk image from `wish_rtl_flush`, which runs on the device's teardown, and
+# for the 83 MB SunOS disk that is 170000 blocks to walk out of the model and
+# write.  Generous on purpose - it costs nothing when QEMU exits at once.
+FLUSH_GRACE = 30.0
+
 SPINNER = re.compile(rb'[\b]|[-\\|/]{3,}')
 
 
@@ -225,17 +232,46 @@ def main():
             if not pending and last_sent and time.time() - last_out > args.idle:
                 break
     finally:
+        # SIGTERM, and then wait for it.  QEMU turns SIGTERM into an orderly
+        # shutdown that runs its exit notifiers, and the board registers one
+        # that calls wish_rtl_free - which is what writes the card back over
+        # the disk image.  SIGKILL cannot run it, so for a long time the
+        # guest's writes went nowhere and `--keep` kept nothing, silently.
+        #
+        # This used to write Ctrl-a x here and sleep 200 ms, which never had a
+        # hope: the console is `-serial stdio` and not `mon:stdio`, so there
+        # is no monitor on it and those two bytes went to the guest as data.
+        #
+        # The console is drained while waiting, because a QEMU blocked writing
+        # to a full pty would never reach its teardown at all.  SIGKILL stays
+        # as the backstop.
         try:
-            os.write(fd, b'\x01x')      # Ctrl-a x
-            time.sleep(0.2)
+            os.kill(pid, 15)
         except OSError:
             pass
+        gone = False
+        deadline = time.time() + FLUSH_GRACE
+        while time.time() < deadline:
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    gone = True
+                    break
+            except OSError:      # already reaped
+                gone = True
+                break
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    log += os.read(fd, 4096)
+                except OSError:
+                    pass
         os.close(fd)
-        try:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
-        except OSError:
-            pass
+        if not gone:
+            try:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
 
     text = log.decode('utf-8', 'replace')
     missing = [p for p in args.wait_for if not re.search(p, text)]
