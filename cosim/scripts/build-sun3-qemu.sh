@@ -1,10 +1,16 @@
 #!/bin/bash
-# Build a QEMU with the Sun-3/60 machine and our onboard SCSI board.
+# Build the QEMU the co-simulation uses: the Sun-3/60 with its onboard SCSI
+# board, and the i386 PC with the ISA card, from one tree.
+#
+# Two machines, one build.  Both boards model the same NCR 5380 behind
+# different glue and share the library that carries it, so a second QEMU to
+# hold the second board bought nothing and cost a file that had to exist
+# twice.  Hence one clone, one patch series, and two binaries.
 #
 # The Sun-3 machine model is not ours: it lives in a separate fork, together
 # with the PROM images and the conventions for recording changes to it.  This
 # script clones that fork's already-patched tree into work/, applies the
-# patchset kept in cosim/patches/sun3/, and builds - so nothing in the fork is
+# patchset kept in cosim/patches/qemu/, and builds - so nothing in the fork is
 # touched and no QEMU sources are kept here.
 #
 # Usage: cosim/scripts/build-sun3-qemu.sh [-f] [-d]
@@ -19,7 +25,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 FORK="${SUN3_FORK:-$HOME/qemu-sun3}"
 WORK="$ROOT/work/sun3-qemu"
-PATCHES="$ROOT/cosim/patches/sun3"
+PATCHES="$ROOT/cosim/patches/qemu"
 
 FRESH=0
 DEBUG=()
@@ -27,7 +33,7 @@ while getopts "fdh" opt; do
     case "$opt" in
         f) FRESH=1 ;;
         d) DEBUG=(--enable-debug) ;;
-        h) sed -n '2,14p' "$0"; exit 0 ;;
+        h) sed -n '2,21p' "$0"; exit 0 ;;
         *) exit 1 ;;
     esac
 done
@@ -61,13 +67,14 @@ if [ ! -f "$WORK/build/config-host.mak" ]; then
     echo "== configuring"
     mkdir -p "$WORK/build"
     (cd "$WORK/build" && ../configure \
-        --target-list=m68k-softmmu --disable-docs --disable-werror \
+        --target-list=m68k-softmmu,i386-softmmu \
+        --disable-docs --disable-werror \
         "${DEBUG[@]}")
 fi
 
 echo "== building"
-(cd "$WORK/build" && ninja qemu-system-m68k)
+(cd "$WORK/build" && ninja qemu-system-m68k qemu-system-i386)
 
 echo
-echo "built $WORK/build/qemu-system-m68k"
-echo "run it with: cosim/scripts/run-sun3.py"
+echo "built $WORK/build/qemu-system-m68k  - run with cosim/scripts/run-sun3.py"
+echo "built $WORK/build/qemu-system-i386  - run with cosim/scripts/run-cosim.py"

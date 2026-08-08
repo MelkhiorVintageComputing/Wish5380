@@ -26,7 +26,8 @@ WORK = pathlib.Path(os.environ.get("WORK", ROOT / "work"))
 KERNEL = WORK / "linux-build" / "arch" / "x86" / "boot" / "bzImage"
 CARD = WORK / "images" / "card.img"
 LIB = WORK / "lib" / "libwish5380rtl.so"
-QEMU = WORK / "qemu-install" / "bin" / "qemu-system-i386"
+# The same tree that carries the Sun-3 machine: one QEMU builds both boards.
+QEMU = WORK / "sun3-qemu" / "build" / "qemu-system-i386"
 
 PORT = 0x350
 IRQ = 5
@@ -48,7 +49,7 @@ def main() -> int:
     for p in (KERNEL, CARD, LIB, QEMU):
         if not p.exists():
             print(f"missing {p}", file=sys.stderr)
-            print("run fetch-qemu.sh, build-qemu.sh and build-guest.sh first",
+            print("run build-sun3-qemu.sh and build-guest.sh first",
                   file=sys.stderr)
             return 2
 

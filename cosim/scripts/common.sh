@@ -10,21 +10,18 @@ ROOT_DIR="$(cd "$COSIM_DIR/.." && pwd)"
 # these scripts are what put it back.
 WORK="${WORK:-$ROOT_DIR/work}"
 DOWNLOADS="$WORK/downloads"
-QEMU_SRC="$WORK/qemu-src"
-QEMU_PRISTINE="$WORK/qemu-pristine"
-QEMU_BUILD="$WORK/qemu-build"
-QEMU_PREFIX="$WORK/qemu-install"
+
+# One QEMU, two machines.  The ISA card and the Sun-3 board model the same
+# part behind different glue and share the library that carries it, so they
+# are built from one tree by build-sun3-qemu.sh - which is why there is no
+# fetch-qemu.sh and no release tarball here any more.
+QEMU_SRC="$WORK/sun3-qemu"
+QEMU_BUILD="$QEMU_SRC/build"
+
 LINUX_SRC="$WORK/linux-src"
 LINUX_BUILD="$WORK/linux-build"
 IMAGES="$WORK/images"
 LIBDIR="$WORK/lib"
-
-# The version Debian 12 ships, so a build from source can be compared against a
-# known good binary of exactly the same thing.
-QEMU_VERSION="7.2.22"
-QEMU_TARBALL="qemu-$QEMU_VERSION.tar.xz"
-QEMU_URL="https://download.qemu.org/$QEMU_TARBALL"
-QEMU_TARBALL_SHA512="c4ca21ab13d73d58f220d6059b404aad7ee3247bd26a395bb58f7907ebd796946e923d01831f12a5781772c6d493082e6df40465aa98a215ce530dbed8aac09b"
 
 # A longterm kernel, built for i386 because CONFIG_ISA exists only there:
 # arch/x86/Kconfig puts `config ISA` inside `if X86_32`, so an ISA card cannot
@@ -45,8 +42,8 @@ CARD_PORT="${CARD_PORT:-0x350}"
 CARD_IRQ="${CARD_IRQ:-5}"
 
 qemu_bin() {
-    if [ -x "$QEMU_PREFIX/bin/qemu-system-i386" ]; then
-        echo "$QEMU_PREFIX/bin/qemu-system-i386"
+    if [ -x "$QEMU_BUILD/qemu-system-i386" ]; then
+        echo "$QEMU_BUILD/qemu-system-i386"
     else
         command -v qemu-system-i386
     fi

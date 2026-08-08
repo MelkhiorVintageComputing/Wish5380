@@ -38,8 +38,7 @@ traffic goes the other way.
 cosim/scripts/check-deps.sh      # reports what is missing; installs nothing
 make -C cosim/rtl                # build work/lib/libwish5380rtl.so
 make -C cosim/rtl check          # drive it with no emulator in the loop
-cosim/scripts/fetch-qemu.sh      # download, verify, unpack, apply patches/
-cosim/scripts/build-qemu.sh      # i386-softmmu only, into work/qemu-install
+cosim/scripts/build-sun3-qemu.sh # one QEMU, both machines: m68k and i386
 cosim/scripts/build-guest.sh     # an i386 Linux, and a card image for it
 cosim/scripts/run-cosim.py       # the verdict
 
@@ -150,8 +149,14 @@ Am9516 Universal DMA Controller doing exactly that, and a boot PROM that uses
 it.
 
 Mainline QEMU has no Sun-3.  The machine model lives in a separate fork under
-separate ownership, which nothing here modifies; `cosim/patches/sun3/` holds
+separate ownership, which nothing here modifies; `cosim/patches/qemu/` holds
 what has to be added to it and `cosim/patches/README.md` explains the shape.
+
+That series carries the ISA card too.  Both boards model the same part behind
+different glue and load the same shared library to carry it, so building a
+second QEMU to hold the second board bought nothing and cost a file that had
+to exist twice.  `build-sun3-qemu.sh` builds `qemu-system-m68k` and
+`qemu-system-i386` from one tree.
 
 ```sh
 make -C cosim/rtl                  # the shared library, as before
@@ -964,8 +969,9 @@ chip that NetBSD's `fsck` does on the Sun-3.
 * Hatari is treated the same way, and for the same reason plus one more: it is
   GPL-2+, so nothing of it may reach `src/` or `tb/`.  Its tree is cloned into
   `work/hatari-src` and the one commit is kept as a patch.
-* QEMU changes exist only as patches against the released tarball, regenerated
-  with `diff -ruN` against the pristine copy `fetch-qemu.sh` keeps beside it.
+* All QEMU changes are one series in `cosim/patches/qemu/`, against that one
+  clone, and they build both machines.  There is no second QEMU and no release
+  tarball: two trees meant two copies of anything both boards needed.
 * The guest is never patched.  If something only works with a modified guest,
   it does not work.
 * The scripts never install system packages; `check-deps.sh` reports and stops.
