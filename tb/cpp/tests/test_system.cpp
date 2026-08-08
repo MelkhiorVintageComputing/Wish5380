@@ -62,6 +62,62 @@ TEST(sys_arbitrate_and_select_the_target) {
   CHECK(env.chip_read(sci::R_CSB) & sci::CSB_BSY);
 }
 
+TEST(sys_a_multi_block_read_holds_the_phase_between_blocks) {
+  // A target fetching the next block of a multi-block read must not let the
+  // phase lines fall while it waits.  Dropping them is a phase *change* in
+  // the middle of a transfer, and an initiator is entitled to read that as
+  // the target having moved on: the Sun-3's DMA controller does exactly that,
+  // and it abandoned every multi-block read after its first 512 bytes.  A
+  // real disk holds the phase across a seek and simply stops asserting REQ.
+  //
+  // Found by cosim/scripts/diff-sun3-dma.py, which runs the same transfer
+  // against this target and against QEMU's scsi-disk and compares them.
+  env.power_on_reset();
+  env.disk().fill_pattern(40, 0x4040);
+  env.disk().fill_pattern(41, 0x4141);
+  Bytes first_want = env.disk().read_block(40);
+  Bytes second_want = env.disk().read_block(41);
+
+  CHECK_DRV(env.drv().select(env.cfg().target_id));
+  uint8_t identify = 0x80;
+  CHECK_EQ(env.drv().pio(sci::PH_MSG_OUT, &identify, nullptr, 1), size_t(1));
+  Bytes cdb = cdb6(0x08, 40, 2);
+  CHECK_EQ(env.drv().pio(sci::PH_COMMAND, cdb.data(), nullptr, cdb.size()),
+           cdb.size());
+
+  Bytes got(512);
+  CHECK_EQ(env.drv().pio(sci::PH_DATA_IN, nullptr, got.data(), 512),
+           size_t(512));
+  CHECK_EQ(got, first_want);
+
+  // The back end is now filling the buffer for block 41.  Watch the bus until
+  // the target asks again, and it must have been DATA IN the whole way.
+  bool held = true;
+  CHECK_MSG(env.sim().run_until(
+                [&]() {
+                  uint8_t csb = env.chip_read(sci::R_CSB);
+                  if ((csb & sci::CSB_BSY) &&
+                      sci::csb_to_phase(csb) != sci::PH_DATA_IN) {
+                    held = false;
+                  }
+                  return (csb & sci::CSB_REQ) != 0;
+                },
+                5 * MS),
+            "the target never asked for the second block");
+  CHECK_MSG(held, "the target changed phase while fetching the next block");
+
+  Bytes rest(512);
+  CHECK_EQ(env.drv().pio(sci::PH_DATA_IN, nullptr, rest.data(), 512),
+           size_t(512));
+  CHECK_EQ(rest, second_want);
+
+  uint8_t st = 0xff, msg = 0xff;
+  CHECK_EQ(env.drv().pio(sci::PH_STATUS, nullptr, &st, 1), size_t(1));
+  CHECK_EQ(env.drv().pio(sci::PH_MSG_IN, nullptr, &msg, 1), size_t(1));
+  CHECK_EQ(st, 0x00);
+  CHECK_EQ(msg, 0x00);
+}
+
 TEST(sys_selecting_an_empty_id_times_out) {
   env.power_on_reset();
   // Nothing answers at ID 3, and the driver gives up rather than hanging.

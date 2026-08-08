@@ -781,14 +781,30 @@ module scsi_targ #(
   // The phase lines, by state.  DATA OUT is zero, which is also what the bus
   // reads as with nobody driving them; on a real bus the two are
   // indistinguishable as well.
+  //
+  // S_RDWAIT holds DATA IN, and that is not tidiness.  It is the state a
+  // multi-block read sits in while the back end fills the buffer for the next
+  // block - milliseconds, for an SD card - and it is reached from S_DATAIN and
+  // returns to it.  Letting the phase fall to zero there is a phase *change*
+  // in the middle of a transfer: the initiator's PHASE MATCH goes false, and
+  // an initiator entitled to believe that means the target has moved on acts
+  // on it.  The Sun-3's DMA controller does exactly that, and abandoned every
+  // multi-block read after its first 512 bytes.  A real disk holds the phase
+  // across a seek and simply stops asserting REQ, which is what this now does.
+  //
+  // S_WRWAIT is the same argument and no change, since DATA OUT is zero
+  // anyway; it is named so that the two are not accidentally separated.
   always_comb begin
     unique case (st)
       S_MSGOUT:  phase = 3'b110;  // MSG, C/D
       S_CMD:     phase = 3'b010;  //      C/D
-      S_DATAIN:  phase = 3'b001;  //                I/O
+      S_DATAIN,
+      S_RDWAIT:  phase = 3'b001;  //                I/O
       S_STATUS:  phase = 3'b011;  //      C/D,      I/O
       S_MSGIN:   phase = 3'b111;  // MSG, C/D,      I/O
-      default:   phase = 3'b000;  // DATA OUT, and the idle states
+      S_DATAOUT,
+      S_WRWAIT:  phase = 3'b000;  // DATA OUT
+      default:   phase = 3'b000;  // the idle states
     endcase
   end
 
