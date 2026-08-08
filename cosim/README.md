@@ -903,11 +903,15 @@ block zero.
 
 ### Where it stops
 
-Five faults are on the record.  The first is now explained and fixed on the
-Verilated path, and survives on the software one for a different reason; the
-rest are intermittent and unexplained.  They are written down here rather than
-left in a commit message because an unexplained fault that nobody can find
-again is worth less than one that is.
+Five faults are on the record and none of them is explained.  The first is
+much better bounded than it was - three harnesses have cleared the register
+port, the bus engine, the acknowledge path and a whole transfer's data - and it
+is still open, on both cores.  A real defect was found and fixed along the way
+and turned out not to be it; that is written up below rather than quietly
+dropped, because a wrong answer that looked right is worth as much to the next
+person as a right one.  They are all here rather than in a commit message
+because an unexplained fault that nobody can find again is worth less than one
+that is.
 
 **`sd0: I/O request timeout` / `si0: lost interrupt`**, once or twice in a
 boot, reproducibly.  It is named after the wrong thing: the interrupt is not
@@ -933,39 +937,49 @@ anything to do with delivering an interrupt.  Note step 3: with `MR_DMA`
 clear the chip no longer interrupts on a phase change, so a driver waiting
 for an interrupt about STATUS rather than polling for it would wait for ever.
 
-**Found, and it was the target.**  `scsi_targ.sv` drives the phase lines from a
-case on its state, and `S_RDWAIT` - the state a multi-block read sits in while
-the back end fills the buffer for the next block - fell into the default and
-drove `3'b000`.  So halfway through a DATA IN transfer the target let the phase
-fall to DATA OUT for the length of an SD card read, milliseconds, and then put
-it back.
+**A real defect found, and it is not this fault.**  Worth stating in that
+order, because it was written up the other way round first and the correction
+is the more useful half.
 
-That is a phase *change* in the middle of a transfer, and an initiator is
-entitled to read it as the target having moved on.  The Sun-3's DMA controller
-does exactly that: its end-of-transfer test is "the chip has asked at least
-once, the phase no longer matches, and the chip is interrupting", and all three
-are true in that window.  Every multi-block read was therefore abandoned after
-its first 512 bytes, with the target still in DATA IN holding REQ and the
-driver waiting for an interrupt about a transfer it thought had finished.
+`scsi_targ.sv` drives the phase lines from a case on its state, and `S_RDWAIT`
+- the state a multi-block read sits in while the back end fills the buffer for
+the next block - fell into the default and drove `3'b000`.  So halfway through
+a DATA IN transfer the target let the phase fall to DATA OUT for the length of
+an SD card read, milliseconds, and then put it back.  That is a phase *change*
+in the middle of a transfer, and an initiator watching PHASE MATCH is entitled
+to read it as the target having moved on.  A real disk holds the phase across a
+seek and simply stops asserting REQ, which is what it now does.
 
-An 8192-byte read is sixteen blocks, which is the whole shape of the fault:
-why it was always on 8192-byte transfers, why it was on DATA IN, why SunOS met
-it far more often than NetBSD - NetBSD's INSTALL kernel reads a block at a time
-where SunOS reads eight kilobytes - and why nothing in `tb/` had ever seen it,
-since every DMA test moved a single block and a single block never reaches
-`S_RDWAIT`.  The step at 6 above, "nothing happens for 117 seconds", was the
-target waiting to be asked for byte 513 of a transfer the board had already
-given up on.
+What it costs is precise.  The Sun-3 board ends a transfer on "the chip has
+asked at least once, the phase no longer matches, and the chip is
+interrupting".  The phase drop supplies the middle term; the last one is
+supplied by an interrupt latch left over from the command before.  So the
+truncation bites from the *second* transfer of a sequence onwards and never the
+first - which is why a single read looks perfectly healthy, and why
+`diff-sun3-dma.py` only caught it once it ran several in a row.  With the fix
+reverted, the second 8192-byte read stops after 512 bytes with the count stuck
+at `0x1e00` and the target still in DATA IN holding REQ.
 
-It took three harnesses to get here, and the order was not wasted.  The
-software core removed the RTL and the pacing from the list of suspects by
-reproducing the fault without either.  `diff-5380.py` cleared the register port
-and the bus engine.  `diff-sun3-dma.py` cleared the acknowledge path, and then,
-once it could run a whole transfer against the same disk on both sides, printed
-the answer in thirty seconds: the Verilated core stopped after 512 of 8192
-bytes with the count stuck at `0x1e00`.
+**But it is not the fault above.**  Measured after fixing it: SunOS on
+`--core rtl` still reaches `Amnesiac login:` with **seven** of these reports,
+against four to seven before.  Unchanged.  SunOS reads register 7 before arming
+each transfer, so the interrupt term is false during the block gap and the
+phase drop cannot reach it; the harness never acknowledged, which is why the
+harness met it and the driver does not.  The defect is real and would bite a
+driver that armed without acknowledging first.  It is not this one.
 
-`sys_a_multi_block_read_holds_the_phase_between_blocks` pins it.
+So the first fault on this list is still open, on both cores, and the three
+harnesses have narrowed rather than solved it.  What they did settle: it is not
+the register port, not the bus engine, not the acknowledge path, not End of
+Process, and not a whole transfer's data or residual, because all of those are
+now compared between two independent implementations and agree.  On the
+software core it is strongly timing-dependent and localised to a correct
+interrupt the driver never answers.  On the Verilated core it survives to a
+login prompt and always has.
+
+`sys_a_multi_block_read_holds_the_phase_between_blocks` pins the defect, and
+fails without the fix - the first version of that test did not, because it
+watched only a single block.
 
 Two things did turn out to be genuinely missing from the board, both found by
 building the software path and both about who wakes the board up: the chip's
@@ -997,12 +1011,17 @@ transfers".  It is specific to what SunOS's `si` does and to the timing it
 expects, which is the same asymmetry the table at the top of this file
 describes and the reason the second guest earns its keep.
 
-**The software core has a second fault, and it is not this one.**  On
+**It is far worse on the software core, and separately localised there.**  On
 `--core sw` SunOS gets through fsck, single-user, `rc` and the network
 services, stalls at the end of `rc`, and then produces nothing but fault
-reports - 2140 of them in 2600 s, having never reached multi-user.  Fixing
-the target below changed that by nothing, and could not have: the software
-core's target is QEMU's `scsi-disk.c`, which never had the bug.
+reports - 2140 of them in 2600 s, having never reached multi-user, against
+seven on `--core rtl` which reaches a login prompt in spite of them.  The
+target defect above changed neither number, and on this path could not have:
+the software core's target is QEMU's `scsi-disk.c`, which never had it.
+
+Whether the two are one fault with two severities or two faults with one
+symptom is not settled.  What follows is what the software one turned out to
+be localised to.
 
 Instrumenting the failing boot localised it exactly, and the chip is not doing
 anything wrong.  The driver arms with `TCR = 0x04`, an unspecified phase, so
