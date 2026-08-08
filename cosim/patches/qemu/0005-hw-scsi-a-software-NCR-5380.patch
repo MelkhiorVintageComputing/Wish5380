@@ -1,0 +1,1639 @@
+From 6445406a86ca8a77c400de124633cc0d17774857 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 8 Aug 2026 10:27:00 +0200
+Subject: [PATCH 5/6] hw/scsi: a software NCR 5380
+
+QEMU has no NCR 5380.  grep over the tree finds a Linux bootinfo tag and
+a line of captured `ls` output used as QDict test data, and nothing else;
+hw/m68k/q800.c models a Macintosh that really had one and uses an ESP
+instead.  This adds the part, as a chip separate from any board that
+carries it - the split esp.c makes between TYPE_ESP and the three boards
+around it, and for the same reason: every 5380 machine presented the same
+eight registers, because the part decoded /CS with A0..A2 on the die
+(design manual p. 6), and differed only in where they landed and in what
+answered DRQ.
+
+It models wires and not commands, which is the one design decision worth
+arguing.  A 5380 has no sequencer: section 7 of the manual (p. 18) lists
+the whole of what is in hardware - DMA transfers, arbitration, phase
+monitoring, disconnection, bus reset, parity, selection - and no part of
+a command is on that list.  Every register a driver writes is a pad, and
+Current SCSI Bus Status is a window straight onto the bus.  esp.c can be
+command-level because an ESP really is a sequencer and the guest kicks
+it with one byte; a 5380 written that way would have to invent a hidden
+phase machine and then re-derive the wires from it to answer three of
+its own registers.  So the chip drives wires, and an adapter at the
+bottom of the file turns bus phases into scsi_req_new, scsi_req_continue
+and complete.  That adapter is the only part that knows what a CDB is.
+
+There is no time in the model.  The two delays the part implements - bus
+free and bus settle, both 400 ns - exist to filter a real cable, and a
+software fabric has no glitches to filter, so both collapse to "BSY is
+false once the wires have settled".  What is deliberately *not* here is
+the 2.2 us arbitration delay, which the manual says the chip does not
+implement and "must be implemented in the controlling software driver"
+(p. 18); nor the selection timeout, which is the driver's for the same
+reason - a target that is not there simply never asserts BSY.  Putting
+either in would make a driver that omitted its half work when against
+real silicon it would not.
+
+The awkward bits of the part are reproduced rather than tidied, each
+cited where it lands: Initiator Command reads AIP and LOST ARBITRATION
+where TEST MODE and DIFF ENBL were written; a DACK access does not
+decode the address at all; the Mode Register refuses the DMA bit while
+BSY is false, the only write the chip does not take; an SCSI reset
+spares the interrupt latch and ASSERT RST where the RESET pin does not;
+END OF DMA is cleared by clearing the DMA bit and not by reading
+register 7; and BUSY ERROR is a level and not an edge, so reading
+register 7 empties it and the condition immediately refills it, which is
+why Linux's NCR5380_intr writes the Mode Register first.
+
+Interrupts are the six the manual lists.  Arbitration reports AIP and
+LOST ARBITRATION and nothing else, because the chip does not decide who
+won - comparing IDs against the data bus is the driver's job.
+
+Disconnection, reselection, tagged queueing, linked commands and
+checking incoming parity are all absent on purpose.  A model that
+quietly acquired one of them would let a driver missing its half appear
+to work.
+---
+ hw/scsi/Kconfig           |    4 +
+ hw/scsi/meson.build       |    1 +
+ hw/scsi/ncr5380.c         | 1312 +++++++++++++++++++++++++++++++++++++
+ hw/scsi/trace-events      |   13 +
+ include/hw/scsi/ncr5380.h |  199 ++++++
+ 5 files changed, 1529 insertions(+)
+ create mode 100644 hw/scsi/ncr5380.c
+ create mode 100644 include/hw/scsi/ncr5380.h
+
+diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
+index cbaf672832..8c3598253d 100644
+--- a/hw/scsi/Kconfig
++++ b/hw/scsi/Kconfig
+@@ -80,3 +80,7 @@ config NCR5380_ISA
+     bool
+     default y
+     depends on ISA_BUS
++
++config NCR5380
++    bool
++    select SCSI
+diff --git a/hw/scsi/meson.build b/hw/scsi/meson.build
+index c5551c1763..7bd218e3b5 100644
+--- a/hw/scsi/meson.build
++++ b/hw/scsi/meson.build
+@@ -8,6 +8,7 @@ scsi_ss.add(files(
+   'scsi-disk.c',
+   'scsi-generic.c',
+ ))
++scsi_ss.add(when: 'CONFIG_NCR5380', if_true: files('ncr5380.c'))
+ scsi_ss.add(when: 'CONFIG_ESP', if_true: files('esp.c'))
+ scsi_ss.add(when: 'CONFIG_ESP_PCI', if_true: files('esp-pci.c'))
+ scsi_ss.add(when: 'CONFIG_LSI_SCSI_PCI', if_true: files('lsi53c895a.c'))
+diff --git a/hw/scsi/ncr5380.c b/hw/scsi/ncr5380.c
+new file mode 100644
+index 0000000000..4e4f635034
+--- /dev/null
++++ b/hw/scsi/ncr5380.c
+@@ -0,0 +1,1312 @@
++/*
++ * NCR 5380 SCSI protocol controller.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Page numbers are the printed pages of the NCR 5380 family design manual,
++ * March 1986.
++ *
++ * The 5380 is a thin part, and modelling it faithfully means resisting the
++ * urge to make it thicker.  It has no sequencer, no address counter and no
++ * byte counter.  Section 7 (p. 18) lists the whole of what is in hardware -
++ * DMA transfers, arbitration, phase change monitoring, bus disconnection, bus
++ * reset, parity checking, and selection - and no part of a command is in that
++ * list.  The driver drives SEL, releases BSY, counts the bytes and decides
++ * when a phase is over, by writing registers one at a time.
++ *
++ * So this models wires, not commands.  Every register a driver writes is a
++ * pad: Initiator Command bit 4 is ACK, bit 3 is BSY, Target Command bits 2:0
++ * are the phase comparator's other input, and Current SCSI Bus Status is a
++ * window straight onto the bus.  esp.c can be command-level because an ESP is
++ * a sequencer - the guest writes CMD_SELATN and the silicon does arbitration,
++ * selection, message and command - but a 5380 model written that way would
++ * have to invent a hidden phase machine and then re-derive the wires from it
++ * to answer those three registers.
++ *
++ * What sits on the other end of the wires is the adapter at the bottom of
++ * this file, which is every device on the bus that is not this chip.  It is
++ * the only part that knows what a CDB is, and it is where QEMU's
++ * command-oriented SCSIBus is put back into REQ/ACK.
++ *
++ * ---------------------------------------------------------------------------
++ * There is no time in here, and that is deliberate.
++ *
++ * The part is clockless (p. 18): its bus free and bus settle delays come out
++ * of gate propagation and "may differ between devices because of inherent
++ * process variations".  Both are 400 ns, and both exist to filter a real
++ * cable - to stop a glitch looking like a free bus or a lost target.  A
++ * software fabric has no glitches, so both collapse to "BSY is false once
++ * everything has settled", which is what ncr5380_settle() means by a fixed
++ * point.
++ *
++ * The 2.2 us arbitration delay is a different matter and is deliberately
++ * absent: the datasheet is explicit that the chip does not implement it and
++ * "this delay must be implemented in the controlling software driver"
++ * (p. 18).  Counting it here would make a driver that omitted it work when on
++ * real silicon it would not.  The selection timeout is the driver's for the
++ * same reason - a target that is not there simply never asserts BSY.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/scsi/ncr5380.h"
++#include "scsi/utils.h"
++#include "trace.h"
++
++/* ---- Initiator Command, register 1 (pp. 11-12) ------------------------- */
++#define ICR_RST         0x80
++#define ICR_AIP         0x40    /* on read */
++#define ICR_TEST        0x40    /* on write: float every output driver */
++#define ICR_LA          0x20    /* on read */
++#define ICR_DIFF        0x20    /* on write: NCR 5381 only */
++#define ICR_ACK         0x10
++#define ICR_BSY         0x08
++#define ICR_SEL         0x04
++#define ICR_ATN         0x02
++#define ICR_DATA        0x01
++
++/* ---- Mode, register 2 (p. 13) ------------------------------------------ */
++#define MR_BLOCK_DMA    0x80
++#define MR_TARGET       0x40
++#define MR_PAR_CHK      0x20
++#define MR_PAR_INTR     0x10
++#define MR_EOP_INTR     0x08
++#define MR_MON_BSY      0x04
++#define MR_DMA          0x02
++#define MR_ARB          0x01
++
++/* ---- Target Command, register 3 (p. 14) -------------------------------- */
++#define TCR_REQ         0x08
++#define TCR_MSG         0x04
++#define TCR_CD          0x02
++#define TCR_IO          0x01
++#define TCR_RW_MASK     0x0f    /* 7 and 6:4 are unimplemented, and read 0 */
++
++/* ---- Current SCSI Bus Status, register 4 on read (p. 15) --------------- */
++#define CSB_RST         0x80
++#define CSB_BSY         0x40
++#define CSB_REQ         0x20
++#define CSB_MSG         0x10
++#define CSB_CD          0x08
++#define CSB_IO          0x04
++#define CSB_SEL         0x02
++#define CSB_DBP         0x01
++
++/* ---- Bus and Status, register 5 on read (p. 16) ------------------------ */
++#define BSR_END_DMA     0x80
++#define BSR_DRQ         0x40
++#define BSR_PAR_ERR     0x20
++#define BSR_IRQ         0x10
++#define BSR_PHASE_MATCH 0x08
++#define BSR_BUSY_ERR    0x04
++#define BSR_ATN         0x02
++#define BSR_ACK         0x01
++
++/* Messages this adapter acts on. */
++#define MSG_COMMAND_COMPLETE    0x00
++#define MSG_ABORT               0x06
++#define MSG_BUS_DEVICE_RESET    0x0c
++
++/*
++ * How many times the settle loop may go round before something is wrong.  A
++ * single byte of a DMA handshake needs a handful: the target offers REQ, the
++ * chip latches and raises DRQ, the host answers, the chip drives ACK, the
++ * target drops REQ.  Sixty-four is far above that and far below a hang.
++ */
++#define SETTLE_MAX 64
++
++static void ncr5380_settle(NCR5380State *s);
++static void ncr5380_target_settled(NCR5380State *s);
++static void ncr5380_target_bus_reset(NCR5380State *s);
++
++/* Odd parity, always generated (p. 8): the bit is set when the byte has an
++ * even number of ones. */
++static bool ncr5380_dbp(uint8_t v)
++{
++    return !(ctpop8(v) & 1);
++}
++
++/* ------------------------------------------------------------------------ */
++/* The wires                                                                */
++/* ------------------------------------------------------------------------ */
++
++static void ncr5380_wires_clear(NCR5380Wires *w)
++{
++    memset(w, 0, sizeof(*w));
++}
++
++static void ncr5380_wires_or(NCR5380Wires *out, const NCR5380Wires *a,
++                             const NCR5380Wires *b)
++{
++    out->rst  = a->rst  || b->rst;
++    out->bsy  = a->bsy  || b->bsy;
++    out->sel  = a->sel  || b->sel;
++    out->req  = a->req  || b->req;
++    out->ack  = a->ack  || b->ack;
++    out->atn  = a->atn  || b->atn;
++    out->msg  = a->msg  || b->msg;
++    out->cd   = a->cd   || b->cd;
++    out->io   = a->io   || b->io;
++    out->data = a->data |  b->data;
++    out->dbp  = a->dbp  || b->dbp;
++}
++
++static bool ncr5380_phase_match(NCR5380State *s)
++{
++    uint8_t on_bus = (s->wires.msg ? 4 : 0) | (s->wires.cd ? 2 : 0) |
++                     (s->wires.io ? 1 : 0);
++    return on_bus == (s->tcr & 0x07);
++}
++
++/*
++ * What this chip drives, recomputed from the registers every time round the
++ * loop.  This is the whole of the combinational half of the part.
++ */
++static void ncr5380_drive(NCR5380State *s)
++{
++    bool target_mode = s->mr & MR_TARGET;
++    bool test_mode = s->icr & ICR_TEST;
++    bool arbitrating = s->arb_active && (s->mr & MR_ARB);
++    bool dma_mode = s->mr & MR_DMA;
++    bool dma_ack, dma_req, drive_data, en;
++
++    /* TEST MODE floats every output driver, "effectively removing the
++     * NCR 5380 from the circuit" (p. 12). */
++    en = !test_mode;
++
++    dma_ack = dma_mode && !s->dma_tgt &&
++              (s->dma_st == NCR5380_DMA_S_HS || s->dma_st == NCR5380_DMA_R_HS);
++    dma_req = dma_mode && s->dma_tgt &&
++              (s->dma_st == NCR5380_DMA_S_HS ||
++               s->dma_st == NCR5380_DMA_R_WANT);
++
++    /*
++     * The Output Data Register reaches the bus in two quite different
++     * situations, and conflating them is the classic way to break selection:
++     *
++     *  - during arbitration the chip asserts it by itself, with ASSERT DATA
++     *    BUS not set at all (p. 12).  Linux relies on this: NCR5380_select
++     *    writes the ID to register 0 and ARBITRATE to register 2 and does not
++     *    touch Initiator Command until arbitration is won;
++     *  - afterwards it needs ASSERT DATA BUS, and as an initiator also needs
++     *    the bus not to be in an input phase and the phase to match.  That is
++     *    why the same function writes zero to Target Command first, with the
++     *    comment "otherwise the NCR5380 won't drive the data bus during
++     *    SELECTION".
++     */
++    drive_data = arbitrating ||
++                 ((s->icr & ICR_DATA) &&
++                  (target_mode || (!s->wires.io && ncr5380_phase_match(s))));
++
++    ncr5380_wires_clear(&s->drv);
++    s->drv.rst = en && (s->icr & ICR_RST);
++    /* BSY comes from the register and from arbitration both, which is what
++     * lets a driver take it over: Linux sets ASSERT BSY while ARBITRATE is
++     * still on, then clears the Mode Register, and BSY never glitches. */
++    s->drv.bsy = en && (((s->icr & ICR_BSY) != 0) || arbitrating);
++    s->drv.sel = en && (s->icr & ICR_SEL);
++    /* ATN and ACK only as initiator; REQ, MSG, C/D and I/O only as target
++     * (p. 13). */
++    s->drv.atn = en && !target_mode && (s->icr & ICR_ATN);
++    s->drv.ack = en && !target_mode && (((s->icr & ICR_ACK) != 0) || dma_ack);
++    s->drv.req = en && target_mode && (((s->tcr & TCR_REQ) != 0) || dma_req);
++    s->drv.msg = en && target_mode && (s->tcr & TCR_MSG);
++    s->drv.cd = en && target_mode && (s->tcr & TCR_CD);
++    s->drv.io = en && target_mode && (s->tcr & TCR_IO);
++    s->drv.data = (en && drive_data) ? s->odr : 0;
++    s->drv.dbp = (en && drive_data) ? ncr5380_dbp(s->odr) : false;
++}
++
++/* ------------------------------------------------------------------------ */
++/* The sequential half: one pass, the analogue of one clock edge             */
++/* ------------------------------------------------------------------------ */
++
++/*
++ * An SCSI reset clears the internal logic and every register "except for the
++ * IRQ interrupt latch and the ASSERT RST bit" (p. 23).  Whether it came from
++ * another device or from this chip's own ASSERT RST is the same event, since
++ * what the chip drives is part of what it sees.
++ */
++static void ncr5380_scsi_reset(NCR5380State *s)
++{
++    s->odr = 0;
++    s->icr &= ICR_RST;
++    s->mr = 0;
++    s->tcr = 0;
++    s->ser = 0;
++
++    s->arb_active = false;
++    s->lost_arb = false;
++    s->aip = false;
++    s->dma_st = NCR5380_DMA_IDLE;
++    s->dma_tgt = false;
++    s->drq_raw = false;
++    s->idr = 0;
++    s->par_err = false;
++    s->busy_err = false;
++    s->end_dma = false;
++
++    ncr5380_target_bus_reset(s);
++}
++
++static void ncr5380_tick(NCR5380State *s)
++{
++    bool target_mode = s->mr & MR_TARGET;
++    bool dma_mode = s->mr & MR_DMA;
++    bool phase_match = ncr5380_phase_match(s);
++    bool req_rise, rst_rise, scsi_rst;
++    bool bsy_false, req_ok, recv_latch = false;
++    bool parity_bad, parity_int, sel_int, busy_lost, eop_int, mismatch_int;
++
++    req_rise = s->wires.req && !s->prev_req;
++    rst_rise = s->wires.rst && !s->prev_rst;
++    s->prev_req = s->wires.req;
++    s->prev_rst = s->wires.rst;
++    scsi_rst = rst_rise;
++
++    /* No bus free or bus settle delay: see the note at the top of the file. */
++    bsy_false = !s->wires.bsy;
++
++    parity_bad = s->wires.dbp != ncr5380_dbp(s->wires.data);
++
++    /* Selection or reselection (p. 19).  Only a single bit match is required,
++     * and the chip does not distinguish the two - the driver reads I/O out of
++     * Current SCSI Bus Status for that. */
++    sel_int = s->wires.sel && !s->wires.bsy && (s->wires.data & s->ser) &&
++              bsy_false;
++
++    /* "If the DMA MODE bit is active and a phase mismatch occurs when REQ
++     * transitions from false to true, an interrupt is generated" (p. 22).
++     * Only an initiator can have one; a target sets the phase itself. */
++    mismatch_int = dma_mode && !target_mode && req_rise && !phase_match;
++
++    /* Unexpected loss of BSY (pp. 13, 16, 22).  This is a level and not an
++     * edge: reading register 7 empties the latch and the condition
++     * immediately refills it, which is why NCR5380_intr writes the Mode
++     * Register before it reads register 7. */
++    busy_lost = (s->mr & MR_MON_BSY) && bsy_false && !s->busy_err;
++
++    eop_int = (s->mr & MR_EOP_INTR) && s->eop && dma_mode;
++
++    if (scsi_rst) {
++        ncr5380_scsi_reset(s);
++        /* The latch is set below and deliberately not cleared: a driver that
++         * pulses RST still learns why it was interrupted. */
++        s->irq_latch = true;
++        s->dirty = true;
++        goto strobes;
++    }
++
++    /* ---- arbitration (p. 18) ------------------------------------------- */
++    if (!(s->mr & MR_ARB)) {
++        /* "AIP will remain active until the ARBITRATE bit is reset" (p. 12),
++         * so this is the only thing that ends arbitration. */
++        s->arb_active = false;
++        s->lost_arb = false;
++    } else {
++        if (!s->arb_active && bsy_false && !s->wires.sel) {
++            s->arb_active = true;
++            /* Which ID is ours, for the adapter to discount at selection.
++             * The chip itself does not decide who won arbitration - it
++             * reports AIP and LOST ARBITRATION and nothing else, and the
++             * driver compares Current SCSI Data against its own mask. */
++            s->arb_id = s->odr;
++            s->dirty = true;
++        }
++        /* Lost only to *another* device's SEL (p. 12).  Our own does not
++         * count, and a driver asserts it while still arbitrating. */
++        if (s->arb_active && s->wires.sel && !s->drv.sel && !s->lost_arb) {
++            s->lost_arb = true;
++            s->dirty = true;
++        }
++    }
++    s->aip = s->arb_active && (s->mr & MR_ARB);
++
++    /* ---- the DMA handshake (pp. 14, 24) --------------------------------- */
++    /* A phase mismatch "prevents the recognition of REQ" (p. 22). */
++    req_ok = s->wires.req && phase_match;
++
++    if (!dma_mode) {
++        /* "A DMA operation may be halted at any time simply by resetting the
++         * DMA MODE bit" (p. 25), and every driver uses that rather than
++         * EOP. */
++        if (s->dma_st != NCR5380_DMA_IDLE || s->drq_raw) {
++            s->dma_st = NCR5380_DMA_IDLE;
++            s->drq_raw = false;
++            s->dirty = true;
++        }
++        s->end_dma = false;
++    } else {
++        NCR5380DmaState was = s->dma_st;
++
++        switch (s->dma_st) {
++        case NCR5380_DMA_IDLE:
++            /* Writing one of the three start registers is the whole trigger;
++             * the data written is meaningless (p. 16). */
++            if (s->st_sds) {
++                s->dma_st = NCR5380_DMA_S_WANT;
++                s->dma_tgt = target_mode;
++                /* The chip asks for a byte before it has anywhere to put it:
++                 * the Output Data Register is its one byte of buffer, and
++                 * filling it early is what lets END OF DMA be set while "the
++                 * SCSI transfer may still be in progress" (p. 20). */
++                s->drq_raw = true;
++            } else if (s->st_sdtr) {
++                s->dma_st = NCR5380_DMA_R_WANT;
++                s->dma_tgt = true;
++            } else if (s->st_sdir) {
++                s->dma_st = NCR5380_DMA_R_WANT;
++                s->dma_tgt = false;
++            }
++            break;
++
++        case NCR5380_DMA_S_WANT:
++            if (s->st_dack_wr) {
++                s->drq_raw = false;
++                s->dma_st = NCR5380_DMA_S_HAVE;
++            }
++            break;
++
++        case NCR5380_DMA_S_HAVE:
++            /* A target offers the byte by raising REQ; an initiator waits to
++             * be asked for it. */
++            if (s->dma_tgt || req_ok) {
++                s->dma_st = NCR5380_DMA_S_HS;
++            }
++            break;
++
++        case NCR5380_DMA_S_HS:
++            if (s->dma_tgt) {
++                if (s->wires.ack) {
++                    s->dma_st = NCR5380_DMA_S_TREL;
++                }
++            } else if (!s->wires.req) {
++                s->dma_st = NCR5380_DMA_S_WANT;
++                s->drq_raw = true;
++            }
++            break;
++
++        case NCR5380_DMA_S_TREL:
++            if (!s->wires.ack) {
++                s->dma_st = NCR5380_DMA_S_WANT;
++                s->drq_raw = true;
++            }
++            break;
++
++        case NCR5380_DMA_R_WANT:
++            /* "Data is latched either during a DMA Target receive operation
++             * when ACK goes active or during a DMA Initiator receive when REQ
++             * goes active" (p. 11). */
++            recv_latch = s->dma_tgt ? s->wires.ack : req_ok;
++            if (recv_latch) {
++                s->idr = s->wires.data;
++                s->drq_raw = true;
++                s->dma_st = NCR5380_DMA_R_HAVE;
++            }
++            break;
++
++        case NCR5380_DMA_R_HAVE:
++            if (s->st_dack_rd) {
++                s->drq_raw = false;
++                s->dma_st = NCR5380_DMA_R_HS;
++            }
++            break;
++
++        case NCR5380_DMA_R_HS:
++            if (s->dma_tgt ? !s->wires.ack : !s->wires.req) {
++                s->dma_st = NCR5380_DMA_R_WANT;
++            }
++            break;
++        }
++
++        if (s->dma_st != was) {
++            trace_ncr5380_dma_state(was, s->dma_st);
++            s->dirty = true;
++        }
++
++        /* END OF DMA (p. 16): "set if EOP, DACK and either IOR or IOW are
++         * simultaneously active", and "reset when the DMA MODE bit is reset".
++         * Reading register 7 does *not* clear it. */
++        if (s->eop && (s->st_dack_rd || s->st_dack_wr)) {
++            s->end_dma = true;
++        }
++    }
++
++    /* ---- the latches ---------------------------------------------------- */
++
++    /* Parity is checked on a read of register 0, during a DMA receive, and
++     * during selection, where ENABLE PARITY INTERRUPT "need not be set for
++     * this interrupt to be generated" - only ENABLE PARITY CHECKING (p. 19). */
++    if (s->st_rpi) {
++        s->par_err = false;
++    } else if ((s->mr & MR_PAR_CHK) && parity_bad &&
++               (s->st_csd_rd || recv_latch || sel_int)) {
++        s->par_err = true;
++    }
++    parity_int = (s->mr & MR_PAR_CHK) && (s->mr & MR_PAR_INTR) && parity_bad &&
++                 (s->st_csd_rd || recv_latch);
++
++    if (s->st_rpi) {
++        s->busy_err = false;
++    } else if (busy_lost) {
++        s->busy_err = true;
++        s->dirty = true;
++    }
++
++    /* Loss of BSY takes the bus away as it goes: the lower six bits of
++     * Initiator Command are reset and every signal removed (p. 13), and the
++     * DMA MODE bit is reset (p. 16).  Both beat a host write in the same
++     * cycle, because on the real part the host is not there at all. */
++    if (busy_lost) {
++        s->icr &= ~0x3f;
++        s->mr &= ~MR_DMA;
++    }
++
++    /* ---- the interrupt latch (p. 19) ------------------------------------ */
++    if (s->st_rpi) {
++        s->irq_latch = false;
++    } else if (sel_int || eop_int || parity_int || mismatch_int || busy_lost) {
++        if (!s->irq_latch) {
++            s->dirty = true;
++        }
++        s->irq_latch = true;
++    }
++
++strobes:
++    /* Every strobe is one pass wide, exactly as it is one clock wide in the
++     * Verilated model.  Consuming them here is what stops a write of register
++     * 5 starting a second DMA transfer on the next pass. */
++    s->st_csd_rd = false;
++    s->st_rpi = false;
++    s->st_sds = false;
++    s->st_sdtr = false;
++    s->st_sdir = false;
++    s->st_dack_rd = false;
++    s->st_dack_wr = false;
++}
++
++/* ------------------------------------------------------------------------ */
++/* The settle loop                                                          */
++/* ------------------------------------------------------------------------ */
++
++static void ncr5380_update_pins(NCR5380State *s)
++{
++    int irq = ncr5380_irq(s) ? 1 : 0;
++    int drq = ncr5380_drq(s) ? 1 : 0;
++
++    if (irq != s->irq_level) {
++        s->irq_level = irq;
++        trace_ncr5380_irq(irq);
++        qemu_set_irq(s->irq, irq);
++    }
++    if (drq != s->drq_level) {
++        s->drq_level = drq;
++        qemu_set_irq(s->drq, drq);
++    }
++}
++
++/*
++ * Run the wires to a fixed point.
++ *
++ * Each pass recomputes what the chip drives, ORs in what everything else
++ * drives, advances the sequential half one step, and lets the target react.
++ * A pass that changes nothing ends it.  The loop is the software analogue of
++ * a clock, and it stalls exactly where the part does: waiting for the host to
++ * answer DRQ, or for a driver to write the next register.
++ *
++ * Level-sensitive rules - BUSY ERROR above all - are evaluated inside the
++ * loop but only reach the outside world once it has settled, which is what a
++ * real chip's 400 ns filter achieves and what stops the momentary BSY-false
++ * between a driver releasing the bus and a target taking it from raising a
++ * spurious error.
++ */
++static void ncr5380_settle(NCR5380State *s)
++{
++    int i;
++
++    if (s->settling) {
++        /* Re-entered from a target callback - scsi_req_continue can reach
++         * transfer_data synchronously.  Leave the work to the outer loop
++         * rather than recursing, which on an 8 KB transfer would not end
++         * well. */
++        s->dirty = true;
++        return;
++    }
++
++    s->settling = true;
++    for (i = 0; i < SETTLE_MAX; i++) {
++        s->dirty = false;
++        ncr5380_drive(s);
++        ncr5380_wires_or(&s->wires, &s->drv, &s->peer);
++        ncr5380_tick(s);
++        ncr5380_target_settled(s);
++        if (!s->dirty) {
++            break;
++        }
++    }
++    if (i == SETTLE_MAX) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "ncr5380: the bus did not settle in %d passes; "
++                      "dma_st=%d phase=%d\n", SETTLE_MAX, s->dma_st, s->phase);
++    }
++    s->settling = false;
++
++    ncr5380_update_pins(s);
++}
++
++/* ------------------------------------------------------------------------ */
++/* The register port (p. 10)                                                */
++/* ------------------------------------------------------------------------ */
++
++static uint8_t ncr5380_bsr(NCR5380State *s)
++{
++    uint8_t v = 0;
++
++    if (s->end_dma && (s->mr & MR_DMA)) {
++        v |= BSR_END_DMA;
++    }
++    if (ncr5380_drq(s)) {
++        v |= BSR_DRQ;
++    }
++    if (s->par_err) {
++        v |= BSR_PAR_ERR;
++    }
++    if (s->irq_latch) {
++        v |= BSR_IRQ;
++    }
++    if (ncr5380_phase_match(s)) {
++        v |= BSR_PHASE_MATCH;
++    }
++    if (s->busy_err) {
++        v |= BSR_BUSY_ERR;
++    }
++    if (s->wires.atn) {
++        v |= BSR_ATN;
++    }
++    if (s->wires.ack) {
++        v |= BSR_ACK;
++    }
++    return v;
++}
++
++static uint8_t ncr5380_csb(NCR5380State *s)
++{
++    uint8_t v = 0;
++
++    if (s->wires.rst) {
++        v |= CSB_RST;
++    }
++    if (s->wires.bsy) {
++        v |= CSB_BSY;
++    }
++    if (s->wires.req) {
++        v |= CSB_REQ;
++    }
++    if (s->wires.msg) {
++        v |= CSB_MSG;
++    }
++    if (s->wires.cd) {
++        v |= CSB_CD;
++    }
++    if (s->wires.io) {
++        v |= CSB_IO;
++    }
++    if (s->wires.sel) {
++        v |= CSB_SEL;
++    }
++    if (s->wires.dbp) {
++        v |= CSB_DBP;
++    }
++    return v;
++}
++
++uint8_t ncr5380_reg_read(NCR5380State *s, int reg)
++{
++    uint8_t v;
++
++    reg &= 7;
++    switch (reg) {
++    case 0:                     /* Current SCSI Data */
++        v = s->wires.data;
++        s->st_csd_rd = true;
++        break;
++    case 1:                     /* Initiator Command */
++        /* Bits 6 and 5 come from the arbitration logic and not from what was
++         * written there (p. 12), so a read/modify/write does not preserve
++         * what it found.  Every one of the four reference drivers works
++         * around this, which is about as strong a signal as software can give
++         * that the fault is real. */
++        v = s->icr & ~(ICR_AIP | ICR_LA);
++        if (s->aip) {
++            v |= ICR_AIP;
++        }
++        if (s->lost_arb && (s->mr & MR_ARB)) {
++            v |= ICR_LA;
++        }
++        break;
++    case 2:
++        v = s->mr;
++        break;
++    case 3:
++        /* Bits 7 and 6:4 are not implemented on the NMOS part (appendix
++         * A7). */
++        v = s->tcr & TCR_RW_MASK;
++        break;
++    case 4:
++        v = ncr5380_csb(s);
++        break;
++    case 5:
++        v = ncr5380_bsr(s);
++        break;
++    case 6:
++        v = s->idr;
++        break;
++    default:                    /* 7: Reset Parity/Interrupt */
++        /* The data a read of 7 returns is not specified and every driver
++         * throws it away.  Zero is as good as anything. */
++        v = 0;
++        s->st_rpi = true;
++        break;
++    }
++
++    trace_ncr5380_reg_read(reg, v);
++    ncr5380_settle(s);
++    return v;
++}
++
++void ncr5380_reg_write(NCR5380State *s, int reg, uint8_t val)
++{
++    reg &= 7;
++    trace_ncr5380_reg_write(reg, val);
++
++    switch (reg) {
++    case 0:
++        s->odr = val;
++        break;
++    case 1:
++        s->icr = val;
++        break;
++    case 2:
++        /* "BSY must be active in order to set the DMA Mode bit" (p. 14).  The
++         * one place a register write is refused rather than merely ignored:
++         * every other bit lands and that one does not, so a driver that
++         * started a DMA transfer with no target connected finds it had not
++         * started one. */
++        s->mr = val;
++        if (!s->wires.bsy) {
++            s->mr &= ~MR_DMA;
++        }
++        break;
++    case 3:
++        s->tcr = val;
++        break;
++    case 4:
++        s->ser = val;
++        break;
++    case 5:                     /* Start DMA Send */
++        s->st_sds = true;
++        break;
++    case 6:                     /* Start DMA Target Receive */
++        s->st_sdtr = true;
++        break;
++    default:                    /* 7: Start DMA Initiator Receive */
++        s->st_sdir = true;
++        break;
++    }
++
++    ncr5380_settle(s);
++}
++
++bool ncr5380_drq(NCR5380State *s)
++{
++    /* Resetting the DMA MODE bit halts the transfer "at any time" (p. 25), so
++     * DRQ follows it immediately rather than waiting for the state machine. */
++    return s->drq_raw && (s->mr & MR_DMA);
++}
++
++bool ncr5380_irq(NCR5380State *s)
++{
++    return s->irq_latch;
++}
++
++uint8_t ncr5380_dack_read(NCR5380State *s)
++{
++    uint8_t v = s->idr;
++
++    s->st_dack_rd = true;
++    ncr5380_settle(s);
++    return v;
++}
++
++void ncr5380_dack_write(NCR5380State *s, uint8_t val)
++{
++    /* An access with DACK asserted reaches a data register whatever the
++     * address lines say (p. 6), and fires no strobe. */
++    s->odr = val;
++    s->st_dack_wr = true;
++    ncr5380_settle(s);
++}
++
++void ncr5380_set_eop(NCR5380State *s, bool asserted)
++{
++    s->eop = asserted;
++    ncr5380_settle(s);
++}
++
++void ncr5380_hard_reset(NCR5380State *s)
++{
++    /* The RESET pin clears everything, the interrupt latch included, which is
++     * what distinguishes it from an SCSI bus reset (p. 23). */
++    s->odr = s->icr = s->mr = s->tcr = s->ser = 0;
++    s->idr = 0;
++    s->aip = s->lost_arb = s->arb_active = false;
++    s->arb_id = 0;
++    s->par_err = s->busy_err = s->irq_latch = s->end_dma = false;
++    s->dma_st = NCR5380_DMA_IDLE;
++    s->dma_tgt = false;
++    s->drq_raw = false;
++    s->eop = false;
++    s->prev_req = s->prev_rst = false;
++    s->st_csd_rd = s->st_rpi = s->st_sds = s->st_sdtr = s->st_sdir = false;
++    s->st_dack_rd = s->st_dack_wr = false;
++    ncr5380_wires_clear(&s->drv);
++
++    ncr5380_target_bus_reset(s);
++    ncr5380_settle(s);
++}
++
++/* ======================================================================== */
++/* The other end of the wires                                               */
++/* ======================================================================== */
++
++/*
++ * Every device on the bus that is not this chip, as one target-side state
++ * machine over QEMU's SCSIBus.
++ *
++ * QEMU's SCSI layer is command-oriented - scsi_req_new, scsi_req_enqueue,
++ * transfer_data, complete - and a 5380 is byte-oriented, so this is where the
++ * REQ/ACK handshake is put back.  The mapping is closer than it looks: enqueue
++ * is the end of COMMAND, a transfer_data callback is a DATA burst, and
++ * complete is STATUS.  What has to be added is one handshake per byte and the
++ * rule that decides when a phase is over.
++ *
++ * Deliberately absent, and matching doc/target.md in the Verilated model so
++ * that the two remain comparable: disconnection, reselection, tagged
++ * queueing, linked commands, and checking incoming parity.  A model that
++ * quietly acquired one of those would let a driver missing its half appear to
++ * work.
++ */
++
++static bool ncr5380_target_connected(NCR5380State *s)
++{
++    return s->phase != NCR5380_PH_FREE;
++}
++
++static void ncr5380_target_free(NCR5380State *s)
++{
++    if (s->sreq) {
++        scsi_req_unref(s->sreq);
++        s->sreq = NULL;
++    }
++    s->sdev = NULL;
++    s->phase = NCR5380_PH_FREE;
++    s->hs = NCR5380_HS_SETUP;
++    s->async_buf = NULL;
++    s->async_len = s->async_off = 0;
++    s->cdb_n = s->cdb_len = 0;
++    s->sel_id = s->sel_lun = 0;
++    s->atn_at_select = false;
++    ncr5380_wires_clear(&s->peer);
++    s->dirty = true;
++    trace_ncr5380_bus_free();
++}
++
++static void ncr5380_target_bus_reset(NCR5380State *s)
++{
++    if (s->sreq) {
++        SCSIRequest *r = s->sreq;
++        s->sreq = NULL;
++        scsi_req_cancel(r);
++        scsi_req_unref(r);
++    }
++    s->sdev = NULL;
++    s->phase = NCR5380_PH_FREE;
++    s->hs = NCR5380_HS_SETUP;
++    s->async_buf = NULL;
++    s->async_len = s->async_off = 0;
++    s->cdb_n = s->cdb_len = 0;
++    ncr5380_wires_clear(&s->peer);
++}
++
++/* The phase lines, as the target holds them (p. 15's encoding, MSG C/D I/O). */
++static void ncr5380_target_phase_lines(NCR5380State *s)
++{
++    bool msg = false, cd = false, io = false;
++
++    switch (s->phase) {
++    case NCR5380_PH_MSG_OUT:
++        msg = true; cd = true; io = false;
++        break;
++    case NCR5380_PH_COMMAND:
++        cd = true;
++        break;
++    case NCR5380_PH_DATA_IN:
++        io = true;
++        break;
++    case NCR5380_PH_DATA_OUT:
++        break;
++    case NCR5380_PH_STATUS:
++        cd = true; io = true;
++        break;
++    case NCR5380_PH_MSG_IN:
++        msg = true; cd = true; io = true;
++        break;
++    default:
++        break;
++    }
++    s->peer.msg = msg;
++    s->peer.cd = cd;
++    s->peer.io = io;
++}
++
++static bool ncr5380_target_is_input(NCR5380State *s)
++{
++    return s->phase == NCR5380_PH_DATA_IN ||
++           s->phase == NCR5380_PH_STATUS ||
++           s->phase == NCR5380_PH_MSG_IN;
++}
++
++/* Is there a byte to offer?  For an input phase this is where the block layer
++ * shows through: REQ is simply absent while a read is in flight, which the
++ * initiator sees as a target that has not asked yet - a thing real targets do
++ * all the time, and the whole of why no timer is needed anywhere. */
++static bool ncr5380_target_have_byte(NCR5380State *s)
++{
++    switch (s->phase) {
++    case NCR5380_PH_DATA_IN:
++    case NCR5380_PH_DATA_OUT:
++        return s->async_buf && s->async_off < s->async_len;
++    case NCR5380_PH_MSG_OUT:
++    case NCR5380_PH_COMMAND:
++    case NCR5380_PH_STATUS:
++    case NCR5380_PH_MSG_IN:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static uint8_t ncr5380_target_out_byte(NCR5380State *s)
++{
++    switch (s->phase) {
++    case NCR5380_PH_DATA_IN:
++        return s->async_buf[s->async_off];
++    case NCR5380_PH_STATUS:
++        return s->status;
++    case NCR5380_PH_MSG_IN:
++        return MSG_COMMAND_COMPLETE;
++    default:
++        return 0;
++    }
++}
++
++/* The CDB is complete: hand it to QEMU. */
++static void ncr5380_target_command(NCR5380State *s)
++{
++    int32_t datalen;
++
++    s->sdev = scsi_device_find(&s->bus, 0, s->sel_id, s->sel_lun);
++    if (!s->sdev) {
++        /* Nothing at that logical unit.  Release the bus without status,
++         * which a driver reads as a target that went away - the honest answer
++         * when there is no device to synthesise sense data from, and one that
++         * terminates instead of looping on CHECK CONDITION. */
++        trace_ncr5380_no_lun(s->sel_id, s->sel_lun);
++        ncr5380_target_free(s);
++        return;
++    }
++
++    s->sreq = scsi_req_new(s->sdev, 0, s->sel_lun, s->cdb, s->cdb_len, s);
++    datalen = scsi_req_enqueue(s->sreq);
++    trace_ncr5380_command(s->sel_id, s->sel_lun, s->cdb[0], datalen);
++
++    s->async_buf = NULL;
++    s->async_len = s->async_off = 0;
++
++    /*
++     * Set the phase from the direction *before* scsi_req_continue, because
++     * that call can reach transfer_data synchronously for the commands
++     * scsi-disk.c answers without touching the block layer.  esp.c's
++     * do_command_phase does the same, for the same reason.
++     */
++    if (datalen > 0) {
++        s->phase = NCR5380_PH_DATA_IN;
++    } else if (datalen < 0) {
++        s->phase = NCR5380_PH_DATA_OUT;
++    }
++    s->hs = NCR5380_HS_SETUP;
++    s->dirty = true;
++
++    if (datalen != 0) {
++        scsi_req_continue(s->sreq);
++    }
++    /* datalen == 0: no data phase at all, and complete() will move us to
++     * STATUS.  It may already have done so inside scsi_req_enqueue. */
++}
++
++/* One message byte has arrived.  Returns true if MESSAGE OUT is over. */
++static bool ncr5380_target_message(NCR5380State *s, uint8_t m, bool atn)
++{
++    if (m >= 0x80) {
++        /* IDENTIFY.  Disconnection is not supported, and the privilege bit is
++         * ignored: what is wanted is the logical unit. */
++        s->sel_lun = m & 7;
++    } else if (m == MSG_ABORT || m == MSG_BUS_DEVICE_RESET) {
++        trace_ncr5380_message_abort(m);
++        if (s->sreq) {
++            SCSIRequest *r = s->sreq;
++            s->sreq = NULL;
++            scsi_req_cancel(r);
++            scsi_req_unref(r);
++        }
++        ncr5380_target_free(s);
++        return true;
++    }
++    /* Everything else is consumed and ignored, which is what every simple
++     * target does with the extended messages a driver may offer. */
++
++    /* The initiator releases ATN before the last ACK of the last message
++     * byte, so ATN as it stood at that ACK is the whole of the rule. */
++    return !atn;
++}
++
++/* A byte has been handshaked.  Decide what comes next. */
++static void ncr5380_target_advance(NCR5380State *s, uint8_t in, bool atn)
++{
++    switch (s->phase) {
++    case NCR5380_PH_MSG_OUT:
++        if (ncr5380_target_message(s, in, atn)) {
++            if (s->phase == NCR5380_PH_MSG_OUT) {
++                s->phase = NCR5380_PH_COMMAND;
++                s->cdb_n = s->cdb_len = 0;
++            }
++        }
++        break;
++
++    case NCR5380_PH_COMMAND:
++        if (s->cdb_n < (int)sizeof(s->cdb)) {
++            s->cdb[s->cdb_n++] = in;
++        }
++        if (s->cdb_n == 1) {
++            s->cdb_len = scsi_cdb_length(s->cdb);
++            if (s->cdb_len <= 0) {
++                /* An unknown group code: take six bytes, which is what the
++                 * shortest group is, and let scsi_req_new answer it.  It
++                 * never returns NULL - a bad opcode yields a request that
++                 * completes CHECK CONDITION, which is the right answer and
++                 * not ours to second-guess. */
++                s->cdb_len = 6;
++            }
++        }
++        if (s->cdb_n == s->cdb_len) {
++            ncr5380_target_command(s);
++        }
++        break;
++
++    case NCR5380_PH_DATA_IN:
++        s->async_off++;
++        if (s->async_off >= s->async_len) {
++            s->async_buf = NULL;
++            s->async_len = s->async_off = 0;
++            if (s->sreq) {
++                scsi_req_continue(s->sreq);
++            }
++        }
++        break;
++
++    case NCR5380_PH_DATA_OUT:
++        s->async_buf[s->async_off++] = in;
++        if (s->async_off >= s->async_len) {
++            s->async_buf = NULL;
++            s->async_len = s->async_off = 0;
++            if (s->sreq) {
++                scsi_req_continue(s->sreq);
++            }
++        }
++        break;
++
++    case NCR5380_PH_STATUS:
++        s->phase = NCR5380_PH_MSG_IN;
++        break;
++
++    case NCR5380_PH_MSG_IN:
++        /* COMMAND COMPLETE has been taken: drop everything. */
++        ncr5380_target_free(s);
++        break;
++
++    default:
++        break;
++    }
++}
++
++static void ncr5380_target_handshake(NCR5380State *s)
++{
++    switch (s->hs) {
++    case NCR5380_HS_SETUP:
++        if (!ncr5380_target_have_byte(s)) {
++            s->peer.req = false;
++            return;
++        }
++        if (ncr5380_target_is_input(s)) {
++            s->peer.data = ncr5380_target_out_byte(s);
++            s->peer.dbp = ncr5380_dbp(s->peer.data);
++        } else {
++            s->peer.data = 0;
++            s->peer.dbp = false;
++        }
++        s->peer.req = true;
++        s->hs = NCR5380_HS_REQ;
++        s->dirty = true;
++        break;
++
++    case NCR5380_HS_REQ:
++        if (s->wires.ack) {
++            s->hs_byte = s->wires.data;
++            s->atn_at_select = s->wires.atn;
++            s->peer.req = false;
++            s->hs = NCR5380_HS_REL;
++            s->dirty = true;
++        }
++        break;
++
++    case NCR5380_HS_REL:
++        if (!s->wires.ack) {
++            s->hs = NCR5380_HS_SETUP;
++            s->dirty = true;
++            ncr5380_target_advance(s, s->hs_byte, s->atn_at_select);
++        }
++        break;
++    }
++}
++
++/* Does anything answer at this ID?  A device may sit at a logical unit other
++ * than zero, so all eight are asked. */
++static bool ncr5380_target_present(NCR5380State *s, int id)
++{
++    int lun;
++
++    for (lun = 0; lun < 8; lun++) {
++        if (scsi_device_find(&s->bus, 0, id, lun)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void ncr5380_target_select(NCR5380State *s)
++{
++    uint8_t ids = s->wires.data;
++    int id;
++
++    /*
++     * The data bus carries the initiator's own ID and the target's, because
++     * that is how a driver that arbitrated addresses one.  The chip recorded
++     * its own when arbitration began; discount it, and take the first of what
++     * is left that anything answers to.
++     *
++     * A driver that does not arbitrate leaves arb_id at zero and nothing is
++     * discounted, which is right: then there is only one ID on the bus.
++     */
++    ids &= ~s->arb_id;
++
++    for (id = 0; id < 8; id++) {
++        if ((ids & (1u << id)) && ncr5380_target_present(s, id)) {
++            s->sel_id = id;
++            s->sel_lun = 0;
++            s->atn_at_select = s->wires.atn;
++            s->phase = NCR5380_PH_SELECTED;
++            s->peer.bsy = true;
++            s->dirty = true;
++            trace_ncr5380_select(id, s->atn_at_select);
++            return;
++        }
++    }
++    /* Nothing there.  Say nothing: BSY never appears and the driver's own
++     * selection timeout fires, which is exactly what an empty ID does on a
++     * real bus.  The timeout is the driver's and must stay the driver's. */
++}
++
++static void ncr5380_target_settled(NCR5380State *s)
++{
++    switch (s->phase) {
++    case NCR5380_PH_FREE:
++        /* SEL true, BSY false, and I/O false because I/O true would make this
++         * a reselection and there is nothing here to reselect. */
++        if (s->wires.sel && !s->wires.bsy && !s->wires.io) {
++            ncr5380_target_select(s);
++        }
++        break;
++
++    case NCR5380_PH_SELECTED:
++        s->peer.bsy = true;
++        if (!s->wires.sel) {
++            /* ATN raised at selection - or raised again afterwards, which
++             * Linux does once it has seen BSY - asks for MESSAGE OUT. */
++            s->phase = (s->atn_at_select || s->wires.atn)
++                       ? NCR5380_PH_MSG_OUT : NCR5380_PH_COMMAND;
++            s->hs = NCR5380_HS_SETUP;
++            s->cdb_n = s->cdb_len = 0;
++            s->dirty = true;
++        } else if (s->wires.atn) {
++            s->atn_at_select = true;
++        }
++        break;
++
++    default:
++        s->peer.bsy = true;
++        ncr5380_target_handshake(s);
++        break;
++    }
++
++    if (ncr5380_target_connected(s)) {
++        ncr5380_target_phase_lines(s);
++    }
++}
++
++/* ---- what QEMU's SCSI layer calls back ---------------------------------- */
++
++static void ncr5380_transfer_data(SCSIRequest *req, uint32_t len)
++{
++    NCR5380State *s = req->hba_private;
++
++    if (req != s->sreq) {
++        return;
++    }
++    s->async_buf = scsi_req_get_buf(req);
++    s->async_len = len;
++    s->async_off = 0;
++    trace_ncr5380_transfer_data(len, s->phase);
++    /* This can arrive before the phase has been set, because
++     * scsi_req_enqueue may complete synchronously; the phase is set from the
++     * direction in ncr5380_target_command and not from here. */
++    s->dirty = true;
++    ncr5380_settle(s);
++}
++
++static void ncr5380_command_complete(SCSIRequest *req, size_t residual)
++{
++    NCR5380State *s = req->hba_private;
++
++    if (req != s->sreq) {
++        return;
++    }
++    s->status = req->status;
++    s->async_buf = NULL;
++    s->async_len = s->async_off = 0;
++    s->phase = NCR5380_PH_STATUS;
++    s->hs = NCR5380_HS_SETUP;
++    trace_ncr5380_complete(s->status, residual);
++    /*
++     * The request is not unreferenced here, the way esp.c does it: STATUS and
++     * MESSAGE IN are still to be handshaked, and a cancel arriving in between
++     * needs something to cancel.  ncr5380_target_free drops it.
++     */
++    s->dirty = true;
++    ncr5380_settle(s);
++}
++
++static void ncr5380_request_cancelled(SCSIRequest *req)
++{
++    NCR5380State *s = req->hba_private;
++
++    if (req != s->sreq) {
++        return;
++    }
++    s->sreq = NULL;
++    scsi_req_unref(req);
++    s->async_buf = NULL;
++    s->async_len = s->async_off = 0;
++    ncr5380_target_free(s);
++    ncr5380_settle(s);
++}
++
++static const SCSIBusInfo ncr5380_scsi_info = {
++    .tcq = false,               /* the 5380 has nowhere to keep a tag */
++    .max_target = 7,
++    .max_lun = 7,
++
++    .transfer_data = ncr5380_transfer_data,
++    .complete = ncr5380_command_complete,
++    .cancel = ncr5380_request_cancelled,
++};
++
++/* ------------------------------------------------------------------------ */
++/* QOM                                                                      */
++/* ------------------------------------------------------------------------ */
++
++static void ncr5380_realize(DeviceState *dev, Error **errp)
++{
++    NCR5380State *s = NCR5380(dev);
++
++    /* The two pins a board cares about.  DRQ is a real output and not a
++     * status bit a board polls: with a software target a byte can become
++     * available while the guest is touching nothing at all - a read
++     * completing on the block layer's own thread - and a board with a DMA
++     * controller in front of the chip needs to be told rather than to spin. */
++    qdev_init_gpio_out(dev, &s->irq, 1);
++    qdev_init_gpio_out_named(dev, &s->drq, "drq", 1);
++}
++
++/*
++ * Attach the SCSI bus, with the *board* as its parent device.
++ *
++ * The bus lives in the chip because that is whose bus it is, but a device
++ * realized with no parent bus of its own is not reachable from the qdev tree,
++ * and a bus hanging off one is not either - so `-device scsi-hd` would answer
++ * "No 'SCSI' bus found" and mean it.  esp.c has the same split and solves it
++ * the same way, passing the board to scsi_bus_init while the SCSIBus struct
++ * sits in ESPState.
++ */
++void ncr5380_bus_init(NCR5380State *s, DeviceState *board)
++{
++    scsi_bus_init(&s->bus, sizeof(s->bus), board, &ncr5380_scsi_info);
++    ncr5380_hard_reset(s);
++}
++
++static void ncr5380_reset_hold(Object *obj, ResetType type)
++{
++    NCR5380State *s = NCR5380(obj);
++
++    ncr5380_hard_reset(s);
++}
++
++static void ncr5380_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = ncr5380_realize;
++    dc->desc = "NCR 5380 SCSI protocol controller";
++    /* A chip is not a board.  Every 5380 machine put the same eight registers
++     * somewhere different, so what is user-creatable is the board. */
++    dc->user_creatable = false;
++    rc->phases.hold = ncr5380_reset_hold;
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo ncr5380_info = {
++    .name          = TYPE_NCR5380,
++    .parent        = TYPE_DEVICE,
++    .instance_size = sizeof(NCR5380State),
++    .class_init    = ncr5380_class_init,
++};
++
++static void ncr5380_register_types(void)
++{
++    type_register_static(&ncr5380_info);
++}
++
++type_init(ncr5380_register_types)
+diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
+index 0233b29f01..4b702d56d9 100644
+--- a/hw/scsi/trace-events
++++ b/hw/scsi/trace-events
+@@ -402,3 +402,16 @@ sun3_si_stalled(uint16_t resid, uint8_t csb, uint8_t bsr, int drq) "stalled with
+ sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
+ sun3_si_irq(int level, uint16_t csr, const char *who) "level 2 %d, csr 0x%04x, from %s"
+ sun3_si_clock(const char *what, int64_t guest_us, int64_t core_us, int64_t lag_us, uint64_t clamped) "%s: guest %"PRId64" us, core %"PRId64" us, core is %"PRId64" us behind, %"PRIu64" clamped"
++
++# ncr5380.c
++ncr5380_reg_read(int reg, uint8_t val) "reg %d -> 0x%02x"
++ncr5380_reg_write(int reg, uint8_t val) "reg %d <- 0x%02x"
++ncr5380_dma_state(int from, int to) "dma %d -> %d"
++ncr5380_irq(int level) "irq %d"
++ncr5380_select(int id, bool atn) "select id %d atn %d"
++ncr5380_command(int id, int lun, uint8_t op, int32_t datalen) "id %d lun %d op 0x%02x datalen %d"
++ncr5380_transfer_data(uint32_t len, int phase) "%u bytes, phase %d"
++ncr5380_complete(uint8_t status, size_t residual) "status 0x%02x residual %zu"
++ncr5380_no_lun(int id, int lun) "nothing at id %d lun %d"
++ncr5380_message_abort(uint8_t msg) "message 0x%02x: abort"
++ncr5380_bus_free(void) "bus free"
+diff --git a/include/hw/scsi/ncr5380.h b/include/hw/scsi/ncr5380.h
+new file mode 100644
+index 0000000000..0521a1da82
+--- /dev/null
++++ b/include/hw/scsi/ncr5380.h
+@@ -0,0 +1,199 @@
++/*
++ * NCR 5380 SCSI protocol controller.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * The chip, separately from any board that carries it.  Every machine that
++ * used a 5380 presented the same eight registers, because the part decoded
++ * /CS with A0..A2 and /IOR or /IOW on the die (design manual p. 6); what the
++ * boards differ in is where those registers land, whether there is a DMA
++ * controller in front of them, and what answers DRQ.  So the boards are
++ * separate objects and this is what they all embed, in the same way esp.c
++ * splits TYPE_ESP from the three boards that carry an ESP.
++ *
++ * Page numbers throughout are the printed pages of the NCR 5380 family design
++ * manual, March 1986.
++ */
++
++#ifndef HW_SCSI_NCR5380_H
++#define HW_SCSI_NCR5380_H
++
++#include "hw/scsi/scsi.h"
++#include "hw/core/irq.h"
++#include "qom/object.h"
++
++#define TYPE_NCR5380 "ncr5380"
++OBJECT_DECLARE_SIMPLE_TYPE(NCR5380State, NCR5380)
++
++/*
++ * The SCSI bus as this chip sees it, active *high*.
++ *
++ * A real bus is wired-OR over open-collector drivers and every signal is
++ * asserted low; taking the inversion out at the pad turns the wired-OR into a
++ * plain OR and leaves one less thing to get backwards.  This is the same
++ * decision, and the same field list, as scsi_t in the Verilated model's
++ * src/wish5380_pkg.sv, so that the two can be read side by side.
++ */
++typedef struct NCR5380Wires {
++    bool rst;
++    bool bsy;
++    bool sel;
++    bool req;
++    bool ack;
++    bool atn;
++    bool msg;
++    bool cd;
++    bool io;
++    uint8_t data;
++    bool dbp;                   /* the parity bit as driven, not as computed */
++} NCR5380Wires;
++
++/* The DMA handshake, pp. 14 and 24.  Named for what the chip is waiting for,
++ * and deliberately the same eight states as the Verilated model's sci_bus.sv:
++ * a difference between the two should be visible as a difference in the
++ * state's name and not buried in a re-derivation. */
++typedef enum NCR5380DmaState {
++    NCR5380_DMA_IDLE,
++    NCR5380_DMA_S_WANT,         /* send: waiting for the host's byte */
++    NCR5380_DMA_S_HAVE,         /* send: byte in ODR, not offered yet */
++    NCR5380_DMA_S_HS,           /* send: our handshake asserted */
++    NCR5380_DMA_S_TREL,         /* send, as target: waiting for ACK to go */
++    NCR5380_DMA_R_WANT,         /* recv: waiting for a byte */
++    NCR5380_DMA_R_HAVE,         /* recv: byte in IDR, DRQ up */
++    NCR5380_DMA_R_HS,           /* recv: our handshake asserted */
++} NCR5380DmaState;
++
++/* Where the target side of the bus has got to.  This is the phase sequence a
++ * direct-access device walks, and it is what the adapter to QEMU's SCSIBus
++ * turns into scsi_req_new / scsi_req_continue / complete. */
++typedef enum NCR5380Phase {
++    NCR5380_PH_FREE,
++    NCR5380_PH_SELECTED,        /* BSY asserted, waiting for SEL to drop */
++    NCR5380_PH_MSG_OUT,
++    NCR5380_PH_COMMAND,
++    NCR5380_PH_DATA_IN,
++    NCR5380_PH_DATA_OUT,
++    NCR5380_PH_STATUS,
++    NCR5380_PH_MSG_IN,
++} NCR5380Phase;
++
++/* The byte handshake, from the target's side: settle the lines, offer the
++ * byte with REQ, wait for ACK to go away again. */
++typedef enum NCR5380Hs {
++    NCR5380_HS_SETUP,
++    NCR5380_HS_REQ,
++    NCR5380_HS_REL,
++} NCR5380Hs;
++
++struct NCR5380State {
++    DeviceState parent_obj;
++
++    SCSIBus bus;
++    qemu_irq irq;               /* the IRQ pin */
++    qemu_irq drq;               /* the DRQ pin */
++
++    /* ---- the five registers that are storage (p. 10) ------------------- */
++    uint8_t odr;                /* Output Data */
++    uint8_t icr;                /* Initiator Command, as written */
++    uint8_t mr;                 /* Mode */
++    uint8_t tcr;                /* Target Command */
++    uint8_t ser;                /* Select Enable */
++
++    /* ---- the engine's own state --------------------------------------- */
++    uint8_t idr;                /* Input Data, latched by a DMA receive */
++    bool aip;                   /* ICR bit 6 on read */
++    bool lost_arb;              /* ICR bit 5 on read */
++    bool arb_active;
++    uint8_t arb_id;             /* the ODR when arbitration began (p. 12) */
++
++    bool par_err;               /* BSR bit 5, emptied by reading register 7 */
++    bool busy_err;              /* BSR bit 2, and level sensitive (p. 16) */
++    bool irq_latch;             /* BSR bit 4 */
++    bool end_dma;               /* BSR bit 7, cleared only by clearing MR.DMA */
++
++    NCR5380DmaState dma_st;
++    bool dma_tgt;               /* the role the transfer was started in */
++    bool drq_raw;               /* before the MR.DMA gate */
++    bool eop;                   /* the End of Process pin */
++
++    bool prev_req;              /* edge detectors */
++    bool prev_rst;
++
++    /* ---- the wires ----------------------------------------------------- */
++    NCR5380Wires drv;           /* what this chip drives */
++    NCR5380Wires peer;          /* what everything else drives */
++    NCR5380Wires wires;         /* the OR of the two: what everybody sees */
++
++    /* ---- strobes, consumed by the next settle -------------------------- */
++    bool st_csd_rd;             /* read 0:  where parity is checked (p. 21) */
++    bool st_rpi;                /* read 7:  Reset Parity/Interrupt */
++    bool st_sds;                /* write 5: Start DMA Send */
++    bool st_sdtr;               /* write 6: Start DMA Target Receive */
++    bool st_sdir;               /* write 7: Start DMA Initiator Receive */
++    bool st_dack_rd;
++    bool st_dack_wr;
++
++    /* ---- the target side: QEMU's SCSI bus behind a phase sequence ------ */
++    NCR5380Phase phase;
++    NCR5380Hs hs;
++    SCSIDevice *sdev;
++    SCSIRequest *sreq;
++    int sel_id;
++    int sel_lun;
++    bool atn_at_select;
++
++    uint8_t cdb[16];
++    int cdb_n;
++    int cdb_len;
++
++    uint8_t *async_buf;         /* scsi_req_get_buf's window */
++    uint32_t async_len;
++    uint32_t async_off;
++    uint8_t status;
++    uint8_t hs_byte;            /* the byte REQ is offering, on the way in */
++
++    /* ---- housekeeping --------------------------------------------------- */
++    bool settling;              /* re-entrancy guard on the settle loop */
++    bool dirty;
++    int irq_level;
++    int drq_level;
++};
++
++/*
++ * What a board may do to the chip.  This is the whole of it, and its
++ * smallness is a property of the part: a 5380 has no address counter and no
++ * byte counter, so it never masters a bus and there is no guest memory for it
++ * to reach.  Everything else a board does - decoding a register window,
++ * counting bytes, driving an Am9516 - is the board's own.
++ */
++
++/* Give the chip its SCSI bus, and bring it up.  Called by the board once it
++ * has realized the chip, and passing the *board* so that the bus is reachable
++ * from the qdev tree - see the comment on the implementation. */
++void ncr5380_bus_init(NCR5380State *s, DeviceState *board);
++
++/* The RESET pin.  Clears everything, including the interrupt latch, which is
++ * what distinguishes it from an SCSI bus reset (p. 23). */
++void ncr5380_hard_reset(NCR5380State *s);
++
++/* The eight registers, as A2..A0 select them.  A read of 7 and a write of 5,
++ * 6 or 7 are events and not accesses to storage, so each must be called
++ * exactly once per guest access and never speculatively. */
++uint8_t ncr5380_reg_read(NCR5380State *s, int reg);
++void ncr5380_reg_write(NCR5380State *s, int reg, uint8_t val);
++
++/* The DMA handshake.  An access with DACK asserted does not decode the
++ * address at all (p. 6) - the DMA controller has no address lines to offer -
++ * which is why there is no register number here. */
++bool ncr5380_drq(NCR5380State *s);
++uint8_t ncr5380_dack_read(NCR5380State *s);
++void ncr5380_dack_write(NCR5380State *s, uint8_t val);
++
++/* Hold End of Process asserted across the next acknowledge cycle, which is
++ * what sets END OF DMA and, if it is enabled, interrupts. */
++void ncr5380_set_eop(NCR5380State *s, bool asserted);
++
++/* The interrupt pin, as it stands now. */
++bool ncr5380_irq(NCR5380State *s);
++
++#endif /* HW_SCSI_NCR5380_H */
+-- 
+2.39.5
+

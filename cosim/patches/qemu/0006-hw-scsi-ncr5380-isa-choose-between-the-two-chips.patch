@@ -1,0 +1,474 @@
+From ded4174479e3ee08c8d367fbd786fe4a569ca954 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 8 Aug 2026 10:27:17 +0200
+Subject: [PATCH 6/6] hw/scsi/ncr5380-isa: choose between the two chips
+
+The card grows core=auto|sw|rtl.  With sw it embeds the software 5380
+and its disks are QEMU's own, from -device scsi-hd; with rtl it loads
+the Verilated wish5380 exactly as before.  auto keeps every existing
+command line working: rtl if rtl= was given, sw otherwise.
+
+A driver cannot tell the two apart, and that is the experiment.  The
+same eight registers, two independent implementations - one derived from
+the datasheet in SystemVerilog and one derived from it again in C - with
+Linux's g_NCR5380 as the judge.
+
+The contradictory combinations are refused by name rather than ignored:
+core=rtl without rtl=, and core=sw with rtl= or image=, because on the
+software path there is no SD card and a disk named that way would come
+from somewhere the user did not mean.
+
+All the pacing is now on the rtl path only.  It exists because a
+Verilated core advances only when it is stepped and the target and SD
+card behind it must advance while the guest is between accesses; the
+software chip has no time in it, so the microsecond per access and the
+500 us timer are simply not created.  On this card that reduces each
+access handler to one call.
+
+The software chip is built in realize rather than instance_init because
+on the rtl path there is no software chip at all, and QEMU asserts that
+every device it can see has been realized.
+
+Its SCSI bus is initialised with the *board* as parent, which is what
+esp.c does and not an accident: a device realized with no parent bus is
+not reachable from the qdev tree, and neither is a bus hanging off one,
+so -device scsi-hd would answer "No 'SCSI' bus found" and be right.
+---
+ hw/scsi/Kconfig       |   1 +
+ hw/scsi/ncr5380-isa.c | 275 +++++++++++++++++++++++++++---------------
+ 2 files changed, 179 insertions(+), 97 deletions(-)
+
+diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
+index 8c3598253d..de792bf6f4 100644
+--- a/hw/scsi/Kconfig
++++ b/hw/scsi/Kconfig
+@@ -80,6 +80,7 @@ config NCR5380_ISA
+     bool
+     default y
+     depends on ISA_BUS
++    select NCR5380
+ 
+ config NCR5380
+     bool
+diff --git a/hw/scsi/ncr5380-isa.c b/hw/scsi/ncr5380-isa.c
+index b8c740b76d..0e92b20b42 100644
+--- a/hw/scsi/ncr5380-isa.c
++++ b/hw/scsi/ncr5380-isa.c
+@@ -1,5 +1,5 @@
+ /*
+- * An ISA card carrying an NCR 5380, backed by the Verilated wish5380.
++ * An ISA card carrying an NCR 5380.
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -9,18 +9,19 @@
+  * generic board has nothing else either, and the driver reaches the chip with
+  * `inb(base + reg)`.
+  *
+- * The chip itself is not modelled here.  The card loads the shared library
+- * built by cosim/rtl and asks it the same handful of questions any 5380 model
+- * would be asked: reset, read or write a register, is the interrupt asserted.
+- * That is the whole interface, and its smallness is a property of the part:
+- * a 5380 never masters the bus, so there is no DMA path to arrange and no
+- * guest memory to reach.
++ * The chip behind the port is either of two, and that is the point of the
++ * card.  With `core=sw` it is hw/scsi/ncr5380.c and the disks are QEMU's own,
++ * from -drive if=scsi.  With `core=rtl` it is the Verilated wish5380 in a
++ * shared library, with an SD card model behind it and a raw image file behind
++ * that.  A driver cannot tell which it is talking to, which is the whole
++ * experiment: the same eight registers, two independent implementations.
+  *
+- * Time is the awkward part.  The core only advances when it is stepped, and
+- * the SCSI target and the SD card behind it need to advance while the guest
+- * is between accesses - waiting out a udelay, or spinning on jiffies.  So
+- * every access steps the core a little, and a timer steps it while nothing is
+- * happening at all.
++ * Time is only awkward on the RTL path.  That core advances only when it is
++ * stepped, and the SCSI target and SD card behind it need to advance while
++ * the guest is between accesses - waiting out a udelay, or spinning on
++ * jiffies - so every access steps it a little and a timer steps it while
++ * nothing is happening.  The software core has no time in it at all and needs
++ * none of that; the pacing below is switched off wholesale when it is in use.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -28,9 +29,11 @@
+ #include "hw/isa/isa.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
++#include "hw/scsi/ncr5380.h"
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
+ #include "system/runstate.h"
++#include "system/system.h"
+ #include "qom/object.h"
+ 
+ #include <dlfcn.h>
+@@ -50,8 +53,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Ncr5380IsaState, NCR5380_ISA)
+ #define WISH_RTL_ABI 2
+ typedef struct WishRtl WishRtl;
+ 
+-/* How far the core is stepped for each register access, and how often and how
+- * far it is stepped when the guest is doing something else.  Both are the
++/* How far the RTL core is stepped for each register access, and how often and
++ * how far it is stepped when the guest is doing something else.  Both are the
+  * core's own time, which runs ahead of the guest's: a real part is faster than
+  * the bus it sits on, so no driver can tell. */
+ #define STEP_PER_ACCESS_NS  1000
+@@ -63,10 +66,14 @@ struct Ncr5380IsaState {
+ 
+     uint32_t iobase;
+     uint32_t isairq;
++    char *core;
+     char *rtl;
+     char *image;
+     uint32_t blocks;
+ 
++    bool use_rtl;
++    NCR5380State chip;          /* only realized when use_rtl is false */
++
+     MemoryRegion io;
+     qemu_irq irq;
+     QEMUTimer *timer;
+@@ -91,7 +98,7 @@ struct Ncr5380IsaState {
+ /* QEMU does not unrealize devices on the way out, and the card image is only
+  * written back when the library is told to.  Without this, everything the
+  * guest wrote would live and die inside the SD card model. */
+-static void ncr5380_exit_notify(Notifier *n, void *opaque)
++static void ncr5380_isa_exit_notify(Notifier *n, void *opaque)
+ {
+     Ncr5380IsaState *s = container_of(n, Ncr5380IsaState, exit_notifier);
+     if (s->dev) {
+@@ -99,7 +106,9 @@ static void ncr5380_exit_notify(Notifier *n, void *opaque)
+     }
+ }
+ 
+-static void ncr5380_update_irq(Ncr5380IsaState *s)
++/* Only the RTL path needs this.  The software core drives its interrupt pin
++ * itself, through the gpio the board connected at realize. */
++static void ncr5380_isa_update_irq(Ncr5380IsaState *s)
+ {
+     int level = s->f_irq(s->dev);
+     if (level != s->irq_level) {
+@@ -108,37 +117,49 @@ static void ncr5380_update_irq(Ncr5380IsaState *s)
+     }
+ }
+ 
+-static uint64_t ncr5380_read(void *opaque, hwaddr addr, unsigned size)
++static uint64_t ncr5380_isa_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     Ncr5380IsaState *s = opaque;
+-    uint8_t v = s->f_read(s->dev, (int)(addr & 7));
++    uint8_t v;
++
++    if (!s->use_rtl) {
++        return ncr5380_reg_read(&s->chip, addr & 7);
++    }
++
++    v = s->f_read(s->dev, (int)(addr & 7));
+     s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
+-    ncr5380_update_irq(s);
++    ncr5380_isa_update_irq(s);
+     return v;
+ }
+ 
+-static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
+-                          unsigned size)
++static void ncr5380_isa_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
+ {
+     Ncr5380IsaState *s = opaque;
++
++    if (!s->use_rtl) {
++        ncr5380_reg_write(&s->chip, addr & 7, (uint8_t)val);
++        return;
++    }
++
+     s->f_write(s->dev, (int)(addr & 7), (uint8_t)val);
+     s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
+-    ncr5380_update_irq(s);
++    ncr5380_isa_update_irq(s);
+ }
+ 
+-static const MemoryRegionOps ncr5380_ops = {
+-    .read = ncr5380_read,
+-    .write = ncr5380_write,
++static const MemoryRegionOps ncr5380_isa_ops = {
++    .read = ncr5380_isa_read,
++    .write = ncr5380_isa_write,
+     .valid.min_access_size = 1,
+     .valid.max_access_size = 1,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
+-static void ncr5380_tick(void *opaque)
++static void ncr5380_isa_tick(void *opaque)
+ {
+     Ncr5380IsaState *s = opaque;
+     s->f_run_ns(s->dev, TIMER_STEP_NS);
+-    ncr5380_update_irq(s);
++    ncr5380_isa_update_irq(s);
+     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
+ }
+ 
+@@ -151,76 +172,134 @@ static void *sym(Ncr5380IsaState *s, const char *name, Error **errp)
+     return p;
+ }
+ 
+-static void ncr5380_realize(DeviceState *dev, Error **errp)
++/* Which core, and refuse the combinations that would take a disk from
++ * somewhere the user did not mean. */
++static bool ncr5380_isa_pick_core(Ncr5380IsaState *s, Error **errp)
+ {
+-    ISADevice *isadev = ISA_DEVICE(dev);
+-    Ncr5380IsaState *s = NCR5380_ISA(dev);
+-
+-    if (!s->rtl) {
+-        error_setg(errp, "rtl= is required: this card has no chip of its own, "
+-                         "it puts the Verilated wish5380 behind the port");
+-        return;
++    const char *c = s->core ?: "auto";
++
++    if (!strcmp(c, "auto")) {
++        s->use_rtl = s->rtl != NULL;
++    } else if (!strcmp(c, "rtl")) {
++        s->use_rtl = true;
++    } else if (!strcmp(c, "sw")) {
++        s->use_rtl = false;
++    } else {
++        error_setg(errp, "core=%s: expected auto, sw or rtl", c);
++        return false;
+     }
+ 
+-    s->dl = dlopen(s->rtl, RTLD_NOW);
+-    if (!s->dl) {
+-        error_setg(errp, "cannot load %s: %s", s->rtl, dlerror());
+-        return;
++    if (s->use_rtl && !s->rtl) {
++        error_setg(errp, "core=rtl needs rtl=: this card has no chip of its "
++                         "own then, it puts the Verilated wish5380 behind the "
++                         "port");
++        return false;
+     }
+-
+-#define GET(field, name)                                    \
+-    do {                                                    \
+-        s->field = sym(s, name, errp);                      \
+-        if (!s->field) { return; }                          \
+-    } while (0)
+-    GET(f_abi, "wish_rtl_abi");
+-    GET(f_new, "wish_rtl_new");
+-    GET(f_free, "wish_rtl_free");
+-    GET(f_flush, "wish_rtl_flush");
+-    GET(f_reset, "wish_rtl_reset");
+-    GET(f_write, "wish_rtl_write");
+-    GET(f_read, "wish_rtl_read");
+-    GET(f_irq, "wish_rtl_irq");
+-    GET(f_run_ns, "wish_rtl_run_ns");
+-    GET(f_time_ns, "wish_rtl_time_ns");
+-#undef GET
+-
+-    if (s->f_abi() != WISH_RTL_ABI) {
+-        error_setg(errp, "%s: ABI %u, this card speaks %u",
+-                   s->rtl, s->f_abi(), WISH_RTL_ABI);
+-        return;
++    if (!s->use_rtl && s->rtl) {
++        error_setg(errp, "core=sw and rtl= are contradictory: the software "
++                         "chip is built in and the library would not be "
++                         "loaded");
++        return false;
+     }
+-
+-    s->dev = s->f_new(s->image, s->blocks);
+-    if (!s->dev) {
+-        error_setg(errp, "%s: could not create the device", s->rtl);
+-        return;
++    if (!s->use_rtl && s->image) {
++        error_setg(errp, "core=sw and image= are contradictory: the software "
++                         "chip has no SD card behind it, its disks come from "
++                         "-drive if=scsi");
++        return false;
+     }
++    return true;
++}
+ 
+-    /* Bring the card up before the guest is anywhere near it, which is what a
+-     * machine that finishes its power-on self test before probing SCSI would
+-     * do.  An SD card takes milliseconds; the guest never sees them. */
+-    if (!s->f_reset(s->dev)) {
+-        error_setg(errp, "the card behind %s never came up", s->rtl);
++static void ncr5380_isa_realize(DeviceState *dev, Error **errp)
++{
++    ISADevice *isadev = ISA_DEVICE(dev);
++    Ncr5380IsaState *s = NCR5380_ISA(dev);
++
++    if (!ncr5380_isa_pick_core(s, errp)) {
+         return;
+     }
+ 
+     s->irq = isa_get_irq(isadev, s->isairq);
+     s->irq_level = 0;
+ 
+-    memory_region_init_io(&s->io, OBJECT(dev), &ncr5380_ops, s,
++    if (!s->use_rtl) {
++        /* Built here rather than in instance_init, because on the RTL path
++         * there is no software chip at all and QEMU asserts that every device
++         * it can see has been realized. */
++        object_initialize_child(OBJECT(dev), "ncr5380", &s->chip,
++                                TYPE_NCR5380);
++        if (!qdev_realize(DEVICE(&s->chip), NULL, errp)) {
++            return;
++        }
++        ncr5380_bus_init(&s->chip, dev);
++        qdev_connect_gpio_out(DEVICE(&s->chip), 0, s->irq);
++    } else {
++        s->dl = dlopen(s->rtl, RTLD_NOW);
++        if (!s->dl) {
++            error_setg(errp, "cannot load %s: %s", s->rtl, dlerror());
++            return;
++        }
++
++#define GET(field, name)                                    \
++        do {                                                \
++            s->field = sym(s, name, errp);                  \
++            if (!s->field) { return; }                      \
++        } while (0)
++        GET(f_abi, "wish_rtl_abi");
++        GET(f_new, "wish_rtl_new");
++        GET(f_free, "wish_rtl_free");
++        GET(f_flush, "wish_rtl_flush");
++        GET(f_reset, "wish_rtl_reset");
++        GET(f_write, "wish_rtl_write");
++        GET(f_read, "wish_rtl_read");
++        GET(f_irq, "wish_rtl_irq");
++        GET(f_run_ns, "wish_rtl_run_ns");
++        GET(f_time_ns, "wish_rtl_time_ns");
++#undef GET
++
++        if (s->f_abi() != WISH_RTL_ABI) {
++            error_setg(errp, "%s: ABI %u, this card speaks %u",
++                       s->rtl, s->f_abi(), WISH_RTL_ABI);
++            return;
++        }
++
++        s->dev = s->f_new(s->image, s->blocks);
++        if (!s->dev) {
++            error_setg(errp, "%s: could not create the device", s->rtl);
++            return;
++        }
++
++        /* Bring the card up before the guest is anywhere near it, which is
++         * what a machine that finishes its power-on self test before probing
++         * SCSI would do.  An SD card takes milliseconds; the guest never sees
++         * them. */
++        if (!s->f_reset(s->dev)) {
++            error_setg(errp, "the card behind %s never came up", s->rtl);
++            return;
++        }
++    }
++
++    memory_region_init_io(&s->io, OBJECT(dev), &ncr5380_isa_ops, s,
+                           TYPE_NCR5380_ISA, 8);
+     memory_region_add_subregion(isa_address_space_io(isadev), s->iobase,
+                                 &s->io);
+ 
+-    s->exit_notifier.notify = ncr5380_exit_notify;
+-    qemu_add_exit_notifier(&s->exit_notifier);
+-
+-    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ncr5380_tick, s);
+-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++    if (s->use_rtl) {
++        s->exit_notifier.notify = ncr5380_isa_exit_notify;
++        qemu_add_exit_notifier(&s->exit_notifier);
++
++        s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ncr5380_isa_tick, s);
++        timer_mod(s->timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TIMER_PERIOD_NS);
++    } else {
++        /* -drive if=scsi,... becomes an scsi-hd on the chip's bus.  The PC
++         * machine's default drive type is IF_IDE, so this one has to be
++         * asked for by name. */
++        scsi_bus_legacy_handle_cmdline(&s->chip.bus);
++    }
+ }
+ 
+-static void ncr5380_unrealize(DeviceState *dev)
++static void ncr5380_isa_unrealize(DeviceState *dev)
+ {
+     Ncr5380IsaState *s = NCR5380_ISA(dev);
+ 
+@@ -233,50 +312,52 @@ static void ncr5380_unrealize(DeviceState *dev)
+     }
+ }
+ 
+-static void ncr5380_reset(DeviceState *dev)
++static void ncr5380_isa_reset(DeviceState *dev)
+ {
+     Ncr5380IsaState *s = NCR5380_ISA(dev);
+ 
+     /* A machine reset does not take the card down: the guest is rebooting,
+-     * not being unplugged, and bringing the SD card up again would cost
+-     * milliseconds of simulated time for nothing.  The chip's own RESET pin
+-     * is what the driver pulses, and that reaches the core through the
+-     * registers. */
+-    if (s->dev) {
+-        ncr5380_update_irq(s);
++     * not being unplugged, and on the RTL path bringing the SD card up again
++     * would cost milliseconds of simulated time for nothing.  The chip's own
++     * RESET pin is what the driver pulses, and that reaches either core
++     * through the registers.  The software chip is a child device and QEMU
++     * resets it for us. */
++    if (s->use_rtl && s->dev) {
++        ncr5380_isa_update_irq(s);
+     }
+ }
+ 
+-static const Property ncr5380_properties[] = {
++static const Property ncr5380_isa_properties[] = {
+     DEFINE_PROP_UINT32("iobase", Ncr5380IsaState, iobase, 0x350),
+     DEFINE_PROP_UINT32("irq", Ncr5380IsaState, isairq, 5),
++    DEFINE_PROP_STRING("core", Ncr5380IsaState, core),
+     DEFINE_PROP_STRING("rtl", Ncr5380IsaState, rtl),
+     DEFINE_PROP_STRING("image", Ncr5380IsaState, image),
+     DEFINE_PROP_UINT32("blocks", Ncr5380IsaState, blocks, 4096),
+ };
+ 
+-static void ncr5380_class_init(ObjectClass *klass, const void *data)
++static void ncr5380_isa_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+-    dc->realize = ncr5380_realize;
+-    dc->unrealize = ncr5380_unrealize;
+-    device_class_set_legacy_reset(dc, ncr5380_reset);
+-    dc->desc = "NCR 5380 SCSI on an ISA card, behind the Verilated wish5380";
+-    device_class_set_props(dc, ncr5380_properties);
++    dc->realize = ncr5380_isa_realize;
++    dc->unrealize = ncr5380_isa_unrealize;
++    device_class_set_legacy_reset(dc, ncr5380_isa_reset);
++    dc->desc = "NCR 5380 SCSI on an ISA card";
++    device_class_set_props(dc, ncr5380_isa_properties);
+     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+ }
+ 
+-static const TypeInfo ncr5380_info = {
++static const TypeInfo ncr5380_isa_info = {
+     .name          = TYPE_NCR5380_ISA,
+     .parent        = TYPE_ISA_DEVICE,
+     .instance_size = sizeof(Ncr5380IsaState),
+-    .class_init    = ncr5380_class_init,
++    .class_init    = ncr5380_isa_class_init,
+ };
+ 
+-static void ncr5380_register_types(void)
++static void ncr5380_isa_register_types(void)
+ {
+-    type_register_static(&ncr5380_info);
++    type_register_static(&ncr5380_isa_info);
+ }
+ 
+-type_init(ncr5380_register_types)
++type_init(ncr5380_isa_register_types)
+-- 
+2.39.5
+

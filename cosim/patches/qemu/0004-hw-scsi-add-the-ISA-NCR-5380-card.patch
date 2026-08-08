@@ -1,7 +1,7 @@
 From 5e05ee19e2ff1a962164728a0609949ec4ce6e32 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 10:03:30 +0200
-Subject: [PATCH 4/4] hw/scsi: add the ISA NCR 5380 card
+Subject: [PATCH 4/6] hw/scsi: add the ISA NCR 5380 card
 
 This is the card the Linux co-simulation has used since the start, moved
 here from a patch against a QEMU 7.2.22 release tarball.  Nothing about
