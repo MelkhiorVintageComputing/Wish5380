@@ -82,6 +82,9 @@ make -C cosim/rtl check # drive the Verilated core through a driver's own
                         # sequences, with no emulator in the loop
 cosim/scripts/run-tt.py # an Atari TT under EmuTOS: the cheapest of the three
                         # co-simulated machines, and a whole boot in a minute
+cosim/scripts/diff-5380.py  # the RTL and the software model, same stimulus,
+                        # every read compared.  Seconds, and it has already
+                        # found a bug in each of them
 ```
 
 `make test` must stay green on **both boards**.  Green means 0 failed; pending
@@ -356,6 +359,16 @@ datasheet; where they disagree, one of them has read it wrong, and neither is
 allowed to derive anything from the other.  The Atari TT has no `--core`:
 Hatari has no `SCSIBus` to put behind the model, and `run-tt.py --stock`
 already gives it Hatari's own 5380 for comparison.
+
+**`cosim/scripts/diff-5380.py` is how that disagreement gets found.**  It puts
+both cards in one QEMU, drives every access to both and compares every read,
+so the stimulus is identical by construction; thirteen scripted checks, one
+per datasheet trap, then a seeded random walk over the register port.  It runs
+in seconds and it found a bug in each model on its first outing - including
+one in `src/`, which is the point of keeping the two independent.  The rule it
+works under is that no target answers on either side, so it never selects ID 0
+and never puts bit 0 into the Output Data Register; `cosim/README.md` says why
+and what that leaves uncovered.
 
 ## Conventions
 

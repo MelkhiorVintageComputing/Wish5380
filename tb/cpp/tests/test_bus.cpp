@@ -202,6 +202,40 @@ TEST(bus_arbitration_waits_out_the_bus_free_filter) {
   CHECK(env.chip_read(sci::R_CSB) & sci::CSB_BSY);
 }
 
+TEST(bus_arbitration_needs_bsy_false_now_and_not_only_lately) {
+  env.power_on_reset();
+
+  // Arbitration is blocked by SEL rather than by BSY, so the bus free filter
+  // fills right up while the block is in force: "arbitration will begin if the
+  // bus is free, SEL is inactive and the ARBITRATION bit is active" (p. 18),
+  // and only BSY feeds the filter.
+  env.chip_write(sci::R_ODR, 0x80);
+  env.chip_write(sci::R_ICR, sci::ICR_SEL);
+  env.chip_write(sci::R_MR, sci::MR_ARB);
+  env.tick(int(env.ticks_for_ps(sci::T_BUS_FREE_PS) + 8));
+  CHECK_MSG(!(env.chip_read(sci::R_ICR) & sci::ICR_AIP),
+            "arbitration started with SEL asserted");
+
+  // Now one access drops SEL and asserts BSY together.  The filter's count is
+  // a clock behind and still reads "free"; BSY says the bus is not free now,
+  // and now is what decides.  Testing a stale count against a fresh SEL is
+  // two different clocks in one condition, and it starts arbitration on a bus
+  // this chip is itself holding.
+  //
+  // No driver writes this - Linux asserts BSY only once it has won - which is
+  // why it went unnoticed until the software model in cosim/patches/qemu/ was
+  // driven through the same random register walk and disagreed about AIP.
+  env.chip_write(sci::R_ICR, sci::ICR_BSY);
+  env.tick(4);
+  CHECK_MSG(!(env.chip_read(sci::R_ICR) & sci::ICR_AIP),
+            "arbitration started while this chip was asserting BSY itself");
+
+  // Release BSY and it starts, once the filter has refilled for real.
+  env.chip_write(sci::R_ICR, 0);
+  env.tick(int(env.ticks_for_ps(sci::T_BUS_FREE_PS) + 8));
+  CHECK(env.chip_read(sci::R_ICR) & sci::ICR_AIP);
+}
+
 TEST(bus_arbitration_drives_the_id_without_assert_data_bus) {
   env.power_on_reset();
   env.chip_write(sci::R_ODR, 0x40);

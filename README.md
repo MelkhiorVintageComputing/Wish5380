@@ -44,7 +44,7 @@ of BSY.
 | `wb_5380`           | machine glue: three windows, byte lanes, pseudo-DMA   | `wb_` (15)             |
 | `wish5380`          | the part itself                                       | `sys_`, `bus_`         |
 | `sci_regs`          | the eight registers and the port they hide behind     | `reg_` (10)            |
-| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (22), `dma_` (15) |
+| `sci_bus`           | arbitration, the handshake, the interrupts            | `bus_` (23), `dma_` (15) |
 | `scsi_fabric`       | the wired-OR joining everything on the bus            | `two_` (8), `bus_`     |
 | `scsi_targ`         | a direct-access device, one per drive                 | `sys_`, `two_`, `sd_`  |
 | `blk_sd`, `sd_spi`  | an SD card in SPI mode                                | `sd_`                  |
@@ -61,7 +61,7 @@ to the datasheet and to all four drivers' own declarations, and `infra_` (5)
 checks the clock, the reset and the accessors everything else stands on - if
 one of those fails, no other result means anything.
 
-All 118 pass, with none pending, in six builds: two boards - the Macintosh,
+All 119 pass, with none pending, in six builds: two boards - the Macintosh,
 with its registers sixteen bytes apart, and a generic ISA card with them one
 byte apart - at each of 7.8 MHz, 50 MHz and 125 MHz.  The part's delays are
 derived from the clock rather than written down and the register spacing is an

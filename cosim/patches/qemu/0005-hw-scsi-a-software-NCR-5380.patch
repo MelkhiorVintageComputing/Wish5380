@@ -1,7 +1,7 @@
 From 6445406a86ca8a77c400de124633cc0d17774857 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 10:27:00 +0200
-Subject: [PATCH 5/7] hw/scsi: a software NCR 5380
+Subject: [PATCH 5/8] hw/scsi: a software NCR 5380
 
 QEMU has no NCR 5380.  grep over the tree finds a Linux bootinfo tag and
 a line of captured `ls` output used as QDict test data, and nothing else;

@@ -235,8 +235,15 @@ module sci_bus #(
     else if (free_cnt != N_MAX) free_cnt <= free_cnt + 1'b1;
   end
 
-  assign bus_free          = (free_cnt >= N_BUS_FREE);
-  assign bsy_settled_false = (free_cnt >= N_BUS_SETTLE);
+  // The count is a clock behind, so both questions ask about BSY now as well.
+  // Without that the two halves of the condition come from different clocks:
+  // the counter is only zeroed on the edge *after* BSY goes true, so for one
+  // clock "BSY has been false for 400 ns" and "BSY is true" are both readable,
+  // and an access that asserts BSY and releases SEL together - which a random
+  // walk finds and no driver does - starts arbitrating on a bus that is not
+  // free.  Whatever else a free bus is, BSY is false on it now.
+  assign bus_free          = (free_cnt >= N_BUS_FREE)   && !bus_i.bsy;
+  assign bsy_settled_false = (free_cnt >= N_BUS_SETTLE) && !bus_i.bsy;
 
   // ---------------------------------------------------------------------------
   // Arbitration (p. 18).

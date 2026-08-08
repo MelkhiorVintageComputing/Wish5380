@@ -1,7 +1,7 @@
 From 575d1121fbd843d8f9bd795d7eab2dc2573ad442 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 11:19:07 +0200
-Subject: [PATCH 7/7] hw/scsi/sun3-si, hw/m68k/sun3: choose between the two
+Subject: [PATCH 7/8] hw/scsi/sun3-si, hw/m68k/sun3: choose between the two
  chips
 
 The board grows core=auto|sw|rtl and the machine grows si-core= to

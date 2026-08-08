@@ -1,7 +1,7 @@
 From ded4174479e3ee08c8d367fbd786fe4a569ca954 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 10:27:17 +0200
-Subject: [PATCH 6/7] hw/scsi/ncr5380-isa: choose between the two chips
+Subject: [PATCH 6/8] hw/scsi/ncr5380-isa: choose between the two chips
 
 The card grows core=auto|sw|rtl.  With sw it embeds the software 5380
 and its disks are QEMU's own, from -device scsi-hd; with rtl it loads

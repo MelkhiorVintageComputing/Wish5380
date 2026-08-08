@@ -58,6 +58,61 @@ it says it twenty times faster.  The useful pairing is to reach for `sw` first
 when a change might have broken a driver's view of the chip, and for `rtl`
 when the question is whether the hardware is right.
 
+### Comparing them directly
+
+```sh
+cosim/scripts/diff-5380.py                    # thirteen scripted checks, then a walk
+cosim/scripts/diff-5380.py --steps 0          # the scripted checks alone
+cosim/scripts/diff-5380.py --seed 7 --steps 50000
+```
+
+Both cards go in **one** QEMU at different I/O ports, and the script speaks
+the qtest protocol to it, issuing every access to both and comparing every
+read.  The stimulus is identical by construction rather than by two scripts
+being kept in step, and `-accel qtest` means the guest CPU never executes an
+instruction, so a divergence is the chips and nothing else.
+
+Thirteen scripted checks, one per trap the datasheet sets - the Initiator
+Command read-back, the Target Command mask, the refused Mode write, what
+reading register 7 empties and what it does not, BUSY ERROR as a level,
+arbitration, the two routes to the data bus, phase match, the SCSI reset,
+TEST MODE, DRQ - and then a seeded random walk over the register port for
+whatever nobody thought of.
+
+**The rule is that no target answers on either side**, because the two cores
+have different ones behind them and a target that answered differently would
+diverge for reasons that are not about the chip.  The software card is given
+no drive; the Verilated card always carries a `scsi_targ` at ID 0 that cannot
+be removed, so the harness never selects ID 0 and never lets a random write
+put bit 0 into the Output Data Register.  Every ID it does select is empty on
+both sides, and an empty ID behaves identically: nothing asserts BSY.
+
+What that leaves out is the DMA handshake proper - DACK cycles and End of
+Process - because the ISA card is the only board with a register window this
+can drive, and an ISA 5380 card has no DMA controller in front of it.  That
+half is covered by the Sun-3 co-simulation on both cores and by the fifteen
+`dma_` tests in `tb/`.
+
+It found three bugs on its first run, which is the whole argument for it.
+
+Two were in the software model.  Its settle loop stopped as soon as no state
+had changed, without checking whether the *wires* had converged - so on
+leaving target mode the chip went on driving the data bus for a phase that no
+longer matched.  And emptying BUSY ERROR was treated as the end of it rather
+than as a level that immediately refills, which would have made
+`NCR5380_intr`'s ordering pointless and let a driver that got it backwards
+appear to work.
+
+The third was in the RTL, and is the one worth the price of admission.
+`bus_free` compared a *registered* count against a *current* SEL - two
+different clocks in one condition - so for exactly one clock after an access
+that asserted BSY and released SEL together, the chip would read "BSY has been
+false for 400 ns" and "BSY is true" at the same time and start arbitrating on
+a bus it was itself holding.  No driver writes that sequence, which is why
+118 tests and four guests had never met it.  `bus_free` and
+`bsy_settled_false` now require BSY to be false *now* as well, and
+`bus_arbitration_needs_bsy_false_now_and_not_only_lately` pins it.
+
 The Atari TT keeps the Verilated core and has no `--core`.  Hatari has no
 `SCSIBus` and cannot link this model; its software comparison already exists
 as `run-tt.py --stock`, which leaves our shim out of the path entirely and
