@@ -1,0 +1,172 @@
+From f54bce9f02e0f17516d8feda73bcea750cceb182 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 8 Aug 2026 18:21:55 +0200
+Subject: [PATCH 9/9] hw/scsi/ncr5380: a debug-only latency on the interrupt
+ pin
+
+Off by default, and it must stay a question rather than become an
+answer.
+
+SunOS survives this chip's Verilated twin and not this one, although the
+two agree on everything diff-5380.py and diff-sun3-dma.py can ask -
+registers, arbitration, the acknowledge path, End of Process, whole
+8192-byte reads and writes against the same disk, and a transfer with
+nobody polling.  Instrumenting the failing boot showed the chip doing
+exactly the right thing: the driver arms with TCR = 0x04, an unspecified
+phase, so that whatever the target asks for produces a mismatch; the
+target asks for DATA IN; the chip raises the mismatch; the board asserts
+level 2.  And then SunOS never answers - not one register access, not
+even the CSR read siintr begins with.
+
+The difference is that this chip answers in no guest time at all.  A
+mismatch raised inside the store instruction that provoked it reaches
+the driver before it has retired a single instruction of its own setup.
+The Verilated core cannot do that, because it is slow.
+
+So NCR5380_IRQ_LATENCY_NS defers the rising edge, and the falling edge
+stays immediate because a driver clearing its interrupt must see it go.
+Measured over five minutes of SunOS boot, with the instruction counter
+at its usual shift of eight:
+
+    latency        faults    got as far as
+    0 (default)    ~130      the end of rc
+    1 us            47       the end of rc
+    10 us           30       starting inetd
+    icount off       2       past init, into fsck
+
+Which says promptness is part of it and not the whole of it.  Turning
+the instruction counter off beats every fixed latency, and it changes
+much more than the interrupt: under icount the model's *entire*
+response takes zero guest time - the data, the phase changes, all of it -
+where a real device takes guest-observable time for each.  A single
+constant on one pin cannot stand in for that, which is why this is a
+knob for understanding and not a fix.
+
+The default build is unchanged: with the define at zero there is no
+timer, no deferral and no extra field in use.
+---
+ hw/scsi/ncr5380.c         | 55 +++++++++++++++++++++++++++++++++++++++
+ include/hw/scsi/ncr5380.h |  5 ++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/hw/scsi/ncr5380.c b/hw/scsi/ncr5380.c
+index 81595b02f8..c948d77ecc 100644
+--- a/hw/scsi/ncr5380.c
++++ b/hw/scsi/ncr5380.c
+@@ -50,6 +50,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
++#include "qemu/timer.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/scsi/ncr5380.h"
+@@ -118,6 +119,38 @@
+  */
+ #define SETTLE_MAX 64
+ 
++/*
++ * How long the interrupt pin takes to rise, in nanoseconds of guest time.
++ *
++ * DEBUG ONLY, and zero - which is off - unless it is built otherwise.  This
++ * is here to answer a question, not because a 5380 needs it.
++ *
++ * The question is why SunOS survives this chip's Verilated twin and not this
++ * one.  The two answer identically to everything cosim/scripts/diff-5380.py
++ * and diff-sun3-dma.py can ask, but this one answers in *no guest time at
++ * all*: a phase mismatch raised inside the store instruction that provoked it
++ * reaches the driver before it has retired a single instruction of its own
++ * setup.  The Verilated core cannot do that, because it is slow.  Running the
++ * same boot with the instruction counter off - so that guest time follows the
++ * wall clock and the answer arrives some real time later - takes the fault
++ * from about a hundred and thirty reports in five minutes down to two.
++ *
++ * So this defers the *rising* edge by a fixed delay to see whether promptness
++ * is the whole of it.  Falling edges are immediate, because a driver that
++ * clears its interrupt must see it go away at once.
++ *
++ * It is not a fix and must not become one.  Real silicon does take time -
++ * tb/ measures this part raising IRQ 70 ns after the last byte - but a fixed
++ * number here is a guess dressed as a delay, and doc/interface.md argues at
++ * length that the software model having no time in it is a property of the
++ * medium rather than a shortcut.  Whatever the real answer is, it is either
++ * in this model or in how the board wakes the guest, and it will not be
++ * spelled with a magic constant.
++ */
++#ifndef NCR5380_IRQ_LATENCY_NS
++#define NCR5380_IRQ_LATENCY_NS 0
++#endif
++
+ static void ncr5380_settle(NCR5380State *s);
+ static void ncr5380_target_settled(NCR5380State *s);
+ static void ncr5380_target_bus_reset(NCR5380State *s);
+@@ -508,6 +541,15 @@ strobes:
+ /* The settle loop                                                          */
+ /* ------------------------------------------------------------------------ */
+ 
++#if NCR5380_IRQ_LATENCY_NS
++static void ncr5380_irq_late(void *opaque)
++{
++    NCR5380State *s = opaque;
++
++    qemu_set_irq(s->irq, s->irq_level);
++}
++#endif
++
+ static void ncr5380_update_pins(NCR5380State *s)
+ {
+     int irq = ncr5380_irq(s) ? 1 : 0;
+@@ -516,7 +558,17 @@ static void ncr5380_update_pins(NCR5380State *s)
+     if (irq != s->irq_level) {
+         s->irq_level = irq;
+         trace_ncr5380_irq(irq);
++#if NCR5380_IRQ_LATENCY_NS
++        if (irq) {
++            timer_mod(s->irq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
++                                    + NCR5380_IRQ_LATENCY_NS);
++        } else {
++            timer_del(s->irq_timer);
++            qemu_set_irq(s->irq, irq);
++        }
++#else
+         qemu_set_irq(s->irq, irq);
++#endif
+     }
+     if (drq != s->drq_level) {
+         s->drq_level = drq;
+@@ -1308,6 +1360,9 @@ static void ncr5380_realize(DeviceState *dev, Error **errp)
+      * controller in front of the chip needs to be told rather than to spin. */
+     qdev_init_gpio_out(dev, &s->irq, 1);
+     qdev_init_gpio_out_named(dev, &s->drq, "drq", 1);
++#if NCR5380_IRQ_LATENCY_NS
++    s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ncr5380_irq_late, s);
++#endif
+ }
+ 
+ /*
+diff --git a/include/hw/scsi/ncr5380.h b/include/hw/scsi/ncr5380.h
+index 0521a1da82..8b2809e8c1 100644
+--- a/include/hw/scsi/ncr5380.h
++++ b/include/hw/scsi/ncr5380.h
+@@ -21,6 +21,7 @@
+ #include "hw/scsi/scsi.h"
+ #include "hw/core/irq.h"
+ #include "qom/object.h"
++#include "qemu/timer.h"
+ 
+ #define TYPE_NCR5380 "ncr5380"
+ OBJECT_DECLARE_SIMPLE_TYPE(NCR5380State, NCR5380)
+@@ -157,6 +158,10 @@ struct NCR5380State {
+     bool dirty;
+     int irq_level;
+     int drq_level;
++
++    /* Only built when NCR5380_IRQ_LATENCY_NS is set, which is a debugging
++     * aid and off by default - see the comment on it in ncr5380.c. */
++    QEMUTimer *irq_timer;
+ };
+ 
+ /*
+-- 
+2.39.5
+

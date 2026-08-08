@@ -1,7 +1,7 @@
 From a8649b1a5c097d7863293c99b2485d37df3bf333 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 11:54:26 +0200
-Subject: [PATCH 8/8] hw/scsi/ncr5380: settle the wires, and let a level refill
+Subject: [PATCH 8/9] hw/scsi/ncr5380: settle the wires, and let a level refill
 
 Two bugs, both found by driving this model and the Verilated one through
 the same register sequences and comparing every read.
