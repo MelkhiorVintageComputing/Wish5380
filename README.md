@@ -40,7 +40,7 @@ of BSY.
 | block               | what it is                                           | tested by              |
 |---------------------|------------------------------------------------------|------------------------|
 | `wish5380_sd`       | the whole thing: a Wishbone slave and two card slots  | `sd_` (13)             |
-| `wish5380_wb`       | the same, for a board with some other back end        | `sys_` (23)            |
+| `wish5380_wb`       | the same, for a board with some other back end        | `sys_` (24)            |
 | `wb_5380`           | machine glue: three windows, byte lanes, pseudo-DMA   | `wb_` (15)             |
 | `wish5380`          | the part itself                                       | `sys_`, `bus_`         |
 | `sci_regs`          | the eight registers and the port they hide behind     | `reg_` (10)            |
@@ -61,7 +61,7 @@ to the datasheet and to all four drivers' own declarations, and `infra_` (5)
 checks the clock, the reset and the accessors everything else stands on - if
 one of those fails, no other result means anything.
 
-All 119 pass, with none pending, in six builds: two boards - the Macintosh,
+All 120 pass, with none pending, in six builds: two boards - the Macintosh,
 with its registers sixteen bytes apart, and a generic ISA card with them one
 byte apart - at each of 7.8 MHz, 50 MHz and 125 MHz.  The part's delays are
 derived from the clock rather than written down and the register spacing is an

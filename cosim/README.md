@@ -139,13 +139,35 @@ check now states what it expects to have happened and the run fails if the
 software side shows no sign of it.  `-v` prints every access for the same
 reason.
 
-What is still not compared is a transfer that *runs* - many bytes, with a
-device handshaking for each one - because that needs a target on both sides,
-and the two have different ones.  Doing it means giving both the same disk
-image, issuing a real READ(6), and comparing the data and the final state
-rather than every read, since the RTL target takes time to answer where QEMU's
-does not.  The fault is on 8192-byte transfers, so that is where the search
-goes next.
+### And a transfer that actually runs
+
+Then both sides get the **same disk**, and a whole 8192-byte READ(6) runs on
+each - the size the open fault always happened on.  This is what found it.
+
+It cannot be lock-step: the Verilated target takes real time to answer where
+QEMU's answers at once, so the two need different numbers of polls to reach
+the same place and comparing poll for poll would report timing as divergence.
+Each side is driven independently through the phases the way `si.c` does it -
+arbitrate, select, IDENTIFY, command, hand the data phase to the UDC, status,
+message, bus free - and what is compared is the data, the status, the message
+and the registers once the dust has settled.  The file is the third opinion,
+and neither model gets a vote on it.
+
+Two differences turned up that are the *targets* and not the chips, and both
+are drained rather than compared.  QEMU's `scsi-disk` reports a power-on UNIT
+ATTENTION on the first command after a reset, exactly as SCSI requires, and
+`scsi_targ.sv` does not implement unit attention at all - so the harness issues
+a TEST UNIT READY and a REQUEST SENSE first, which is what every driver does at
+probe time.  And it dispatches on the phase the target asks for rather than
+assuming a data phase, because a CHECK CONDITION goes straight from COMMAND to
+STATUS.
+
+Two bugs in the harness itself came out of this, both worth naming because
+both looked like device faults.  Arming the UDC before setting the byte count
+makes the board declare the transfer finished on the spot - a live transfer
+with a count of zero has, by its own reckoning, already ended - so the count
+goes in first now.  And a phase loop that re-entered the data phase when the
+DMA was already done span for ever instead of saying so.
 
 It found three bugs on its first run, which is the whole argument for it.
 
@@ -873,15 +895,39 @@ anything to do with delivering an interrupt.  Note step 3: with `MR_DMA`
 clear the chip no longer interrupts on a phase change, so a driver waiting
 for an interrupt about STATUS rather than polling for it would wait for ever.
 
-**The software core reproduces it, and that is the most useful thing now
-known about it.**  `--core sw` puts an independently written C model of the
-same part behind the same board, with no Verilator, no shared library and no
-pacing anywhere in the picture - and SunOS reports the same fault, in the same
-place, on the same 8192-byte transfers.  That removes two of the four suspects
-this has always had.  It is not the RTL, and it is not the pacing that keeps
-guest time and Verilated time in step; the board model, the driver's
-expectations of it, or something both chip models read the same way out of the
-same datasheet is what is left.
+**Found, and it was the target.**  `scsi_targ.sv` drives the phase lines from a
+case on its state, and `S_RDWAIT` - the state a multi-block read sits in while
+the back end fills the buffer for the next block - fell into the default and
+drove `3'b000`.  So halfway through a DATA IN transfer the target let the phase
+fall to DATA OUT for the length of an SD card read, milliseconds, and then put
+it back.
+
+That is a phase *change* in the middle of a transfer, and an initiator is
+entitled to read it as the target having moved on.  The Sun-3's DMA controller
+does exactly that: its end-of-transfer test is "the chip has asked at least
+once, the phase no longer matches, and the chip is interrupting", and all three
+are true in that window.  Every multi-block read was therefore abandoned after
+its first 512 bytes, with the target still in DATA IN holding REQ and the
+driver waiting for an interrupt about a transfer it thought had finished.
+
+An 8192-byte read is sixteen blocks, which is the whole shape of the fault:
+why it was always on 8192-byte transfers, why it was on DATA IN, why SunOS met
+it far more often than NetBSD - NetBSD's INSTALL kernel reads a block at a time
+where SunOS reads eight kilobytes - and why nothing in `tb/` had ever seen it,
+since every DMA test moved a single block and a single block never reaches
+`S_RDWAIT`.  The step at 6 above, "nothing happens for 117 seconds", was the
+target waiting to be asked for byte 513 of a transfer the board had already
+given up on.
+
+It took three harnesses to get here, and the order was not wasted.  The
+software core removed the RTL and the pacing from the list of suspects by
+reproducing the fault without either.  `diff-5380.py` cleared the register port
+and the bus engine.  `diff-sun3-dma.py` cleared the acknowledge path, and then,
+once it could run a whole transfer against the same disk on both sides, printed
+the answer in thirty seconds: the Verilated core stopped after 512 of 8192
+bytes with the count stuck at `0x1e00`.
+
+`sys_a_multi_block_read_holds_the_phase_between_blocks` pins it.
 
 Two things did turn out to be genuinely missing from the board, both found by
 building the software path and both about who wakes the board up: the chip's
