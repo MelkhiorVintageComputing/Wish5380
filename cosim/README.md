@@ -32,6 +32,37 @@ It is a separate and much slower loop and is deliberately not part of
 `make test`.  Nothing in `src/` or `tb/` may grow a dependency on it - the
 traffic goes the other way.
 
+## Two chips behind the same eight registers
+
+The two QEMU boards take `--core`, and it picks which NCR 5380 answers:
+
+| | `--core rtl` | `--core sw` |
+|---|---|---|
+| the chip | the Verilated `wish5380`, in `libwish5380rtl.so` | `hw/scsi/ncr5380.c`, compiled into QEMU |
+| the target | `scsi_targ.sv` and an SD card model, over a raw image | QEMU's `scsi-disk.c`, over a block backend |
+| the disk | `image=` | `-drive` |
+| what it proves | the RTL | the driver, and the board around the chip |
+| Linux, whole boot | 160 s | 8 s |
+
+QEMU had no 5380 at all before this: `grep` over the tree finds a Linux
+bootinfo tag and a line of captured `ls` output used as test data, and
+`hw/m68k/q800.c` models a Macintosh that really had one and uses an ESP
+anyway.  So the software core is a genuinely independent second reading of
+the same datasheet - written in C, from the same pages, against the same four
+driver families - and the referee is a driver that has seen neither.  Where
+they agree, the datasheet has been read right twice.
+
+It is not a replacement for the RTL path and cannot be.  Only `--core rtl`
+says anything about `src/`; `--core sw` says whether a *driver* is happy, and
+it says it twenty times faster.  The useful pairing is to reach for `sw` first
+when a change might have broken a driver's view of the chip, and for `rtl`
+when the question is whether the hardware is right.
+
+The Atari TT keeps the Verilated core and has no `--core`.  Hatari has no
+`SCSIBus` and cannot link this model; its software comparison already exists
+as `run-tt.py --stock`, which leaves our shim out of the path entirely and
+uses Hatari's own 5380 and its own disk against the same image.
+
 ## Running it
 
 ```sh
@@ -40,11 +71,15 @@ make -C cosim/rtl                # build work/lib/libwish5380rtl.so
 make -C cosim/rtl check          # drive it with no emulator in the loop
 cosim/scripts/build-sun3-qemu.sh # one QEMU, both machines: m68k and i386
 cosim/scripts/build-guest.sh     # an i386 Linux, and a card image for it
-cosim/scripts/run-cosim.py       # the verdict
+cosim/scripts/run-cosim.py       # the verdict, against the Verilated core
+cosim/scripts/run-cosim.py --core sw   # the same, against the software one
 
 cosim/scripts/build-hatari.sh    # the Atari TT, and the EmuTOS that drives it
 cosim/scripts/run-tt.py          # its verdict
 ```
+
+`make -C cosim/rtl` is only needed for `--core rtl`; the software core is part
+of QEMU and is built with it.
 
 Everything downloaded, built or generated lands in `work/`, which is not in
 git; these scripts are what put it back.
@@ -728,6 +763,50 @@ So the fault is a stall in the STATUS handshake *after* the data phase, not
 anything to do with delivering an interrupt.  Note step 3: with `MR_DMA`
 clear the chip no longer interrupts on a phase change, so a driver waiting
 for an interrupt about STATUS rather than polling for it would wait for ever.
+
+**The software core reproduces it, and that is the most useful thing now
+known about it.**  `--core sw` puts an independently written C model of the
+same part behind the same board, with no Verilator, no shared library and no
+pacing anywhere in the picture - and SunOS reports the same fault, in the same
+place, on the same 8192-byte transfers.  That removes two of the four suspects
+this has always had.  It is not the RTL, and it is not the pacing that keeps
+guest time and Verilated time in step; the board model, the driver's
+expectations of it, or something both chip models read the same way out of the
+same datasheet is what is left.
+
+Two things did turn out to be genuinely missing from the board, both found by
+building the software path and both about who wakes the board up: the chip's
+interrupt pin was polled rather than listened to, so an interrupt raised
+between two register accesses waited for the driver to touch something; and a
+transfer that ends short interrupts rather than raising DRQ, so the pump had
+to be re-entered from the interrupt as well.  Connecting those cut the reports
+on a SunOS boot by a third.  Neither is the fault above - it survives both -
+but the RTL path had been hiding both behind its 500 µs pacing timer, which
+called the pump and re-read the interrupt whatever else was going on.
+
+NetBSD, for what it is worth, is clean on the software core: a whole boot to a
+shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
+Which is the same asymmetry the table at the top of this file describes, and
+the reason the second guest earns its keep.
+
+**But the software core is worse than the RTL under SunOS, not better, and
+that is the state to be honest about.**  On `--core rtl` SunOS reaches
+`Amnesiac login:` in about 14000 s with four to seven of these reports on the
+way.  On `--core sw` it gets through fsck, single-user, `rc`, the rpc and net
+services, the system logger and `inetd`, stalls at the end of `rc` around the
+printer step, and then produces nothing but fault reports - 2269 of them in
+2000 s, having never reached multi-user.  So the fault is *more* frequent with
+the software chip and eventually fatal, where with the Verilated one it is
+survivable.
+
+That does not weaken the conclusion above - the fault plainly is not the RTL
+and not the pacing, since it happens without either - but it does mean the two
+chips differ somewhere, and the RTL is the one with 118 tests behind it.  The
+next step is therefore to find where they diverge rather than to chase the
+stall in SunOS: the same register sequence into both cores, compared access by
+access, which is the differential harness this work deliberately deferred.  It
+is now clearly worth building, and it has a specific first question to answer -
+what the two do differently at the end of an 8192-byte transfer.
 
 The regression covers the textbook version of that sequence -
 `dma_a_block_reads_back_through_a_real_engine` ends a DMA read exactly this

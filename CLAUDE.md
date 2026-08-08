@@ -344,6 +344,19 @@ The library reuses `sim`, `wb`, `util` and `sd_card` from `tb/cpp` unchanged.
 A co-simulation with its own bus model would drift from the regression and stop
 saying anything about it.
 
+**There are two chips, and `--core` picks between them.**  The QEMU boards
+carry either the Verilated `wish5380` (`--core rtl`, the default wherever
+`rtl=` is given) or `hw/scsi/ncr5380.c`, a software model of the same part
+added by `cosim/patches/qemu/` (`--core sw`).  Only `rtl` says anything about
+`src/`.  `sw` says whether a *driver* is happy, and says it about twenty times
+faster - a whole Linux boot is eight seconds against a hundred and sixty - so
+it is what to reach for when the question is the board or the driver rather
+than the hardware.  The two are deliberately independent readings of the same
+datasheet; where they disagree, one of them has read it wrong, and neither is
+allowed to derive anything from the other.  The Atari TT has no `--core`:
+Hatari has no `SCSIBus` to put behind the model, and `run-tt.py --stock`
+already gives it Hatari's own 5380 for comparison.
+
 ## Conventions
 
 RTL: SystemVerilog, `always_ff`/`always_comb`, synchronous active-high reset,

@@ -1,7 +1,7 @@
 From b5705e2864fd5ca10d1ae3514619e0ccf9e4a4b8 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Wed, 5 Aug 2026 01:39:38 +0200
-Subject: [PATCH 2/6] hw/scsi: add the Sun-3 "si" onboard SCSI board
+Subject: [PATCH 2/7] hw/scsi: add the Sun-3 "si" onboard SCSI board
 
 The 3/60's SCSI is three things in one 32-byte register block: an NCR
 5380, an AMD Am9516 Universal DMA Controller, and Sun's own byte/word

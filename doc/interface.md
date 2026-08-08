@@ -78,6 +78,16 @@ Wishbone cycle and never speculatively, and a read must never be turned into a
 peek.  `reg_strobes_fire_on_the_access_and_hold_nothing` pins the first half;
 the second is a rule for `wb_5380`.
 
+There is now a **third** place that rule can be got wrong.
+`cosim/patches/qemu/` adds `hw/scsi/ncr5380.c`, a software model of the same
+part written for QEMU, and a board reaching it through a `MemoryRegionOps`
+read handler has exactly the same obligation: call the model once per guest
+access, and never speculatively.  That file is not a consumer of this
+document - it is an independent second reading of the same datasheet, and is
+deliberately not derived from `src/` any more than `tb/cpp/ncr5380.h` is - but
+it is another implementation of this port, and the traps are the same traps.
+`cosim/README.md` records what the two agreeing is worth.
+
 ## The Wishbone slave
 
 Wishbone B4 classic, 32-bit data, **word addressed**: `ADR` carries the index
@@ -212,6 +222,17 @@ datasheet is explicit that the chip does not implement it - *"This delay must
 be implemented in the controlling software driver"* (p. 18) - and both drivers
 do, so counting it here would make a driver that omitted it work when it
 should not.  `tb/cpp/ncr5380.h` carries it because the driver model needs it.
+
+The software model in `cosim/patches/qemu/` counts *neither* of the two out,
+and the argument for why that is legal belongs beside this one.  Both delays
+exist to filter a real cable - to stop a glitch looking like a free bus or a
+lost target - and a fabric made of C structs has no glitches to filter, so
+both collapse to "BSY is false once the wires have settled".  That is a
+property of the medium and not a shortcut.  The arbitration delay is the
+opposite case and is absent there for exactly the reason it is absent here:
+the part does not implement it, so neither may a model of the part.  A
+software chip that quietly counted it would make a broken driver pass on the
+fast path and fail on the slow one, which is the worst of both.
 
 ## One register write the chip refuses
 

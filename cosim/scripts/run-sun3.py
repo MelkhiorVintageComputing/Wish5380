@@ -89,6 +89,11 @@ def main():
     ap.add_argument('--keep', action='store_true',
                     help='let the guest write to --image itself, instead of '
                          'to a copy beside it')
+    ap.add_argument('--core', choices=('rtl', 'sw'), default='rtl',
+                    help='which 5380 the board carries: rtl is the Verilated '
+                         'wish5380 behind libwish5380rtl.so, sw is the one '
+                         'built into QEMU.  The board around it - the Am9516, '
+                         'the FIFO, the CSR - is the same either way')
     ap.add_argument('-s', '--send', action='append', default=[],
                     metavar='PATTERN:=TEXT',
                     help='type TEXT when PATTERN appears; may be repeated, '
@@ -118,10 +123,14 @@ def main():
             sys.exit(f'{what} missing: {path}')
 
     machine = f'sun3'
+    drive = []
     if not args.no_si:
-        if not os.path.exists(args.rtl):
-            sys.exit(f'RTL library missing: {args.rtl} - make -C cosim/rtl')
-        machine += f',si-rtl={args.rtl}'
+        machine += f',si-core={args.core}'
+        if args.core == 'rtl':
+            if not os.path.exists(args.rtl):
+                sys.exit(f'RTL library missing: {args.rtl} - '
+                         f'make -C cosim/rtl')
+            machine += f',si-rtl={args.rtl}'
         image = args.image
         if os.path.exists(image) and not args.keep:
             # A run should not change what the next one starts from.  The
@@ -136,7 +145,13 @@ def main():
             shutil.copyfile(image, run)
             image = run
         if os.path.exists(image):
-            machine += f',si-image={image}'
+            if args.core == 'rtl':
+                machine += f',si-image={image}'
+            else:
+                # The software chip has no SD card behind it: the disk is
+                # QEMU's own, and the machine's default drive type is IF_SCSI
+                # so it lands on the chip's bus without being told to.
+                drive = ['-drive', f'file={image},format=raw']
 
     # Guest time has to come from somewhere, and the wall clock is the wrong
     # place: a Verilated 5380 answers far slower than the part, so a guest
@@ -155,7 +170,7 @@ def main():
            '-M', machine, '-m', args.memory, '-bios', args.prom,
            '-display', 'none',
            '-serial', 'null', '-serial', 'null', '-serial', 'null',
-           '-serial', 'stdio'] + clock + extra
+           '-serial', 'stdio'] + drive + clock + extra
 
     env = dict(os.environ)
     if args.trace:

@@ -1,0 +1,716 @@
+From 575d1121fbd843d8f9bd795d7eab2dc2573ad442 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sat, 8 Aug 2026 11:19:07 +0200
+Subject: [PATCH 7/7] hw/scsi/sun3-si, hw/m68k/sun3: choose between the two
+ chips
+
+The board grows core=auto|sw|rtl and the machine grows si-core= to
+reach it.  Everything that makes this board a Sun-3 board rather than a
+5380 - the Am9516 chain parsing, the packing FIFO, the CSR semantics,
+the "the OBIO si ignores fifo_count during a DATA phase" rule, the VME
+register shadows, and the three status-bit decisions SunOS settled - is
+untouched.  Eight one-line dispatchers are the whole difference, because
+all of that logic is about the chip's observable pins and not about how
+the chip is built.
+
+Two things did have to change, and both are about who wakes the board
+up.
+
+The pump no longer spins.  It used to sit in `while (!drq) run_ns(100)`
+because a Verilated core only advances while it is being stepped, so
+stepping it was the only way to see DRQ come up.  With the software chip
+that loop would be worse than pointless: scsi_req_enqueue on a real disk
+completes on QEMU's AIO path, which cannot run while this function holds
+the thread inside an MMIO handler, so the transfer it is waiting for
+could never finish.  It returns instead, and the chip's DRQ pin brings
+it back.  This is the same shape as esp.c's dma_cb, which lets a command
+defer itself until an external DMA controller says go.
+
+And the chip's interrupt is now listened to rather than polled.  On the
+RTL path the board notices by reading si_irq() at the foot of every
+register access and from a 500 us timer; the software chip has no timer
+and needs none, but an interrupt raised between two accesses - which is
+every interrupt that ends a transfer - would otherwise sit in the chip
+until the driver happened to touch a register, and a driver waiting for
+that interrupt never will.  Connecting the pin cost a third of the
+"lost interrupt" reports on a SunOS boot.
+
+The interrupt callback pumps before it updates, because that is also how
+a *short* transfer ends: when the target gives less than was asked for,
+the chip stops asking and never raises DRQ again, so DRQ cannot be what
+notices.  It interrupts on the phase mismatch instead, which is exactly
+what the pump's end-of-transfer test is waiting for.
+
+The machine's block_default_type becomes IF_SCSI, so a bare -drive
+file=x is a SCSI disk here as it is on every other machine whose only
+disk interface is SCSI.  It reaches nothing unless the board was asked
+for.
+
+Verified: the 3/60 PROM reads a Sun label and loads an 893 KB kernel;
+NetBSD 10.1 attaches si0, finds the disk, mounts root and reaches a
+shell over 600 commands and 569 DMA transfers with residual 0 on every
+one; SunOS 4.1.1 boots multi-user through fsck, rc and the network
+services.  The RTL path is unchanged and still boots NetBSD.
+---
+ hw/m68k/sun3.c    |  41 +++++-
+ hw/scsi/Kconfig   |   1 +
+ hw/scsi/sun3-si.c | 313 ++++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 310 insertions(+), 45 deletions(-)
+
+diff --git a/hw/m68k/sun3.c b/hw/m68k/sun3.c
+index 62106c2c55..58d1ef032d 100644
+--- a/hw/m68k/sun3.c
++++ b/hw/m68k/sun3.c
+@@ -54,6 +54,7 @@ struct Sun3MachineState {
+     DeviceState *sun3mmu;
+ 
+     /* Onboard SCSI, which only exists if it was asked for */
++    char *si_core;
+     char *si_rtl;
+     char *si_image;
+ 
+@@ -479,14 +480,20 @@ static void sun3_init(MachineState *machine)
+ 
+     /*
+      * The onboard SCSI, obio 0x140000, one slot above the Lance.  It appears
+-     * only when the machine is given a controller to put there - without
+-     * si-rtl= the region stays unmapped and the PROM says "Device not found",
+-     * which is what a 3/60 with nothing on the bus does anyway.
++     * only when the machine is given a controller to put there - with neither
++     * si-rtl= nor si-core= the region stays unmapped and the PROM says
++     * "Device not found", which is what a 3/60 with nothing on the bus does
++     * anyway.
+      */
+-    if (s_mach->si_rtl) {
++    if (s_mach->si_rtl || s_mach->si_core) {
+         DeviceState *si_dev = qdev_new("sun3-si");
+ 
+-        qdev_prop_set_string(si_dev, "rtl", s_mach->si_rtl);
++        if (s_mach->si_core) {
++            qdev_prop_set_string(si_dev, "core", s_mach->si_core);
++        }
++        if (s_mach->si_rtl) {
++            qdev_prop_set_string(si_dev, "rtl", s_mach->si_rtl);
++        }
+         if (s_mach->si_image) {
+             qdev_prop_set_string(si_dev, "image", s_mach->si_image);
+         }
+@@ -519,6 +526,19 @@ static void sun3_init(MachineState *machine)
+                                         &s_mach->timeout_net, -10);
+ }
+ 
++static char *sun3_get_si_core(Object *obj, Error **errp)
++{
++    return g_strdup(SUN3_MACHINE(obj)->si_core);
++}
++
++static void sun3_set_si_core(Object *obj, const char *value, Error **errp)
++{
++    Sun3MachineState *s_mach = SUN3_MACHINE(obj);
++
++    g_free(s_mach->si_core);
++    s_mach->si_core = g_strdup(value);
++}
++
+ static char *sun3_get_si_rtl(Object *obj, Error **errp)
+ {
+     return g_strdup(SUN3_MACHINE(obj)->si_rtl);
+@@ -550,6 +570,11 @@ static void sun3_machine_class_init(ObjectClass *oc, const void *data)
+     MachineClass *mc = MACHINE_CLASS(oc);
+ 
+     mc->desc = "Sun-3 (3/60)";
++    /* A bare -drive file=x is a SCSI disk here, as it is on every other
++     * machine whose only disk interface is SCSI.  It only reaches anything if
++     * the board was asked for; without si-core= or si-rtl= there is no bus to
++     * put it on. */
++    mc->block_default_type = IF_SCSI;
+     mc->init = sun3_init;
+     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68020");
+     /* Minimum of 4MB for a 3/60, typical maximum ~24MB */
+@@ -558,6 +583,12 @@ static void sun3_machine_class_init(ObjectClass *oc, const void *data)
+ 
+     mc->ignore_memory_transaction_failures = false;
+ 
++    object_class_property_add_str(oc, "si-core",
++                                  sun3_get_si_core, sun3_set_si_core);
++    object_class_property_set_description(oc, "si-core",
++        "which NCR 5380 the onboard SCSI carries: sw for the one built into "
++        "QEMU, rtl for the Verilated wish5380 named by si-rtl=");
++
+     object_class_property_add_str(oc, "si-rtl",
+                                   sun3_get_si_rtl, sun3_set_si_rtl);
+     object_class_property_set_description(oc, "si-rtl",
+diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
+index de792bf6f4..f597d9d998 100644
+--- a/hw/scsi/Kconfig
++++ b/hw/scsi/Kconfig
+@@ -72,6 +72,7 @@ config VHOST_USER_SCSI
+ 
+ config SUN3_SI
+     bool
++    select NCR5380
+     # The Sun-3 board's own logic - an Am9516 UDC and a packing FIFO.  The
+     # NCR 5380 in front of it is a shared library loaded at run time, so this
+     # depends on nothing else in hw/scsi and does not select SCSI.
+diff --git a/hw/scsi/sun3-si.c b/hw/scsi/sun3-si.c
+index 355aec5fef..7194fa0a9e 100644
+--- a/hw/scsi/sun3-si.c
++++ b/hw/scsi/sun3-si.c
+@@ -47,6 +47,7 @@
+ #include "hw/core/irq.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/sysbus.h"
++#include "hw/scsi/ncr5380.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
+@@ -172,10 +173,15 @@ struct Sun3SiState {
+     MemoryRegion *dma_mr;
+     AddressSpace dma_as;
+ 
++    char *core;
+     char *rtl;
+     char *image;
+     uint32_t blocks;
+ 
++    bool use_rtl;
++    NCR5380State chip;      /* only realized when use_rtl is false */
++    bool pumping;           /* the pump is on the stack already */
++
+     /* Sun's own logic. */
+     uint16_t csr;
+     uint16_t fifo_count;    /* bytes; the driver reads this as the residual */
+@@ -221,6 +227,89 @@ struct Sun3SiState {
+     uint64_t (*f_time_ns)(WishRtl *);
+ };
+ 
++/*
++ * Which 5380, per call.
++ *
++ * The board's own logic - the Am9516 chain, the packing FIFO, the CSR - is
++ * about the chip's observable pins and not about how the chip is built, so it
++ * is written once and these eight functions are the whole of the difference
++ * between a Verilated core behind a shared library and hw/scsi/ncr5380.c
++ * compiled in.
++ */
++static uint8_t si_read(Sun3SiState *s, int reg)
++{
++    return s->use_rtl ? s->f_read(s->dev, reg)
++                      : ncr5380_reg_read(&s->chip, reg);
++}
++
++static void si_write(Sun3SiState *s, int reg, uint8_t val)
++{
++    if (s->use_rtl) {
++        s->f_write(s->dev, reg, val);
++    } else {
++        ncr5380_reg_write(&s->chip, reg, val);
++    }
++}
++
++static int si_irq(Sun3SiState *s)
++{
++    return s->use_rtl ? s->f_irq(s->dev) : ncr5380_irq(&s->chip);
++}
++
++static int si_drq(Sun3SiState *s)
++{
++    return s->use_rtl ? s->f_drq(s->dev) : ncr5380_drq(&s->chip);
++}
++
++static uint8_t si_dack_read(Sun3SiState *s)
++{
++    return s->use_rtl ? s->f_dack_read(s->dev)
++                      : ncr5380_dack_read(&s->chip);
++}
++
++static void si_dack_write(Sun3SiState *s, uint8_t val)
++{
++    if (s->use_rtl) {
++        s->f_dack_write(s->dev, val);
++    } else {
++        ncr5380_dack_write(&s->chip, val);
++    }
++}
++
++static void si_set_eop(Sun3SiState *s, int asserted)
++{
++    if (s->use_rtl) {
++        s->f_set_eop(s->dev, asserted);
++    } else {
++        ncr5380_set_eop(&s->chip, asserted != 0);
++    }
++}
++
++static int si_reset(Sun3SiState *s)
++{
++    if (s->use_rtl) {
++        return s->f_reset(s->dev);
++    }
++    ncr5380_hard_reset(&s->chip);
++    return 1;
++}
++
++/*
++ * Give the core some time.
++ *
++ * Only the Verilated one has any: it advances when it is stepped and not
++ * otherwise, and the SCSI target and SD card behind it have to advance while
++ * the guest is between accesses.  The software chip settles its wires inside
++ * each access and has nothing to advance, so every one of these calls, the
++ * catch-up, the settle and the 500 us timer are simply not there on that path.
++ */
++static void si_run_ns(Sun3SiState *s, uint64_t ns)
++{
++    if (s->use_rtl) {
++        s->f_run_ns(s->dev, ns);
++    }
++}
++
+ /*
+  * How far the core has fallen behind the guest.
+  *
+@@ -233,8 +322,13 @@ struct Sun3SiState {
+  */
+ static void sun3_si_clock(Sun3SiState *s, const char *what)
+ {
+-    int64_t guest = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->guest0;
+-    int64_t core = (int64_t)s->f_time_ns(s->dev) - s->core0;
++    int64_t guest, core;
++
++    if (!s->use_rtl) {
++        return;         /* nothing to diverge: the software chip has no clock */
++    }
++    guest = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->guest0;
++    core = (int64_t)s->f_time_ns(s->dev) - s->core0;
+ 
+     trace_sun3_si_clock(what, guest / 1000, core / 1000,
+                         (guest - core) / 1000, s->clamped);
+@@ -245,7 +339,7 @@ static void sun3_si_update_irq(Sun3SiState *s)
+     int level;
+ 
+     s->csr &= ~SI_CSR_SBC_IP;
+-    if (s->f_irq(s->dev)) {
++    if (si_irq(s)) {
+         s->csr |= SI_CSR_SBC_IP;
+     }
+ 
+@@ -270,7 +364,7 @@ static void sun3_si_update_irq(Sun3SiState *s)
+ static bool sun3_si_busy(Sun3SiState *s)
+ {
+ #define CSB_BSY 0x40
+-    return s->dma_running || (s->f_read(s->dev, 4) & CSB_BSY);
++    return s->dma_running || (si_read(s, 4) & CSB_BSY);
+ }
+ 
+ /* Bring the core up to virtual time, but only while it has work to do. */
+@@ -280,14 +374,14 @@ static void sun3_si_catch_up(Sun3SiState *s)
+     int64_t delta = now - s->last_ns;
+ 
+     s->last_ns = now;
+-    if (delta <= 0 || !sun3_si_busy(s)) {
++    if (!s->use_rtl || delta <= 0 || !sun3_si_busy(s)) {
+         return;
+     }
+     if (delta > MAX_CATCH_UP_NS) {
+         delta = MAX_CATCH_UP_NS;
+         s->clamped++;
+     }
+-    s->f_run_ns(s->dev, delta);
++    si_run_ns(s, delta);
+ }
+ 
+ /*
+@@ -313,8 +407,11 @@ static void sun3_si_settle(Sun3SiState *s)
+ {
+     uint64_t waited = 0;
+ 
+-    while (!s->f_irq(s->dev) && waited < SETTLE_MAX_NS) {
+-        s->f_run_ns(s->dev, SETTLE_STEP_NS);
++    if (!s->use_rtl) {
++        return;         /* the software chip has already had its say */
++    }
++    while (!si_irq(s) && waited < SETTLE_MAX_NS) {
++        si_run_ns(s, SETTLE_STEP_NS);
+         waited += SETTLE_STEP_NS;
+     }
+ }
+@@ -331,15 +428,19 @@ static void sun3_si_pump(Sun3SiState *s)
+ {
+     uint64_t waited = 0;
+ 
+-    if (!s->dma_running) {
++    if (!s->dma_running || s->pumping) {
++        /* Re-entered from the DRQ callback, which the software chip raises
++         * from inside dack_read - the byte after this one is already being
++         * asked for.  The loop below has not finished with it yet. */
+         return;
+     }
++    s->pumping = true;
+ 
+     while (s->fifo_count > 0) {
+         bool last = (s->fifo_count == 1);
+         uint8_t byte;
+ 
+-        while (!s->f_drq(s->dev)) {
++        while (!si_drq(s)) {
+             /* The chip has nothing to hand over yet.  The transfer is over
+              * when the target leaves the phase the chip was set up for: the
+              * chip stops recognising REQ, no further request will come, and
+@@ -372,7 +473,7 @@ static void sun3_si_pump(Sun3SiState *s)
+              * the mismatch as the end only after that.
+              */
+ #define BSR_PHASE_MATCH 0x08
+-            bool matched = (s->f_read(s->dev, 5) & BSR_PHASE_MATCH) != 0;
++            bool matched = (si_read(s, 5) & BSR_PHASE_MATCH) != 0;
+             /* Both signals, and neither alone.  The interrupt on its own is a
+              * latch left over from the command before.  The phase on its own
+              * is momentary - it is false between the chip being armed and the
+@@ -380,11 +481,23 @@ static void sun3_si_pump(Sun3SiState *s)
+              * during a transfer, which ended the PROM's boot block read early
+              * and got "scsi: dma never completed".  Together, after the chip
+              * has asked at least once, they mean the target has moved on. */
+-            if (s->saw_drq && !matched && s->f_irq(s->dev)) {
++            if (s->saw_drq && !matched && si_irq(s)) {
+                 s->dma_running = false;
+                 s->csr &= ~SI_CSR_DMA_ACTIVE;
+                 trace_sun3_si_dma_done(s->fifo_count, s->csr, s->head);
+                 sun3_si_settle(s);
++                s->pumping = false;
++                return;
++            }
++            if (!s->use_rtl) {
++                /* Nothing to spin for.  The software chip has no time in it,
++                 * so if it is not asking now it is waiting on something that
++                 * only the block layer can finish - and it will say so by
++                 * raising DRQ, which brings us straight back here.  Spinning
++                 * would be worse than pointless: scsi_req_enqueue on a real
++                 * disk completes on the AIO path, which cannot run while this
++                 * function holds the thread inside an MMIO handler. */
++                s->pumping = false;
+                 return;
+             }
+             if (waited >= DRQ_WAIT_NS) {
+@@ -392,16 +505,17 @@ static void sun3_si_pump(Sun3SiState *s)
+                  * its thread; the pump is re-entered on the next register
+                  * access, and a transfer that has not started yet is waiting
+                  * for the driver to finish setting the chip up. */
++                s->pumping = false;
+                 return;
+             }
+-            s->f_run_ns(s->dev, DRQ_STEP_NS);
++            si_run_ns(s, DRQ_STEP_NS);
+             waited += DRQ_STEP_NS;
+         }
+         waited = 0;
+         s->saw_drq = true;
+ 
+         if (last) {
+-            s->f_set_eop(s->dev, 1);
++            si_set_eop(s, 1);
+         }
+ 
+         if (s->csr & SI_CSR_SEND) {
+@@ -410,9 +524,9 @@ static void sun3_si_pump(Sun3SiState *s)
+                 s->csr |= SI_CSR_DMA_BUS_ERR;
+                 break;
+             }
+-            s->f_dack_write(s->dev, byte);
++            si_dack_write(s, byte);
+         } else {
+-            byte = s->f_dack_read(s->dev);
++            byte = si_dack_read(s);
+             if (dma_memory_write(&s->dma_as, s->dma_addr, &byte, 1,
+                                  MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                 s->csr |= SI_CSR_DMA_BUS_ERR;
+@@ -421,7 +535,7 @@ static void sun3_si_pump(Sun3SiState *s)
+         }
+ 
+         if (last) {
+-            s->f_set_eop(s->dev, 0);
++            si_set_eop(s, 0);
+         }
+ 
+         /* The FIFO packs bytes into words most significant byte first - the
+@@ -468,6 +582,8 @@ static void sun3_si_pump(Sun3SiState *s)
+             s->csr |= SI_CSR_DMA_IP;
+         }
+     }
++
++    s->pumping = false;
+ }
+ 
+ static void sun3_si_udc_reset(Sun3SiState *s)
+@@ -638,7 +754,7 @@ static uint16_t sun3_si_udc_read(Sun3SiState *s)
+ /* The 5380's current phase, for the one place the board cares about it. */
+ static bool sun3_si_in_data_phase(Sun3SiState *s)
+ {
+-    uint8_t csb = s->f_read(s->dev, 4);     /* Current SCSI Bus Status */
++    uint8_t csb = si_read(s, 4);     /* Current SCSI Bus Status */
+     uint8_t phase = (csb >> 2) & 7;
+     return phase == 0 /* DATA OUT */ || phase == 1 /* DATA IN */;
+ }
+@@ -653,9 +769,9 @@ static uint64_t sun3_si_read(void *opaque, hwaddr addr, unsigned size)
+          * access is two register cycles, high byte first - not one wide
+          * register - and getting that wrong would quietly halve the register
+          * file for anyone who used one. */
+-        val = s->f_read(s->dev, addr & 7);
++        val = si_read(s, addr & 7);
+         if (size == 2) {
+-            val = (val << 8) | s->f_read(s->dev, (addr + 1) & 7);
++            val = (val << 8) | si_read(s, (addr + 1) & 7);
+         }
+     } else {
+         switch (addr) {
+@@ -694,7 +810,7 @@ static uint64_t sun3_si_read(void *opaque, hwaddr addr, unsigned size)
+     }
+ 
+     sun3_si_catch_up(s);
+-    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    si_run_ns(s, STEP_PER_ACCESS_NS);
+     sun3_si_pump(s);
+     s->irq_who = "read";
+     sun3_si_update_irq(s);
+@@ -710,10 +826,10 @@ static void sun3_si_write(void *opaque, hwaddr addr, uint64_t val,
+     trace_sun3_si_reg_write(addr, size, val);
+     if (addr < 8) {
+         if (size == 2) {
+-            s->f_write(s->dev, addr & 7, val >> 8);
+-            s->f_write(s->dev, (addr + 1) & 7, val);
++            si_write(s, addr & 7, val >> 8);
++            si_write(s, (addr + 1) & 7, val);
+         } else {
+-            s->f_write(s->dev, addr & 7, val);
++            si_write(s, addr & 7, val);
+         }
+     } else {
+         switch (addr) {
+@@ -739,7 +855,7 @@ static void sun3_si_write(void *opaque, hwaddr addr, uint64_t val,
+             /* Both resets are active low. */
+             if (!(val & SI_CSR_SCSI_RES)) {
+                 sun3_si_udc_reset(s);
+-                s->f_reset(s->dev);
++                si_reset(s);
+                 s->csr &= ~SI_CSR_DMA_BUS_ERR;
+             }
+             if (!(val & SI_CSR_FIFO_RES)) {
+@@ -762,7 +878,7 @@ static void sun3_si_write(void *opaque, hwaddr addr, uint64_t val,
+     }
+ 
+     sun3_si_catch_up(s);
+-    s->f_run_ns(s->dev, STEP_PER_ACCESS_NS);
++    si_run_ns(s, STEP_PER_ACCESS_NS);
+     sun3_si_pump(s);
+     s->irq_who = "write";
+     sun3_si_update_irq(s);
+@@ -791,8 +907,8 @@ static void sun3_si_tick(void *opaque)
+      * going on, which is the first question anyone asks. */
+     if (s->dma_running && s->fifo_count == before) {
+         if (++s->stalled == 200) {
+-            trace_sun3_si_stalled(s->fifo_count, s->f_read(s->dev, 4),
+-                                  s->f_read(s->dev, 5), s->f_drq(s->dev));
++            trace_sun3_si_stalled(s->fifo_count, si_read(s, 4),
++                                  si_read(s, 5), si_drq(s));
+         }
+     } else {
+         s->stalled = 0;
+@@ -819,6 +935,96 @@ static void sun3_si_exit_notify(Notifier *n, void *opaque)
+     }
+ }
+ 
++/*
++ * DRQ moved.
++ *
++ * On the RTL path nothing is connected to this: that core only advances when
++ * it is stepped, so the pump can see DRQ come up by stepping it, and does.
++ * The software chip is the other way round - a byte can become available with
++ * the guest touching nothing at all, when a read completes on the block
++ * layer's own thread - so it says so, and this is where the transfer picks up
++ * again.  It is the same idea as esp.c's dma_cb, which lets a command defer
++ * itself until an external DMA controller says go.
++ */
++/*
++ * The chip's interrupt moved.
++ *
++ * On the RTL path the board notices by polling si_irq() at the foot of every
++ * register access and from its 500 us timer, because a Verilated core cannot
++ * tell anyone anything - it only exists while it is being stepped.  The
++ * software chip has no timer behind it and needs none, but it does need to be
++ * *listened* to: an interrupt raised while the guest is between accesses -
++ * which is every interrupt that ends a transfer - would otherwise sit in the
++ * chip until the driver happened to touch a register, and a driver waiting
++ * for that interrupt never will.  That is what "lost interrupt" means.
++ */
++static void sun3_si_irq_changed(void *opaque, int n, int level)
++{
++    Sun3SiState *s = opaque;
++
++    /* Pump first, because this is also how a *short* transfer ends.  When the
++     * target gives less than was asked for - 36 bytes of INQUIRY against the
++     * 56 SunOS asks for, or the tail of a partial block - the chip stops
++     * asking and never raises DRQ again, so the DRQ callback cannot be what
++     * notices.  What it does instead is interrupt on the phase mismatch, and
++     * the pump's end-of-transfer test is waiting for exactly that pair:
++     * PHASE MATCH gone and the chip interrupting.  Without this the byte
++     * count would sit where it stopped, DMA ACTIVE would never clear, and
++     * SunOS's si_cmdwait would poll the CSR until its watchdog gave up. */
++    sun3_si_pump(s);
++    s->irq_who = "chip";
++    sun3_si_update_irq(s);
++}
++
++static void sun3_si_drq_changed(void *opaque, int n, int level)
++{
++    Sun3SiState *s = opaque;
++
++    if (level) {
++        sun3_si_pump(s);
++        s->irq_who = "drq";
++        sun3_si_update_irq(s);
++    }
++}
++
++/* Which core, and refuse the combinations that would take a disk from
++ * somewhere the user did not mean. */
++static bool sun3_si_pick_core(Sun3SiState *s, Error **errp)
++{
++    const char *c = s->core ?: "auto";
++
++    if (!strcmp(c, "auto")) {
++        s->use_rtl = s->rtl != NULL;
++    } else if (!strcmp(c, "rtl")) {
++        s->use_rtl = true;
++    } else if (!strcmp(c, "sw")) {
++        s->use_rtl = false;
++    } else {
++        error_setg(errp, "core=%s: expected auto, sw or rtl", c);
++        return false;
++    }
++
++    if (s->use_rtl && !s->rtl) {
++        error_setg(errp, "core=rtl needs rtl=: this board has no SCSI "
++                         "controller of its own then, it puts the Verilated "
++                         "wish5380 behind the first eight registers");
++        return false;
++    }
++    if (!s->use_rtl && s->rtl) {
++        error_setg(errp, "core=sw and rtl= are contradictory: the software "
++                         "chip is built in and the library would not be "
++                         "loaded");
++        return false;
++    }
++    if (!s->use_rtl && s->image) {
++        error_setg(errp, "core=sw and image= are contradictory: the software "
++                         "chip has no SD card behind it, its disks come from "
++                         "-drive if=scsi");
++        return false;
++    }
++    return true;
++}
++
+ static void *sym(Sun3SiState *s, const char *name, Error **errp)
+ {
+     void *p = dlsym(s->dl, name);
+@@ -833,13 +1039,36 @@ static void sun3_si_realize(DeviceState *dev, Error **errp)
+     Sun3SiState *s = SUN3_SI(dev);
+     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+ 
+-    if (!s->rtl) {
+-        error_setg(errp, "rtl= is required: this board has no SCSI controller "
+-                         "of its own, it puts the Verilated wish5380 behind "
+-                         "the first eight registers");
++    if (!sun3_si_pick_core(s, errp)) {
+         return;
+     }
+ 
++    /* The UDC masters the bus on either path: it is the board's own DMA
++     * controller and has nothing to do with which chip answers DRQ. */
++    if (s->dma_mr) {
++        address_space_init(&s->dma_as, s->dma_mr, "sun3-si-dma");
++    } else {
++        address_space_init(&s->dma_as, get_system_memory(), "sun3-si-dma");
++    }
++
++    if (!s->use_rtl) {
++        /* Built here rather than in instance_init, because on the RTL path
++         * there is no software chip at all and QEMU asserts that every device
++         * it can see has been realized. */
++        object_initialize_child(OBJECT(dev), "ncr5380", &s->chip,
++                                TYPE_NCR5380);
++        if (!qdev_realize(DEVICE(&s->chip), NULL, errp)) {
++            return;
++        }
++        ncr5380_bus_init(&s->chip, dev);
++        qdev_connect_gpio_out(DEVICE(&s->chip), 0,
++                              qemu_allocate_irq(sun3_si_irq_changed, s, 0));
++        qdev_connect_gpio_out_named(DEVICE(&s->chip), "drq", 0,
++                                    qemu_allocate_irq(sun3_si_drq_changed,
++                                                      s, 0));
++        goto configured;
++    }
++
+     s->dl = dlopen(s->rtl, RTLD_NOW);
+     if (!s->dl) {
+         error_setg(errp, "cannot load %s: %s", s->rtl, dlerror());
+@@ -873,12 +1102,6 @@ static void sun3_si_realize(DeviceState *dev, Error **errp)
+         return;
+     }
+ 
+-    if (s->dma_mr) {
+-        address_space_init(&s->dma_as, s->dma_mr, "sun3-si-dma");
+-    } else {
+-        address_space_init(&s->dma_as, get_system_memory(), "sun3-si-dma");
+-    }
+-
+     if (!s->blocks) {
+         /* Size the card from the image, so a disk is as big as its file and
+          * nobody has to say the same number twice. */
+@@ -899,11 +1122,12 @@ static void sun3_si_realize(DeviceState *dev, Error **errp)
+     /* Bring the card up before the guest is anywhere near it: an SD card
+      * takes milliseconds, which a machine finishing its power-on self test
+      * would never notice. */
+-    if (!s->f_reset(s->dev)) {
++    if (!si_reset(s)) {
+         error_setg(errp, "the card behind %s never came up", s->rtl);
+         return;
+     }
+ 
++configured:
+     sun3_si_udc_reset(s);
+     s->csr = SI_CSR_FIFO_EMPTY;     /* ID reads 0 on the onboard board */
+     s->fifo_count = 0;
+@@ -914,6 +1138,14 @@ static void sun3_si_realize(DeviceState *dev, Error **errp)
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
+ 
++    if (!s->use_rtl) {
++        /* -drive if=scsi becomes an scsi-hd on the chip's bus.  The machine
++         * sets block_default_type to IF_SCSI, so a bare -drive file= lands
++         * here too. */
++        scsi_bus_legacy_handle_cmdline(&s->chip.bus);
++        return;
++    }
++
+     sun3_si_exit.s = s;
+     sun3_si_exit.notifier.notify = sun3_si_exit_notify;
+     qemu_add_exit_notifier(&sun3_si_exit.notifier);
+@@ -928,6 +1160,7 @@ static void sun3_si_realize(DeviceState *dev, Error **errp)
+ }
+ 
+ static const Property sun3_si_properties[] = {
++    DEFINE_PROP_STRING("core", Sun3SiState, core),
+     DEFINE_PROP_STRING("rtl", Sun3SiState, rtl),
+     DEFINE_PROP_STRING("image", Sun3SiState, image),
+     DEFINE_PROP_UINT32("blocks", Sun3SiState, blocks, 0),
+@@ -940,7 +1173,7 @@ static void sun3_si_class_init(ObjectClass *klass, const void *data)
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->realize = sun3_si_realize;
+-    dc->desc = "Sun-3 onboard SCSI: NCR 5380 (Verilated) with an Am9516 UDC";
++    dc->desc = "Sun-3 onboard SCSI: NCR 5380 with an Am9516 UDC";
+     device_class_set_props(dc, sun3_si_properties);
+     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+ }
+-- 
+2.39.5
+
