@@ -85,6 +85,8 @@ cosim/scripts/run-tt.py # an Atari TT under EmuTOS: the cheapest of the three
 cosim/scripts/diff-5380.py  # the RTL and the software model, same stimulus,
                         # every read compared.  Seconds, and it has already
                         # found a bug in each of them
+cosim/scripts/diff-sun3-dma.py  # the same, across the DMA acknowledge path,
+                        # which the ISA card has no way to reach
 ```
 
 `make test` must stay green on **both boards**.  Green means 0 failed; pending
@@ -369,6 +371,15 @@ one in `src/`, which is the point of keeping the two independent.  The rule it
 works under is that no target answers on either side, so it never selects ID 0
 and never puts bit 0 into the Output Data Register; `cosim/README.md` says why
 and what that leaves uncovered.
+
+`diff-sun3-dma.py` covers what that one cannot: the DACK cycles and End of
+Process, which need a board with a DMA controller in front of the chip and so
+can only be reached through the Sun-3.  It runs two machines rather than two
+cards, builds a DVMA mapping by hand because there is no guest to have built
+one, and moves exactly one byte per transfer - which is all the no-target rule
+allows and is also the byte that carries EOP.  Both harnesses guard against
+passing vacuously; two models agreeing about nothing is worth nothing, and the
+first version of the EOP check did exactly that.
 
 ## Conventions
 

@@ -89,9 +89,63 @@ both sides, and an empty ID behaves identically: nothing asserts BSY.
 
 What that leaves out is the DMA handshake proper - DACK cycles and End of
 Process - because the ISA card is the only board with a register window this
-can drive, and an ISA 5380 card has no DMA controller in front of it.  That
-half is covered by the Sun-3 co-simulation on both cores and by the fifteen
-`dma_` tests in `tb/`.
+can drive, and an ISA 5380 card has no DMA controller in front of it.  That is
+what the next one is for.
+
+### And across the DMA handshake
+
+```sh
+cosim/scripts/diff-sun3-dma.py        # the acknowledge path, on the Sun-3 board
+cosim/scripts/diff-sun3-dma.py -v     # every access, so a vacuous check shows
+```
+
+The Sun-3 machine carries exactly one `si`, so the two chips cannot share a
+QEMU the way the two ISA cards do.  There are two machines instead, driven from
+one script over two qtest connections - the stimulus is still written once, and
+neither guest CPU executes an instruction, so nothing is running to drift.
+
+Getting at DVMA is the awkward part.  The board masters the bus through the
+Sun-3 MMU, and with no guest there are no page tables, so every DMA access
+would fail translation and both sides would agree on a bus error and prove
+nothing.  The MMU's segment and page maps are ordinary MMIO on this machine, at
+`0x90000000` and `0xA0000000`, so the harness builds a context-0 mapping by
+hand: DVMA address D is virtual `0x0F000000 + D`, and the page table entry
+points it at memory the script has already written through qtest.
+
+**A transfer is one byte long, and the bound is the interesting part.**  The
+same no-target rule applies, so nothing will handshake - but a Start DMA Send
+raises DRQ *before* the chip has anywhere to put the byte, because the Output
+Data Register is its one byte of buffer and filling it early is exactly what
+lets END OF DMA be set "while the SCSI transfer may still be in progress"
+(p. 20).  So the UDC reads one byte out of memory and hands it over, and then
+the chip waits for a REQ that will not come.  Set the FIFO count to one and
+that byte is also the *last* byte, which is where End of Process is asserted
+and END OF DMA is set - the one thing that cannot be reached from the ISA card
+at all, because a CPU moving bytes has no End of Process pin.
+
+Nine checks, and they agree: the board's reset state, the refused Mode write
+through this window, a word access being two register cycles, the Am9516 chain
+parse, the FIFO count refused during a DATA phase, an armed-but-unstarted
+transfer moving nothing, one acknowledge cycle, the EOP boundary with END OF
+DMA surviving an acknowledge and dying with the DMA bit, and a receive that
+asks for nothing.
+
+It also carries a guard against itself.  The first version of the EOP check
+passed while doing nothing at all: writing the FIFO count is refused during a
+DATA phase, and an *idle* bus decodes as phase 0, which is DATA OUT - so the
+count never landed, the byte was never the last one, and End of Process was
+never asserted.  Two models agreeing about nothing is worth nothing, so each
+check now states what it expects to have happened and the run fails if the
+software side shows no sign of it.  `-v` prints every access for the same
+reason.
+
+What is still not compared is a transfer that *runs* - many bytes, with a
+device handshaking for each one - because that needs a target on both sides,
+and the two have different ones.  Doing it means giving both the same disk
+image, issuing a real READ(6), and comparing the data and the final state
+rather than every read, since the RTL target takes time to answer where QEMU's
+does not.  The fault is on 8192-byte transfers, so that is where the search
+goes next.
 
 It found three bugs on its first run, which is the whole argument for it.
 
