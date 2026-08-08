@@ -146,6 +146,9 @@ class Qtest:
     def write_mem(self, a, data):
         self.cmd(f"write 0x{a:x} 0x{len(data):x} 0x{data.hex()}")
 
+    def clock_step(self, ns):
+        self.cmd(f"clock_step {ns}")
+
     def read_mem(self, a, n):
         return bytes.fromhex(self.cmd(f"read 0x{a:x} 0x{n:x}").split()[-1][2:])
 
@@ -616,6 +619,23 @@ class Side:
         self.ww(CSR, CSR_SCSI_RES | CSR_FIFO_RES | CSR_INTR_EN
                 | (CSR_SEND if send else 0))
 
+    def dma_out(self):
+        """Hand a DATA OUT phase to the UDC.
+
+        The mirror of dma_in, with two differences that matter: the board has
+        to be told the direction so that it reads memory rather than writing
+        it, and the chip needs ASSERT DATA BUS, because as an initiator it only
+        drives the data lines when the phase matches and it has been told to
+        (p. 12)."""
+        self.wb(R_TCR, PH_DATA_OUT)
+        self.wb(R_ICR, ICR_DATA)
+        self.wb(R_MR, MR_DMA | MR_MON_BSY)
+        self.wb(R_SDS, 0)               # write register 5
+        self.until(CSR, CSR_DMA_ACTIVE, 0, "DMA ACTIVE never cleared",
+                   wide=True)
+        self.wb(R_MR, 0)
+        self.wb(R_ICR, 0)
+
     def dma_in(self):
         """Hand the data phase to the UDC and wait for it to stop asking."""
         self.wb(R_TCR, PH_DATA_IN)
@@ -642,7 +662,7 @@ class Side:
         if os.environ.get("WISH_DIFF_STEPS"):
             print(f"      [{self.name}] {what}", flush=True)
 
-    def command(self, cdb, dma_count=None):
+    def command(self, cdb, dma_count=None, send=False, data=None):
         """One command, dispatched on the phase the target asks for, the way
         si.c's phase loop does it."""
         self.step(f"select for cdb {cdb.hex()}")
@@ -651,9 +671,11 @@ class Side:
         self.pio_out(PH_MSG_OUT, bytes([0x80]))     # IDENTIFY, no disconnect
         if dma_count:
             self.step("arm udc")
+            if data is not None:
+                self.qt.write_mem(PHYS_BASE + 0x2000, data)
             # The FIFO count has to be set from a phase that is not a DATA
             # phase, so it goes in here, while the target is still in COMMAND.
-            self.arm_udc(dma_count, send=False)
+            self.arm_udc(dma_count, send=send)
         self.step("command out")
         self.pio_out(PH_COMMAND, cdb)
 
@@ -662,7 +684,14 @@ class Side:
         while True:
             ph = self.wait_phase()
             self.step(f"phase {ph}")
-            if ph == PH_DATA_IN and dma_count:
+            if ph == PH_DATA_OUT and dma_count and send:
+                if did_data:
+                    raise Timeout(f"{self.name}: the target is still in DATA "
+                                  f"OUT after the transfer ended\n"
+                                  f"        {self.dump()}")
+                did_data = True
+                self.dma_out()
+            elif ph == PH_DATA_IN and dma_count:
                 if did_data:
                     # The target still wants to give us data after the DMA has
                     # said it is finished.  Spinning here is how this used to
@@ -685,7 +714,18 @@ class Side:
         self.step(f"message 0x{message:02x}")
         self.until(R_CSB, CSB_BSY, 0, "the bus never went free")
         self.step("bus free")
-        return status, message, sense
+        # The residual is what a driver reads to find out how much of a
+        # transfer really happened, and it is the same number on both sides
+        # whatever the two targets put in the buffer.
+        residual = self.rw(FIFO_COUNT) if dma_count else 0
+        # And what the board and the chip are left holding.  "Lost interrupt"
+        # is the whole shape of the fault this is hunting, so the interrupt
+        # latch and the two status bits the driver reads it through are part
+        # of what a command's outcome means.
+        state = (self.rb(R_BSR) & (BSR_END_DMA | BSR_IRQ | BSR_PHASE_MATCH),
+                 self.rw(CSR) & (CSR_DMA_ACTIVE | CSR_DMA_BUS_ERR
+                                 | CSR_FIFO_EMPTY | CSR_SBC_IP | 0x0100))
+        return status, message, sense, residual, state
 
     def settle(self, tries=4):
         """Get the device past whatever it wants to complain about first.
@@ -700,7 +740,7 @@ class Side:
 
         Every driver does this at probe time for the same reason."""
         for _ in range(tries):
-            status, _, _ = self.command(bytes(6))           # TEST UNIT READY
+            status, _, _, _, _ = self.command(bytes(6))     # TEST UNIT READY
             if status == 0:
                 return
             self.command(bytes([0x03, 0, 0, 0, 18, 0]))     # REQUEST SENSE
@@ -710,6 +750,231 @@ class Side:
         return self.command(bytes([0x08, (lba >> 16) & 0x1f,
                                    (lba >> 8) & 0xff, lba & 0xff,
                                    blocks & 0xff, 0]), dma_count=count)
+
+    def write6(self, lba, blocks, data):
+        return self.command(bytes([0x0a, (lba >> 16) & 0x1f,
+                                   (lba >> 8) & 0xff, lba & 0xff,
+                                   blocks & 0xff, 0]),
+                            dma_count=len(data), send=True, data=data)
+
+    def inquiry(self, alloc):
+        """Ask for more than a SCSI-1 disk will give.
+
+        SunOS asks for 56 bytes and gets the standard 36, so the transfer ends
+        on a phase change rather than at terminal count - which is the case the
+        board's end-of-transfer rule exists for, and the one NetBSD never
+        produces because it only ever asks for what it will get."""
+        return self.command(bytes([0x12, 0, 0, 0, alloc, 0]),
+                            dma_count=alloc)
+
+
+class Model:
+    """What the disk ought to contain.
+
+    Reads are compared against this and not only against each other, because
+    two models agreeing on the wrong bytes is a failure that agreeing alone
+    cannot catch.  It starts as the file and takes every write this harness
+    issues, so it stays right across the whole sequence."""
+
+    def __init__(self, path):
+        self.data = bytearray(open(path, "rb").read())
+
+    def read(self, lba, blocks):
+        return bytes(self.data[lba * 512:(lba + blocks) * 512])
+
+    def write(self, lba, data):
+        self.data[lba * 512:lba * 512 + len(data)] = data
+
+
+def pattern(lba, blocks, salt):
+    """Something to write that says where it was meant to go."""
+    out = bytearray()
+    for b in range(blocks):
+        blk = bytearray(512)
+        blk[0:4] = ((lba + b) ^ salt).to_bytes(4, "big")
+        blk[4:8] = salt.to_bytes(4, "big")
+        for i in range(8, 512):
+            blk[i] = ((lba + b) * 13 + i * 7 + salt) & 0xFF
+        out += blk
+    return bytes(out)
+
+
+# The mixture SunOS actually produces, which is what a single clean read never
+# reproduced: reads and writes interleaved, sizes that are and are not the
+# 8192 bytes the fault happens on, a transfer the target ends short, and a
+# command that fails and has to be recovered from.
+SEQUENCE = [
+    ("tur",),
+    ("read", 0, 16),
+    ("read", 1, 1),
+    ("write", 100, 16),
+    ("read", 100, 16),
+    ("inquiry", 56),
+    ("write", 101, 2),
+    ("read", 100, 17),
+    ("read", 500, 16),
+    ("write", 500, 16),
+    ("read", 500, 16),
+    ("read", 2, 4),
+    ("write", 2, 4),
+    ("inquiry", 36),
+    ("read", 0, 16),
+    ("write", 1000, 16),
+    ("read", 1000, 16),
+    ("read", 999, 18),
+    ("read", 2040, 16),         # off the end: CHECK CONDITION from both
+    ("tur",),
+    ("read", 137, 16),
+]
+
+
+def quiet_transfer(sw, rtl, model, report, lba=300, blocks=16):
+    """A transfer nobody is watching.
+
+    Everything else here polls the CSR until the transfer ends, and polling is
+    a register access, and a register access is what wakes the board up.  That
+    hides an entire class of fault by construction - two of the three bugs
+    found on the way here were missed wake-ups, where a transfer only made
+    progress because the driver happened to touch something.
+
+    A real driver does not poll.  SunOS arms the transfer and sleeps until the
+    interrupt, which is the case this reproduces: arm it, then advance the
+    clock without touching the board at all, and see whether it finished by
+    itself.  The two cores get there differently - the Verilated one from its
+    500 us pacing timer, the software one from the chip's DRQ and IRQ pins -
+    and this is the only place that difference is visible.
+    """
+    count = blocks * 512
+    ok = True
+    got = []
+    for side in (sw, rtl):
+        side.qt.write_mem(PHYS_BASE + 0x2000, b"\x77" * count)
+        side.select(0)
+        side.pio_out(PH_MSG_OUT, bytes([0x80]))
+        side.arm_udc(count, send=False)
+        side.pio_out(PH_COMMAND, bytes([0x08, (lba >> 16) & 0x1f,
+                                        (lba >> 8) & 0xff, lba & 0xff,
+                                        blocks & 0xff, 0]))
+        side.until(R_CSB, CSB_REQ, CSB_REQ, "the target never asked")
+        side.wb(R_TCR, PH_DATA_IN)
+        side.wb(R_ICR, 0)
+        side.wb(R_MR, MR_DMA | MR_MON_BSY)
+        side.wb(R_SDIR, 0)
+
+        # From here nothing touches the board.  Give it a second of virtual
+        # time in ten pieces, and let it finish on its own.
+        for _ in range(10):
+            side.qt.clock_step(100 * 1000 * 1000)
+
+        csr = side.rw(CSR)
+        got.append(csr & CSR_DMA_ACTIVE)
+        if csr & CSR_DMA_ACTIVE:
+            report.append(f"quiet transfer: {side.name} was still running "
+                          f"after a second of virtual time with nobody "
+                          f"polling it\n        {side.dump()}")
+            ok = False
+        # Put the bus back, however it went.
+        side.wb(R_MR, 0)
+        side.wb(R_ICR, 0)
+        try:
+            while side.wait_phase() != PH_STATUS:
+                pass
+            side.pio_in(PH_STATUS, 1)
+            side.pio_in(PH_MSG_IN, 1)
+            side.until(R_CSB, CSB_BSY, 0, "the bus never went free")
+        except Timeout as e:
+            report.append(f"quiet transfer: {e}")
+            ok = False
+
+    if ok:
+        data = [side.qt.read_mem(PHYS_BASE + 0x2000, count)
+                for side in (sw, rtl)]
+        want = model.read(lba, blocks)
+        for name, d in (("software", data[0]), ("Verilated", data[1])):
+            if d != want:
+                j = next(k for k in range(count) if d[k] != want[k])
+                report.append(f"quiet transfer: {name} read 0x{d[j]:02x} at "
+                              f"byte {j}, disk holds 0x{want[j]:02x}")
+                ok = False
+    return ok
+
+
+def run_sequence(sw, rtl, model, report, step=None):
+    """One script, both machines, compared after every command."""
+    salt = 0
+    for n, op in enumerate(SEQUENCE):
+        kind = op[0]
+        salt += 1
+        what = f"{n:2d} {kind} {' '.join(str(x) for x in op[1:])}"
+        if step:
+            print(f"      {what}", flush=True)
+
+        if kind == "tur":
+            res = [side.command(bytes(6)) for side in (sw, rtl)]
+            got = [(r[0], r[1], r[4]) for r in res]
+            data = [None, None]
+        elif kind == "inquiry":
+            alloc = op[1]
+            res = [side.inquiry(alloc) for side in (sw, rtl)]
+            # Status and message only, and the residual deliberately not.
+            #
+            # Asked for 56 bytes, scsi_targ.sv hands over the 36 an INQUIRY
+            # has and leaves 20 in the count; QEMU's scsi-disk pads to the
+            # allocation length and leaves none.  The RTL is right - SCSI says
+            # the target transfers the lesser of the allocation length and
+            # what it has - but both are targets, and this harness compares
+            # chips.
+            #
+            # It costs something worth naming: the short-transfer path, where
+            # a transfer ends on a phase change rather than at terminal count,
+            # is the one SunOS produces and NetBSD never does, and it can only
+            # be exercised on the Verilated side.  The out-of-range read below
+            # is the error case both targets do produce identically.
+            got = [(r[0], r[1], r[4]) for r in res]
+            data = [None, None]
+        elif kind == "read":
+            lba, blocks = op[1], op[2]
+            data = []
+            got = []
+            for side in (sw, rtl):
+                side.qt.write_mem(PHYS_BASE + 0x2000, b"\xee" * (blocks * 512))
+                r = side.read6(lba, blocks, blocks * 512)
+                got.append((r[0], r[1], r[3], r[4]))
+                data.append(side.qt.read_mem(PHYS_BASE + 0x2000, blocks * 512))
+            if got[0][0] != 0 or got[1][0] != 0:
+                # A command that failed moved nothing, so there is nothing to
+                # compare but the failure itself.
+                data = [None, None]
+        elif kind == "write":
+            lba, blocks = op[1], op[2]
+            buf = pattern(lba, blocks, salt)
+            res = [side.write6(lba, blocks, buf) for side in (sw, rtl)]
+            got = [(r[0], r[1], r[3], r[4]) for r in res]
+            data = [None, None]
+            if got[0] == got[1] and got[0][0] == 0:
+                model.write(lba, buf)
+        else:
+            raise RuntimeError(kind)
+
+        if got[0] != got[1]:
+            report.append(f"{what}: software {got[0]}, Verilated {got[1]}")
+            return False
+        if data[0] is not None:
+            want = model.read(op[1], op[2])
+            if data[0] != data[1]:
+                j = next(k for k in range(len(data[0]))
+                         if data[0][k] != data[1][k])
+                report.append(f"{what}: data differs at byte {j}, software "
+                              f"0x{data[0][j]:02x}, Verilated "
+                              f"0x{data[1][j]:02x}")
+                return False
+            if data[0] != want:
+                j = next(k for k in range(len(want)) if data[0][k] != want[k])
+                report.append(f"{what}: both read 0x{data[0][j]:02x} at byte "
+                              f"{j} where the disk should hold "
+                              f"0x{want[j]:02x}")
+                return False
+    return True
 
 
 def running_transfer(sw, rtl, image, lba, blocks, report):
@@ -725,7 +990,7 @@ def running_transfer(sw, rtl, image, lba, blocks, report):
         # cannot pass by leaving the previous run's bytes lying there.
         side.qt.write_mem(PHYS_BASE + 0x2000, b"\xee" * count)
         before = side.accesses
-        status, message, _ = side.read6(lba, blocks, count)
+        status, message, _, _, _ = side.read6(lba, blocks, count)
         data = side.qt.read_mem(PHYS_BASE + 0x2000, count)
         got[side.name] = (status, message, data, side.accesses - before)
 
@@ -815,6 +1080,8 @@ def main():
                          "a hang belongs to")
     ap.add_argument("--tries", type=int, default=3000,
                     help="how many polls before a phase is called stuck")
+    ap.add_argument("--no-seq", action="store_true",
+                    help="skip the interleaved read/write sequence")
     ap.add_argument("--no-xfer", action="store_true",
                     help="skip the running transfer and its disk")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -828,15 +1095,22 @@ def main():
             print(f"missing {what}: {path}", file=sys.stderr)
             return 2
 
-    image = None
+    image = sw_img = rtl_img = None
     if not args.no_xfer:
         image = pathlib.Path(args.image)
         if not image.exists():
             print(f"making {image}")
             make_image(image, 2048)
+        # A copy each.  The software side writes through QEMU's block layer
+        # and the Verilated side into an SD card model it only flushes when it
+        # exits, so one file between them would be two writers and a race.
+        sw_img = image.with_name(image.stem + "-sw" + image.suffix)
+        rtl_img = image.with_name(image.stem + "-rtl" + image.suffix)
+        for dst in (sw_img, rtl_img):
+            dst.write_bytes(image.read_bytes())
 
-    sw_p = start(args.qemu, args.prom, "sw", args.rtl, image)
-    rtl_p = start(args.qemu, args.prom, "rtl", args.rtl, image)
+    sw_p = start(args.qemu, args.prom, "sw", args.rtl, sw_img)
+    rtl_p = start(args.qemu, args.prom, "rtl", args.rtl, rtl_img)
     sw, rtl = Qtest(sw_p, "sw"), Qtest(rtl_p, "rtl")
     p = Pair(sw, rtl)
     xfer = []
@@ -871,7 +1145,7 @@ def main():
                         side = sides[0]
                         side.qt.write_mem(PHYS_BASE + 0x2000,
                                           b"\xee" * (args.blocks * 512))
-                        st, msg, _ = side.read6(lba, args.blocks,
+                        st, msg, _, _, _ = side.read6(lba, args.blocks,
                                                 args.blocks * 512)
                         print(f"  {side.name} lba {lba}: status 0x{st:02x} "
                               f"message 0x{msg:02x}", flush=True)
@@ -886,6 +1160,26 @@ def main():
                              if ok else ""))
                 except Timeout as e:
                     print(f"  FAIL  running_transfer lba {lba}: {e}")
+                    xfer.append(str(e))
+
+            if not args.no_seq:
+                model = Model(image)
+                try:
+                    ok = run_sequence(sw_side, rtl_side, model, xfer,
+                                      os.environ.get("WISH_DIFF_STEPS"))
+                    print(f"  {'ok  ' if ok else 'FAIL'}  sequence "
+                          f"({len(SEQUENCE)} commands, reads and writes "
+                          f"interleaved)", flush=True)
+                except Timeout as e:
+                    print(f"  FAIL  sequence: {e}", flush=True)
+                    xfer.append(str(e))
+
+                try:
+                    ok = quiet_transfer(sw_side, rtl_side, model, xfer)
+                    print(f"  {'ok  ' if ok else 'FAIL'}  quiet_transfer "
+                          f"(8192 bytes, nobody polling)", flush=True)
+                except Timeout as e:
+                    print(f"  FAIL  quiet_transfer: {e}", flush=True)
                     xfer.append(str(e))
     finally:
         for proc in (sw_p, rtl_p):

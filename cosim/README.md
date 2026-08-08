@@ -169,6 +169,43 @@ with a count of zero has, by its own reckoning, already ended - so the count
 goes in first now.  And a phase loop that re-entered the data phase when the
 DMA was already done span for ever instead of saying so.
 
+### Writes, a sequence, and a transfer nobody is watching
+
+Then the same again with WRITE(6), and then a scripted sequence of twenty-one
+commands - reads and writes interleaved, sizes that are and are not the 8192
+bytes the fault happens on, an INQUIRY the target ends short, a read off the
+end of the disk that both targets refuse, and TEST UNIT READY between them.
+Each side gets its own copy of the disk, because the software side writes
+through QEMU's block layer and the Verilated side into an SD card model it only
+flushes when it exits, and one file between them would be two writers and a
+race.  A host-side model of the disk takes every write and every read is
+compared against it, so two cores agreeing on the wrong bytes cannot pass.
+
+Compared after every command: the status, the message, the residual byte count,
+the interrupt latch, and the board's own status bits.  "Lost interrupt" is the
+shape of the fault being hunted, so what the chip is left holding is part of
+what a command's outcome means.
+
+The last one is `quiet_transfer`, and it exists because everything else here
+polls - and a poll is a register access, and a register access is what wakes
+the board up.  That hides a whole class of fault by construction; two of the
+bugs found on the way here were missed wake-ups, where a transfer only
+progressed because the driver happened to touch something.  A real driver does
+not poll: SunOS arms the transfer and sleeps until the interrupt.  So this arms
+an 8192-byte read and then advances the virtual clock without touching the
+board at all.  The two cores get there by different routes - the Verilated one
+from its 500 us pacing timer, the software one from the chip's DRQ and IRQ pins
+- and this is the only place that difference is visible.
+
+**All of it passes, on both cores, and the software core's SunOS fault is still
+not reproduced.**  That is a real result rather than an absence of one: reads,
+writes, interleaving, errors, residuals, interrupt state and an unpolled
+transfer are now all compared and all agree.  What is left is what a harness
+without a CPU cannot reach - a real driver's own state machine, real interrupt
+delivery, and the timing of a running system.  Finding it means instrumenting
+the failing SunOS boot on `--core sw` and following it, not extending this
+further.
+
 It found three bugs on its first run, which is the whole argument for it.
 
 Two were in the software model.  Its settle loop stopped as soon as no state
