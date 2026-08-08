@@ -903,10 +903,11 @@ block zero.
 
 ### Where it stops
 
-Five faults are on the record and none is fully explained, though the first
-is now narrowed to one exchange.  All but the first are intermittent, and they are written down here
-rather than left in a commit message because an unexplained fault that nobody
-can find again is worth less than one that is.
+Five faults are on the record.  The first is now explained and fixed on the
+Verilated path, and survives on the software one for a different reason; the
+rest are intermittent and unexplained.  They are written down here rather than
+left in a commit message because an unexplained fault that nobody can find
+again is worth less than one that is.
 
 **`sd0: I/O request timeout` / `si0: lost interrupt`**, once or twice in a
 boot, reproducibly.  It is named after the wrong thing: the interrupt is not
@@ -976,14 +977,30 @@ on a SunOS boot by a third.  Neither is the fault above - it survives both -
 but the RTL path had been hiding both behind its 500 µs pacing timer, which
 called the pump and re-read the interrupt whatever else was going on.
 
-NetBSD, for what it is worth, is clean on the software core: a whole boot to a
-shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
-Which is the same asymmetry the table at the top of this file describes, and
-the reason the second guest earns its keep.
+NetBSD is clean on the software core, and thoroughly so.  A whole boot reaches
+a shell with no fault of any kind in the log - the only string matching
+`error` in the run is the PROM's own `NXM Bus Error Test` - and at the prompt
+`dd if=/dev/rsd0c of=/dev/null bs=8k count=200` moves 1.6 MB in **8192-byte
+transfers**, the exact size the fault lives on, with no short reads and no
+retries:
+
+```
+si0 at obio0 addr 0x140000 ipl 2: options=0xf
+sd0 at scsibus0 target 0 lun 0: <QEMU, QEMU HARDDISK, 2.5+> disk fixed
+root on sd0a dumps on sd0b
+200+0 records out
+1638400 bytes transferred in 2.500 secs (655360 bytes/sec)
+```
+
+So the remaining fault is not "the software core mishandles 8192-byte
+transfers".  It is specific to what SunOS's `si` does and to the timing it
+expects, which is the same asymmetry the table at the top of this file
+describes and the reason the second guest earns its keep.
 
 **The software core has a second fault, and it is not this one.**  On
-`--core sw` SunOS gets through fsck, single-user, `rc` and the network services,
-stalls at the end of `rc`, and then produces nothing but fault reports.  Fixing
+`--core sw` SunOS gets through fsck, single-user, `rc` and the network
+services, stalls at the end of `rc`, and then produces nothing but fault
+reports - 2140 of them in 2600 s, having never reached multi-user.  Fixing
 the target below changed that by nothing, and could not have: the software
 core's target is QEMU's `scsi-disk.c`, which never had the bug.
 
@@ -1004,13 +1021,15 @@ counter at its usual shift of eight:
 
 | interrupt latency | faults | got as far as |
 |---|---|---|
-| 0, the default | ~130 | the end of `rc` |
-| 1 µs | 47 | the end of `rc` |
-| 10 µs | 30 | starting `inetd` |
-| instruction counter off | 2 | past init, into fsck |
+| 0, the default | ~130 in 300 s | the end of `rc` |
+| 1 µs | 47 in 300 s | the end of `rc` |
+| 10 µs | 30 in 300 s | starting `inetd` |
+| instruction counter off | 18 in 2200 s | the end of `rc.boot` |
 
-So promptness is part of it and not the whole of it.  Turning the instruction
-counter off beats every fixed latency, and it changes far more than one pin:
+So promptness is part of it and not the whole of it - and note that the last
+row is a hundredfold fewer faults and still **not zero, and still no login
+prompt**.  Turning the instruction counter off beats every fixed latency, and
+it changes far more than one pin:
 under `-icount` the model's *entire* response takes zero guest time - the data,
 the phase changes, all of it - where a real device takes guest-observable time
 for each.  One constant on one pin cannot stand in for that.
@@ -1020,212 +1039,6 @@ deciding what the software core owes the guest in time, and `doc/interface.md`
 argues at some length that having none is a property of the medium rather than
 a shortcut - an argument that holds for a fabric made of C structs and is
 visibly not holding for a driver written against silicon.
-
-**Found, and it was the target.**  `scsi_targ.sv` drives the phase lines from a
-case on its state, and `S_RDWAIT` - the state a multi-block read sits in while
-the back end fills the buffer for the next block - fell into the default and
-drove `3'b000`.  So halfway through a DATA IN transfer the target let the phase
-fall to DATA OUT for the length of an SD card read, milliseconds, and then put
-it back.
-
-That is a phase *change* in the middle of a transfer, and an initiator is
-entitled to read it as the target having moved on.  The Sun-3's DMA controller
-does exactly that: its end-of-transfer test is "the chip has asked at least
-once, the phase no longer matches, and the chip is interrupting", and all three
-are true in that window.  Every multi-block read was therefore abandoned after
-its first 512 bytes, with the target still in DATA IN holding REQ and the
-driver waiting for an interrupt about a transfer it thought had finished.
-
-An 8192-byte read is sixteen blocks, which is the whole shape of the fault:
-why it was always on 8192-byte transfers, why it was on DATA IN, why SunOS met
-it far more often than NetBSD - NetBSD's INSTALL kernel reads a block at a time
-where SunOS reads eight kilobytes - and why nothing in `tb/` had ever seen it,
-since every DMA test moved a single block and a single block never reaches
-`S_RDWAIT`.  The step at 6 above, "nothing happens for 117 seconds", was the
-target waiting to be asked for byte 513 of a transfer the board had already
-given up on.
-
-It took three harnesses to get here, and the order was not wasted.  The
-software core removed the RTL and the pacing from the list of suspects by
-reproducing the fault without either.  `diff-5380.py` cleared the register port
-and the bus engine.  `diff-sun3-dma.py` cleared the acknowledge path, and then,
-once it could run a whole transfer against the same disk on both sides, printed
-the answer in thirty seconds: the Verilated core stopped after 512 of 8192
-bytes with the count stuck at `0x1e00`.
-
-`sys_a_multi_block_read_holds_the_phase_between_blocks` pins it.
-
-Two things did turn out to be genuinely missing from the board, both found by
-building the software path and both about who wakes the board up: the chip's
-interrupt pin was polled rather than listened to, so an interrupt raised
-between two register accesses waited for the driver to touch something; and a
-transfer that ends short interrupts rather than raising DRQ, so the pump had
-to be re-entered from the interrupt as well.  Connecting those cut the reports
-on a SunOS boot by a third.  Neither is the fault above - it survives both -
-but the RTL path had been hiding both behind its 500 µs pacing timer, which
-called the pump and re-read the interrupt whatever else was going on.
-
-NetBSD, for what it is worth, is clean on the software core: a whole boot to a
-shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
-Which is the same asymmetry the table at the top of this file describes, and
-the reason the second guest earns its keep.
-
-**The software core has a second fault, and it is not this one.**  On
-`--core sw` SunOS gets through fsck, single-user, `rc`, the rpc and net
-services, the system logger and `inetd`, stalls at the end of `rc` around the
-printer step, and then produces nothing but fault reports - 2140 of them in
-2600 s, having never reached multi-user.  Fixing the target below changed that
-number by nothing at all, and it could not have: the software core's target is
-QEMU's `scsi-disk.c`, which never had the bug.
-
-So there were two faults with one symptom.  The Verilated one is explained and
-fixed below.  The software one is still open, it is somewhere in
-`hw/scsi/ncr5380.c` or in how the board drives it, and what is known about it
-is that a *single* 8192-byte read is not enough to provoke it -
-`diff-sun3-dma.py` runs several in a row on both cores and they agree byte for
-byte.  Whatever it is needs the mixture SunOS actually produces: writes as well
-as reads, interleaved, with error recovery in between.  Extending the running
-transfer to WRITE(6) and to a longer scripted sequence is the next thing to
-try, and it is cheap now that the machinery exists.
-
-**Found, and it was the target.**  `scsi_targ.sv` drives the phase lines from a
-case on its state, and `S_RDWAIT` - the state a multi-block read sits in while
-the back end fills the buffer for the next block - fell into the default and
-drove `3'b000`.  So halfway through a DATA IN transfer the target let the phase
-fall to DATA OUT for the length of an SD card read, milliseconds, and then put
-it back.
-
-That is a phase *change* in the middle of a transfer, and an initiator is
-entitled to read it as the target having moved on.  The Sun-3's DMA controller
-does exactly that: its end-of-transfer test is "the chip has asked at least
-once, the phase no longer matches, and the chip is interrupting", and all three
-are true in that window.  Every multi-block read was therefore abandoned after
-its first 512 bytes, with the target still in DATA IN holding REQ and the
-driver waiting for an interrupt about a transfer it thought had finished.
-
-An 8192-byte read is sixteen blocks, which is the whole shape of the fault:
-why it was always on 8192-byte transfers, why it was on DATA IN, why SunOS met
-it far more often than NetBSD - NetBSD's INSTALL kernel reads a block at a time
-where SunOS reads eight kilobytes - and why nothing in `tb/` had ever seen it,
-since every DMA test moved a single block and a single block never reaches
-`S_RDWAIT`.  The step at 6 above, "nothing happens for 117 seconds", was the
-target waiting to be asked for byte 513 of a transfer the board had already
-given up on.
-
-It took three harnesses to get here, and the order was not wasted.  The
-software core removed the RTL and the pacing from the list of suspects by
-reproducing the fault without either.  `diff-5380.py` cleared the register port
-and the bus engine.  `diff-sun3-dma.py` cleared the acknowledge path, and then,
-once it could run a whole transfer against the same disk on both sides, printed
-the answer in thirty seconds: the Verilated core stopped after 512 of 8192
-bytes with the count stuck at `0x1e00`.
-
-`sys_a_multi_block_read_holds_the_phase_between_blocks` pins it.
-
-Two things did turn out to be genuinely missing from the board, both found by
-building the software path and both about who wakes the board up: the chip's
-interrupt pin was polled rather than listened to, so an interrupt raised
-between two register accesses waited for the driver to touch something; and a
-transfer that ends short interrupts rather than raising DRQ, so the pump had
-to be re-entered from the interrupt as well.  Connecting those cut the reports
-on a SunOS boot by a third.  Neither is the fault above - it survives both -
-but the RTL path had been hiding both behind its 500 µs pacing timer, which
-called the pump and re-read the interrupt whatever else was going on.
-
-NetBSD, for what it is worth, is clean on the software core: a whole boot to a
-shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
-Which is the same asymmetry the table at the top of this file describes, and
-the reason the second guest earns its keep.
-
-**But the software core is worse than the RTL under SunOS, not better, and
-that is the state to be honest about.**  On `--core rtl` SunOS reaches
-`Amnesiac login:` in about 14000 s with four to seven of these reports on the
-way.  On `--core sw` it gets through fsck, single-user, `rc`, the rpc and net
-services, the system logger and `inetd`, stalls at the end of `rc` around the
-printer step, and then produces nothing but fault reports - 2269 of them in
-2000 s, having never reached multi-user.  So the fault is *more* frequent with
-the software chip and eventually fatal, where with the Verilated one it is
-survivable.
-
-That does not weaken the conclusion above - the fault plainly is not the RTL
-and not the pacing, since it happens without either - but it does mean the two
-chips differ somewhere, and the RTL is the one with the tests behind it.
-
-**The differential harness was built for exactly this, found three real bugs,
-and did not fix it.**  `diff-5380.py` is described above; it turned up a
-settle loop that stopped before the wires had converged, a BUSY ERROR latch
-treated as an edge, and a one-clock race in the RTL's bus-free filter.  All
-three are fixed.  SunOS on `--core sw` still stalls in `rc` in exactly the
-same place, with 1820 reports in 2000 s where before it was 2269 - a real
-reduction, and nowhere near enough to matter.
-
-That is worth stating plainly because it narrows the search rather than
-widening it.  The harness compares the register port and the bus engine, and
-those two now agree over eight seeds of a twenty thousand step walk.  What it
-explicitly does *not* reach is the DMA handshake - DACK cycles and End of
-Process - because the ISA card is the only board with a register window qtest
-can drive and an ISA 5380 card has no DMA controller in front of it.  The
-fault is on 8192-byte DMA transfers.  So the remaining suspect is the half
-that has never been compared, and the next step is a harness that can reach
-it: driving the Sun-3 board's register block and its DVMA memory from qtest,
-so the Am9516 chain, the packing FIFO and the DACK path are exercised against
-both cores the way the register port now is.
-
-The regression covers the textbook version of that sequence -
-`dma_a_block_reads_back_through_a_real_engine` ends a DMA read exactly this
-way, clears `MR` and then reads STATUS and MESSAGE IN - and it passes, as
-does `dma_the_chip_interrupts_promptly_after_the_last_byte`, which measures
-the chip raising IRQ **70 ns** after the last byte.  The driver's own source settles half of it.  `doc/drivers/SunOS412/si.c` is
-now here, and `si_deque` shows that **`lost interrupt` is printed after a
-request has already timed out**, when the CSR happens to show `SBC_IP`: it is
-the driver's explanation for the timeout, not an independent fault, and the
-command in the dump is simply whichever was current.  `siintr` handles one
-phase per interrupt and arms for the next with `TCR = TCR_UNSPECIFIED`,
-`MR |= SBC_MR_DMA` and *then a poll of the bus status for REQ* - and both
-halves of what that needs from the chip are now pinned by tests in
-`tb/cpp/tests/test_dma.cpp`, because the mismatch interrupt is an edge and a
-request already standing produces nothing.  The poll is what covers that, and
-it is the driver's, not ours.
-
-The poll is not the problem either, and tracing the register *reads* settles
-it.  The whole exchange after the data phase is clean:
-
-```
-CSB 0x6d   STATUS, REQ      the driver reads the status byte, 0x00
-ICR 0x10 / 0x00             ACK
-CSB 0x4d -> 0x7d            REQ drops, target moves to MESSAGE IN and asks
-TCR=4, read reg 7, MR=2     the arm
-CSB 0x7d                    the poll - and it sees REQ
-...message byte read and acknowledged...
-CSB 0x00                    BUS FREE: the target disconnected
-ODR 0x80, MR=1, ICR 0x40    arbitration for the next command
-```
-
-Status, message, disconnect: the command finishes properly and the driver
-goes straight on to the next one.  **The stall is between two commands, not
-inside either**, and the whole window holds ninety-five register accesses -
-the driver is not spinning on anything, it is idle.
-
-So nothing on the SCSI side is wrong.  What is left is guest timekeeping: the
-virtual clock advancing about two minutes - 118.5 s in one run, 117.4 s in
-another - while the machine is idle between commands, with `catch_up`
-faithfully burning the same two minutes of core time to follow it.  Two
-minutes trivially exceeds `sd`'s I/O timeout, which is what fires, and `si`
-then prints its "lost interrupt" explanation.
-
-Pinning that wants a timestamp on *every* register access rather than on
-chain and completion events, so the jump can be located between two adjacent
-accesses instead of inferred from the space between them.
-
-It still fires on the small ProDrive 80S disk, four times in one boot with
-three `lost interrupt`s beside them, and the driver recovered from every one.
-One of those dumps carries `last phase= 0x40 (DATA OUT) 8192` and a ten-byte
-CDB, where every earlier sighting had `0x4 (DATA IN)` and a six-byte READ.
-That *hints* the stall is not read-specific and the 8192-byte transfer is the
-common factor - but it is only a hint, because the paragraph above is exactly
-about the dump reporting whichever command was current rather than the one
-that failed, and the phase ring is the same dump.  Worth checking against a
-per-access timestamp; not worth believing before that.
 
 **`panic: ialloc: dup alloc`**, once, on a filesystem that is not corrupt.
 The panic named inode 1565 and killed the boot 20 s after `checking
