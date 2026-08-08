@@ -944,6 +944,73 @@ shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
 Which is the same asymmetry the table at the top of this file describes, and
 the reason the second guest earns its keep.
 
+**The software core has a second fault, and it is not this one.**  On
+`--core sw` SunOS gets through fsck, single-user, `rc`, the rpc and net
+services, the system logger and `inetd`, stalls at the end of `rc` around the
+printer step, and then produces nothing but fault reports - 2140 of them in
+2600 s, having never reached multi-user.  Fixing the target below changed that
+number by nothing at all, and it could not have: the software core's target is
+QEMU's `scsi-disk.c`, which never had the bug.
+
+So there were two faults with one symptom.  The Verilated one is explained and
+fixed below.  The software one is still open, it is somewhere in
+`hw/scsi/ncr5380.c` or in how the board drives it, and what is known about it
+is that a *single* 8192-byte read is not enough to provoke it -
+`diff-sun3-dma.py` runs several in a row on both cores and they agree byte for
+byte.  Whatever it is needs the mixture SunOS actually produces: writes as well
+as reads, interleaved, with error recovery in between.  Extending the running
+transfer to WRITE(6) and to a longer scripted sequence is the next thing to
+try, and it is cheap now that the machinery exists.
+
+**Found, and it was the target.**  `scsi_targ.sv` drives the phase lines from a
+case on its state, and `S_RDWAIT` - the state a multi-block read sits in while
+the back end fills the buffer for the next block - fell into the default and
+drove `3'b000`.  So halfway through a DATA IN transfer the target let the phase
+fall to DATA OUT for the length of an SD card read, milliseconds, and then put
+it back.
+
+That is a phase *change* in the middle of a transfer, and an initiator is
+entitled to read it as the target having moved on.  The Sun-3's DMA controller
+does exactly that: its end-of-transfer test is "the chip has asked at least
+once, the phase no longer matches, and the chip is interrupting", and all three
+are true in that window.  Every multi-block read was therefore abandoned after
+its first 512 bytes, with the target still in DATA IN holding REQ and the
+driver waiting for an interrupt about a transfer it thought had finished.
+
+An 8192-byte read is sixteen blocks, which is the whole shape of the fault:
+why it was always on 8192-byte transfers, why it was on DATA IN, why SunOS met
+it far more often than NetBSD - NetBSD's INSTALL kernel reads a block at a time
+where SunOS reads eight kilobytes - and why nothing in `tb/` had ever seen it,
+since every DMA test moved a single block and a single block never reaches
+`S_RDWAIT`.  The step at 6 above, "nothing happens for 117 seconds", was the
+target waiting to be asked for byte 513 of a transfer the board had already
+given up on.
+
+It took three harnesses to get here, and the order was not wasted.  The
+software core removed the RTL and the pacing from the list of suspects by
+reproducing the fault without either.  `diff-5380.py` cleared the register port
+and the bus engine.  `diff-sun3-dma.py` cleared the acknowledge path, and then,
+once it could run a whole transfer against the same disk on both sides, printed
+the answer in thirty seconds: the Verilated core stopped after 512 of 8192
+bytes with the count stuck at `0x1e00`.
+
+`sys_a_multi_block_read_holds_the_phase_between_blocks` pins it.
+
+Two things did turn out to be genuinely missing from the board, both found by
+building the software path and both about who wakes the board up: the chip's
+interrupt pin was polled rather than listened to, so an interrupt raised
+between two register accesses waited for the driver to touch something; and a
+transfer that ends short interrupts rather than raising DRQ, so the pump had
+to be re-entered from the interrupt as well.  Connecting those cut the reports
+on a SunOS boot by a third.  Neither is the fault above - it survives both -
+but the RTL path had been hiding both behind its 500 µs pacing timer, which
+called the pump and re-read the interrupt whatever else was going on.
+
+NetBSD, for what it is worth, is clean on the software core: a whole boot to a
+shell is 600 commands and 569 DMA transfers with `residual 0` on every one.
+Which is the same asymmetry the table at the top of this file describes, and
+the reason the second guest earns its keep.
+
 **But the software core is worse than the RTL under SunOS, not better, and
 that is the state to be honest about.**  On `--core rtl` SunOS reaches
 `Amnesiac login:` in about 14000 s with four to seven of these reports on the
