@@ -856,12 +856,27 @@ survivable.
 
 That does not weaken the conclusion above - the fault plainly is not the RTL
 and not the pacing, since it happens without either - but it does mean the two
-chips differ somewhere, and the RTL is the one with 118 tests behind it.  The
-next step is therefore to find where they diverge rather than to chase the
-stall in SunOS: the same register sequence into both cores, compared access by
-access, which is the differential harness this work deliberately deferred.  It
-is now clearly worth building, and it has a specific first question to answer -
-what the two do differently at the end of an 8192-byte transfer.
+chips differ somewhere, and the RTL is the one with the tests behind it.
+
+**The differential harness was built for exactly this, found three real bugs,
+and did not fix it.**  `diff-5380.py` is described above; it turned up a
+settle loop that stopped before the wires had converged, a BUSY ERROR latch
+treated as an edge, and a one-clock race in the RTL's bus-free filter.  All
+three are fixed.  SunOS on `--core sw` still stalls in `rc` in exactly the
+same place, with 1820 reports in 2000 s where before it was 2269 - a real
+reduction, and nowhere near enough to matter.
+
+That is worth stating plainly because it narrows the search rather than
+widening it.  The harness compares the register port and the bus engine, and
+those two now agree over eight seeds of a twenty thousand step walk.  What it
+explicitly does *not* reach is the DMA handshake - DACK cycles and End of
+Process - because the ISA card is the only board with a register window qtest
+can drive and an ISA 5380 card has no DMA controller in front of it.  The
+fault is on 8192-byte DMA transfers.  So the remaining suspect is the half
+that has never been compared, and the next step is a harness that can reach
+it: driving the Sun-3 board's register block and its DVMA memory from qtest,
+so the Am9516 chain, the packing FIFO and the DACK path are exercised against
+both cores the way the register port now is.
 
 The regression covers the textbook version of that sequence -
 `dma_a_block_reads_back_through_a_real_engine` ends a DMA read exactly this
