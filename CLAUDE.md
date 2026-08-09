@@ -362,6 +362,17 @@ allowed to derive anything from the other.  The Atari TT has no `--core`:
 Hatari has no `SCSIBus` to put behind the model, and `run-tt.py --stock`
 already gives it Hatari's own 5380 for comparison.
 
+**The QEMU changes are two series, and which one a change belongs in is
+decided by what it owes this project.**  `cosim/patches/qemu/` is the software
+5380 and the two boards that carry it, with no mention of Verilog, of a shared
+library or of Wish5380 anywhere in it - it is what could be posted to
+qemu-devel, and it has to stay that way.  `cosim/patches/qemu-rtl/` then
+teaches both boards to `dlopen` the Verilated chip, and carries every trace of
+the pacing that a core which only advances when stepped needs.  A change that
+would put an `#ifdef` or an `rtl` in the first series belongs in the second.
+`build-sun3-qemu.sh -s` applies only the first, which is how that claim is
+checked.
+
 **`cosim/scripts/diff-5380.py` is how that disagreement gets found.**  It puts
 both cards in one QEMU, drives every access to both and compares every read,
 so the stimulus is identical by construction; thirteen scripted checks, one

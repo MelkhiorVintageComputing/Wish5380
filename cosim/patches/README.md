@@ -3,46 +3,41 @@
 Changes to emulators, kept as patches because the emulators are not ours and
 their sources do not belong in this repository.
 
-## `qemu/`
+## `qemu/` and `qemu-rtl/`
 
-One series, one tree, two machines.  These apply to the **Sun-3 QEMU fork**,
-because mainline has no Sun-3 machine at all.  The fork lives outside this tree
-(`~/qemu-sun3` by default) and is a separate piece of work under separate
+Two series, one tree, two machines.  Both apply to the **Sun-3 QEMU fork**,
+because mainline has no Sun-3 machine at all.  The fork lives outside this
+tree (`~/qemu-sun3` by default) and is a separate piece of work under separate
 ownership; nothing here modifies it.
 
 `cosim/scripts/build-sun3-qemu.sh` clones the fork's already-patched tree into
-`work/sun3-qemu`, applies these on top, and builds `qemu-system-m68k` and
-`qemu-system-i386`.  Run it, then `cosim/scripts/run-sun3.py` or
-`cosim/scripts/run-cosim.py`.
+`work/sun3-qemu`, applies `qemu/` and then `qemu-rtl/`, and builds
+`qemu-system-m68k` and `qemu-system-i386`.  The order is not a convenience:
+the second series rewrites files the first creates.  `-s` stops after the
+first, which is how "the first series stands on its own" is tested rather than
+asserted.
 
-The ISA card used to be a `diff -ruN` against a QEMU 7.2.22 release tarball in
-a tree of its own.  It is here now because the two boards are not as separate
-as two trees implied: they model the same part behind different glue and they
-load the same shared library to carry it.  A file both of them need - which is
-what a software 5380 is about to be - would have had to exist twice, in two
-patch formats, with nothing to report when one copy was fixed and the other
-was not.  Rebasing the card onto the newer tree cost only QOM idioms.
+### `qemu/` - the software 5380, and it could be posted
 
-Seven patches, in order:
+Five patches that owe nothing to this project.  They add an NCR 5380 to QEMU
+and two boards that carry it, and there is no mention of Verilog, of a shared
+library, or of Wish5380 anywhere in them.
 
 | patch | what it does |
 |---|---|
-| `0001-...-let-the-MMU-reach-the-SCSI-registers.patch` | lets the MMU reach the SCSI registers at all |
-| `0002-...-the-Sun-3-si-onboard-SCSI-board.patch` | the `si` board: Am9516 UDC, packing FIFO, CSR |
-| `0003-...-attach-the-onboard-SCSI-board.patch` | puts one on the machine, behind `si-rtl=` |
-| `0004-...-the-ISA-NCR-5380-card.patch` | the i386 card: eight ports, an interrupt, no DMA |
-| `0005-...-a-software-NCR-5380.patch` | the part itself, in C, on a real `SCSIBus` |
-| `0006-...-ncr5380-isa-choose-between-the-two-chips.patch` | `core=sw\|rtl` on the card |
-| `0007-...-sun3-si-...-choose-between-the-two-chips.patch` | `core=sw\|rtl` on the board and the machine |
+| `0001-hw-scsi-a-software-NCR-5380.patch` | the part itself, in C, on a real `SCSIBus` |
+| `0002-...-the-ISA-NCR-5380-card.patch` | the i386 card: eight ports, an interrupt, no DMA |
+| `0003-...-let-the-MMU-reach-the-SCSI-registers.patch` | lets the Sun-3 MMU reach the board at all |
+| `0004-...-the-Sun-3-si-onboard-SCSI-board.patch` | the `si` board: Am9516 UDC, packing FIFO, CSR |
+| `0005-...-attach-the-onboard-SCSI-board.patch` | puts one on the machine |
 
-The fifth is the one that could be posted to qemu-devel on its own merits.
 QEMU has no NCR 5380 and never has: the only hits for it in the tree are a
 Linux bootinfo tag and a line of captured `ls` output used as QDict test data,
 and `hw/m68k/q800.c` models a Macintosh that really had one and uses an ESP
-anyway.  It is written the way `esp.c` is - the chip a bare `TYPE_DEVICE`,
-the boards separate objects around it - because that is the shape the part
-demands: every 5380 machine presented the same eight registers and differed
-only in where they landed and in what answered DRQ.
+anyway.  The first patch is written the way `esp.c` is - the chip a bare
+`TYPE_DEVICE`, the boards separate objects around it - because that is the
+shape the part demands: every 5380 machine presented the same eight registers,
+and they differed only in where those landed and in what answered DRQ.
 
 It models wires rather than commands, which is the decision worth knowing
 about before reading it.  A 5380 has no sequencer, so there is no command
@@ -50,7 +45,7 @@ level to hide behind; the adapter at the bottom of the file is the only part
 that knows what a CDB is, and it is where QEMU's command-oriented `SCSIBus`
 gets its REQ/ACK put back.
 
-The first is not optional and is easy to miss.  `sun3mmu.c` carries a
+The third is not optional and is easy to miss.  `sun3mmu.c` carries a
 whitelist of physical addresses the MMU is allowed to reach, and anything
 outside it becomes a bus-error timeout *before* the access is dispatched.  A
 device can be correctly modelled, correctly mapped, and still be invisible:
@@ -58,12 +53,47 @@ the PROM's probe writes one word to the board, takes a bus error, and reports
 "Device not found" without ever having read a register.  That was the first
 day of this work.
 
-The second carries three decisions about the board's status register that
+The fourth carries three decisions about the board's status register that
 only a driver could settle, and all three came from SunOS rather than from
 NetBSD - `DMA_CONFLICT` never set, `DMA_IP` not raised at terminal count, and
 `DMA_ACTIVE` cleared when the chip stops asking rather than when the count
 runs out.  Its commit message argues each; `cosim/README.md` has the
 evidence.
+
+The fifth attaches the board unconditionally, because every 3/60 shipped with
+onboard SCSI, and turns off QEMU's default CD-ROM in the same breath.  That
+pairing is not cosmetic: with `block_default_type = IF_SCSI` the default
+empty CD lands at target 2 and answers NOT READY, and the 1.9 boot PROM
+auto-boots by walking the bus - so it finds the phantom drive and retries it
+for ever instead of saying "Device not found" and stopping at the monitor.
+
+### `qemu-rtl/` - the Verilated chip, and it could not be
+
+Three patches that are local to this project and are not offered upstream:
+they `dlopen` a shared library built from `src/`.
+
+| patch | what it does |
+|---|---|
+| `0001-...-ncr5380-isa-carry-the-Verilated-core-instead.patch` | `core=auto\|sw\|rtl` on the card |
+| `0002-...-sun3-si-...-carry-the-Verilated-core-instead.patch` | the same on the board and the machine |
+| `0003-...-a-debug-only-latency-on-the-interrupt-pin.patch` | off unless built otherwise; see the comment on it |
+
+Everything that makes a board a board is untouched by these.  Eight one-line
+dispatchers are the whole difference on the Sun-3, because the Am9516 chain
+parsing, the packing FIFO and the CSR semantics are all about the chip's
+observable pins and not about how the chip is built.  What the second series
+does add, and only to the RTL path, is *time*: a Verilated core advances when
+it is stepped and not otherwise, so there is a catch-up to virtual time, a
+microsecond bought by each register access, and a 500 us timer.  The software
+chip has no time in it and none of that is created for it.
+
+The ISA card used to be a `diff -ruN` against a QEMU 7.2.22 release tarball in
+a tree of its own.  It is here now because the two boards are not as separate
+as two trees implied: they model the same part behind different glue, and a
+file both of them need - which is what a software 5380 turned out to be -
+would have had to exist twice, in two patch formats, with nothing to report
+when one copy was fixed and the other was not.  Rebasing the card onto the
+newer tree cost only QOM idioms.
 
 ## `hatari/`
 

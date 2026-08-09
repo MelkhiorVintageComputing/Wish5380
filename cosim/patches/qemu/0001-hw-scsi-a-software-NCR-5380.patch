@@ -1,7 +1,7 @@
-From 6445406a86ca8a77c400de124633cc0d17774857 Mon Sep 17 00:00:00 2001
+From 126baaca4fd430c8da3388b2c1f45ec74d2bce7e Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
-Date: Sat, 8 Aug 2026 10:27:00 +0200
-Subject: [PATCH 5/9] hw/scsi: a software NCR 5380
+Date: Sun, 9 Aug 2026 08:29:08 +0200
+Subject: [PATCH 1/5] hw/scsi: a software NCR 5380
 
 QEMU has no NCR 5380.  grep over the tree finds a Linux bootinfo tag and
 a line of captured `ls` output used as QDict test data, and nothing else;
@@ -37,16 +37,27 @@ reason - a target that is not there simply never asserts BSY.  Putting
 either in would make a driver that omitted its half work when against
 real silicon it would not.
 
-The awkward bits of the part are reproduced rather than tidied, each
-cited where it lands: Initiator Command reads AIP and LOST ARBITRATION
-where TEST MODE and DIFF ENBL were written; a DACK access does not
-decode the address at all; the Mode Register refuses the DMA bit while
-BSY is false, the only write the chip does not take; an SCSI reset
-spares the interrupt latch and ASSERT RST where the RESET pin does not;
-END OF DMA is cleared by clearing the DMA bit and not by reading
-register 7; and BUSY ERROR is a level and not an edge, so reading
-register 7 empties it and the condition immediately refills it, which is
-why Linux's NCR5380_intr writes the Mode Register first.
+Wires settling is the part that has to be iterated by hand, and it is
+subtler than it looks.  What this chip drives depends on what it sees:
+as an initiator it drives the data lines only while the phase matches,
+and the phase is on wires it may itself have been driving a moment ago.
+Leaving target mode is the case that bites.  The chip stops driving MSG
+and C/D, the phase it was matching disappears, and it must stop driving
+the data bus in the same instant - so a single pass leaves the old byte
+sitting on the bus until something else happens to disturb it.  The
+combinational half therefore runs to its own fixed point before each
+edge, and the wires are part of the loop's termination test as well as
+the state.  Hardware gets this for nothing, being a comb block; in C it
+is a loop, and the loop has to be told what it is converging on.
+
+BUSY ERROR is the same shape seen from the other side.  It is a level -
+"set whenever the MONITOR BUSY bit is true and BSY is false" (p. 16) -
+so the condition that filled the latch is still true after a driver has
+read register 7, and the model has to ask for the pass that fills it
+again rather than treating the read as the end of it.  A latch that
+emptied and stayed empty would make NCR5380_intr's careful ordering,
+Mode Register before register 7, pointless, and would let a driver that
+got it backwards appear to work.
 
 Interrupts are the six the manual lists.  Arbitration reports AIP and
 LOST ARBITRATION and nothing else, because the chip does not decide who
@@ -56,30 +67,37 @@ Disconnection, reselection, tagged queueing, linked commands and
 checking incoming parity are all absent on purpose.  A model that
 quietly acquired one of them would let a driver missing its half appear
 to work.
+
+Both of the paragraphs above about settling are here because the first
+draft got them wrong, and what caught them was a differential harness:
+this model and an independent SystemVerilog one driven through identical
+register sequences with every read compared.  They now agree over
+thirteen scripted sequences, one per datasheet trap, and over eight
+seeds of a twenty-thousand-step random walk - about 68000 reads.
 ---
  hw/scsi/Kconfig           |    4 +
  hw/scsi/meson.build       |    1 +
- hw/scsi/ncr5380.c         | 1312 +++++++++++++++++++++++++++++++++++++
+ hw/scsi/ncr5380.c         | 1362 +++++++++++++++++++++++++++++++++++++
  hw/scsi/trace-events      |   13 +
  include/hw/scsi/ncr5380.h |  199 ++++++
- 5 files changed, 1529 insertions(+)
+ 5 files changed, 1579 insertions(+)
  create mode 100644 hw/scsi/ncr5380.c
  create mode 100644 include/hw/scsi/ncr5380.h
 
 diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
-index cbaf672832..8c3598253d 100644
+index 5743ee9b4d..df43b9d080 100644
 --- a/hw/scsi/Kconfig
 +++ b/hw/scsi/Kconfig
-@@ -80,3 +80,7 @@ config NCR5380_ISA
-     bool
-     default y
-     depends on ISA_BUS
+@@ -69,3 +69,7 @@ config VHOST_USER_SCSI
+     default y if VIRTIO_PCI
+     select VHOST_SCSI_COMMON
+     depends on VIRTIO && VHOST_USER && LINUX
 +
 +config NCR5380
 +    bool
 +    select SCSI
 diff --git a/hw/scsi/meson.build b/hw/scsi/meson.build
-index c5551c1763..7bd218e3b5 100644
+index 69fde0cf84..3b74ffdc82 100644
 --- a/hw/scsi/meson.build
 +++ b/hw/scsi/meson.build
 @@ -8,6 +8,7 @@ scsi_ss.add(files(
@@ -92,10 +110,10 @@ index c5551c1763..7bd218e3b5 100644
  scsi_ss.add(when: 'CONFIG_LSI_SCSI_PCI', if_true: files('lsi53c895a.c'))
 diff --git a/hw/scsi/ncr5380.c b/hw/scsi/ncr5380.c
 new file mode 100644
-index 0000000000..4e4f635034
+index 0000000000..81595b02f8
 --- /dev/null
 +++ b/hw/scsi/ncr5380.c
-@@ -0,0 +1,1312 @@
+@@ -0,0 +1,1362 @@
 +/*
 + * NCR 5380 SCSI protocol controller.
 + *
@@ -250,6 +268,14 @@ index 0000000000..4e4f635034
 +    out->io   = a->io   || b->io;
 +    out->data = a->data |  b->data;
 +    out->dbp  = a->dbp  || b->dbp;
++}
++
++static bool ncr5380_wires_eq(const NCR5380Wires *a, const NCR5380Wires *b)
++{
++    return a->rst == b->rst && a->bsy == b->bsy && a->sel == b->sel &&
++           a->req == b->req && a->ack == b->ack && a->atn == b->atn &&
++           a->msg == b->msg && a->cd == b->cd && a->io == b->io &&
++           a->data == b->data && a->dbp == b->dbp;
 +}
 +
 +static bool ncr5380_phase_match(NCR5380State *s)
@@ -548,7 +574,15 @@ index 0000000000..4e4f635034
 +                 (s->st_csd_rd || recv_latch);
 +
 +    if (s->st_rpi) {
++        /* Emptying a level-sensitive latch is not the end of it: the
++         * condition that filled it is still true, and the next pass fills it
++         * again.  Asking for that pass is the whole of what makes BUSY ERROR
++         * a level rather than an edge - without it a driver that
++         * acknowledged would see the error go away and stay away, and
++         * NCR5380_intr's careful ordering (Mode Register first, register 7
++         * second) would be pointless. */
 +        s->busy_err = false;
++        s->dirty = true;
 +    } else if (busy_lost) {
 +        s->busy_err = true;
 +        s->dirty = true;
@@ -636,11 +670,45 @@ index 0000000000..4e4f635034
 +
 +    s->settling = true;
 +    for (i = 0; i < SETTLE_MAX; i++) {
++        NCR5380Wires before = s->wires;
++        int j;
++
 +        s->dirty = false;
-+        ncr5380_drive(s);
-+        ncr5380_wires_or(&s->wires, &s->drv, &s->peer);
++
++        /*
++         * The combinational half first, to its own fixed point, because what
++         * this chip drives depends on what it sees: as an initiator it only
++         * drives the data lines while the phase matches, and the phase is on
++         * wires it may itself have been driving a moment ago.  Leaving target
++         * mode is the case that bites - the chip stops driving MSG and C/D,
++         * the phase it was matching disappears, and it must stop driving the
++         * data bus in the same instant.  One pass would leave the old byte on
++         * the bus until something else happened to disturb it.
++         *
++         * The Verilated model gets this for nothing: it is a comb block, and
++         * `drive_o` depending on `bus_i` is the reason sci_bus.sv carries a
++         * UNOPTFLAT suppression.  Here it has to be iterated by hand.
++         */
++        for (j = 0; j < SETTLE_MAX; j++) {
++            NCR5380Wires prev = s->wires;
++
++            ncr5380_drive(s);
++            ncr5380_wires_or(&s->wires, &s->drv, &s->peer);
++            if (ncr5380_wires_eq(&prev, &s->wires)) {
++                break;
++            }
++        }
++
++        /* Then the edge, and then whatever the other end makes of it. */
 +        ncr5380_tick(s);
 +        ncr5380_target_settled(s);
++
++        /* A target that drove something new has changed the wires without
++         * changing any of this chip's state, so the wires are part of the
++         * termination test and not only the state. */
++        if (!ncr5380_wires_eq(&before, &s->wires)) {
++            s->dirty = true;
++        }
 +        if (!s->dirty) {
 +            break;
 +        }
@@ -1409,13 +1477,13 @@ index 0000000000..4e4f635034
 +
 +type_init(ncr5380_register_types)
 diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
-index 0233b29f01..4b702d56d9 100644
+index a8ac1e7f1d..3053de8933 100644
 --- a/hw/scsi/trace-events
 +++ b/hw/scsi/trace-events
-@@ -402,3 +402,16 @@ sun3_si_stalled(uint16_t resid, uint8_t csb, uint8_t bsr, int drq) "stalled with
- sun3_si_dma_done(uint16_t resid, uint16_t csr, uint32_t head) "residual %u bytes, csr 0x%04x, first four bytes 0x%08x"
- sun3_si_irq(int level, uint16_t csr, const char *who) "level 2 %d, csr 0x%04x, from %s"
- sun3_si_clock(const char *what, int64_t guest_us, int64_t core_us, int64_t lag_us, uint64_t clamped) "%s: guest %"PRId64" us, core %"PRId64" us, core is %"PRId64" us behind, %"PRIu64" clamped"
+@@ -392,3 +392,16 @@ scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sg
+ scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
+ scsi_generic_persistent_reserve_out_reply(uint8_t service_action, uint8_t resv_type, uint64_t old_key, uint64_t new_key) "persistent reserve out reply service_action=%u resv_type=%u old_key=0x%" PRIx64 " new_key=0x%" PRIx64
+ scsi_generic_pr_state_preempt(uint64_t key, uint8_t resv_type) "key=0x%" PRIx64 " resv_type=%u"
 +
 +# ncr5380.c
 +ncr5380_reg_read(int reg, uint8_t val) "reg %d -> 0x%02x"

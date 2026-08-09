@@ -1,0 +1,204 @@
+From 6986369a7a196cb0a040ba904a8cdf7866cf1a39 Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sun, 9 Aug 2026 08:30:49 +0200
+Subject: [PATCH 2/5] hw/scsi: add the ISA NCR 5380 card
+
+A generic ISA card carrying the 5380, which is what Linux's g_NCR5380
+driver calls board=0: eight byte-wide registers at an I/O port, one
+apart, an interrupt, and nothing else.  No BIOS ROM and no pseudo-DMA
+window, because the generic board had neither and the driver reaches
+the chip with inb(base + reg).
+
+That driver knows five boards and this is the only bare one - it sets
+FLAG_NO_PSEUDO_DMA for it, where the other four have a wakeup magic and
+a 53C400 block-transfer register file in front of the chip.  So the card
+is about the decode and not about the part: iobase and irq are its whole
+configuration, and everything a driver does to it, it does to the 5380.
+
+Without a DMA controller, DRQ, DACK and End of Process go unresolved
+here.  The driver moves every byte itself and polls the DRQ bit in the
+Bus and Status Register; that is programmed I/O as the manual describes
+it (pp. 24-25) and is all this card can do.  A board with a DMA
+controller in front of the chip is a different board and belongs in a
+different file.
+
+The chip's SCSI bus is initialised with the card as its parent, which is
+what esp.c does and is not an accident: a device realized with no parent
+bus is not reachable from the qdev tree, and neither is a bus hanging
+off one, so -device scsi-hd would answer "No 'SCSI' bus found" and be
+right.  The PC machine's default drive type is IF_IDE, so a disk here
+has to be asked for by name - -drive if=scsi or -device scsi-hd.
+
+Verified with an unmodified i386 Linux: g_NCR5380 probes the card,
+INQUIRY and READ CAPACITY answer, sda attaches, and an ext2 filesystem
+mounts, reads and writes.
+---
+ hw/scsi/Kconfig       |   6 ++
+ hw/scsi/meson.build   |   2 +
+ hw/scsi/ncr5380-isa.c | 125 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 133 insertions(+)
+ create mode 100644 hw/scsi/ncr5380-isa.c
+
+diff --git a/hw/scsi/Kconfig b/hw/scsi/Kconfig
+index df43b9d080..67ba701bb3 100644
+--- a/hw/scsi/Kconfig
++++ b/hw/scsi/Kconfig
+@@ -70,6 +70,12 @@ config VHOST_USER_SCSI
+     select VHOST_SCSI_COMMON
+     depends on VIRTIO && VHOST_USER && LINUX
+ 
++config NCR5380_ISA
++    bool
++    default y
++    depends on ISA_BUS
++    select NCR5380
++
+ config NCR5380
+     bool
+     select SCSI
+diff --git a/hw/scsi/meson.build b/hw/scsi/meson.build
+index 3b74ffdc82..41ed4a4620 100644
+--- a/hw/scsi/meson.build
++++ b/hw/scsi/meson.build
+@@ -28,5 +28,7 @@ scsi_ss.add_all(when: 'CONFIG_VIRTIO_SCSI', if_true: virtio_scsi_ss)
+ 
+ specific_scsi_ss.add(when: 'CONFIG_SPAPR_VSCSI', if_true: files('spapr_vscsi.c'))
+ 
++system_ss.add(when: 'CONFIG_NCR5380_ISA', if_true: files('ncr5380-isa.c'))
++
+ system_ss.add_all(when: 'CONFIG_SCSI', if_true: scsi_ss)
+ specific_ss.add_all(when: 'CONFIG_SCSI', if_true: specific_scsi_ss)
+diff --git a/hw/scsi/ncr5380-isa.c b/hw/scsi/ncr5380-isa.c
+new file mode 100644
+index 0000000000..fdb36fe11d
+--- /dev/null
++++ b/hw/scsi/ncr5380-isa.c
+@@ -0,0 +1,125 @@
++/*
++ * An ISA card carrying an NCR 5380.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * This is the shape Linux's g_NCR5380 driver expects from `board=0`: eight
++ * byte-wide registers at an I/O port, one apart, and an interrupt.  There is
++ * nothing else on the card - no BIOS ROM, no pseudo-DMA window - because the
++ * generic board has nothing else either, and the driver reaches the chip with
++ * `inb(base + reg)`.
++ *
++ * There is no DMA controller in front of the chip, so the card resolves
++ * neither DRQ nor DACK nor End of Process: the driver moves every byte itself
++ * and polls the DRQ bit in the Bus and Status Register instead.  That is what
++ * a generic 5380 card was, and it is why this file is as short as it is - all
++ * eight registers are the chip's, and the card is a decoder and an interrupt
++ * line.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/isa/isa.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/scsi/ncr5380.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_NCR5380_ISA "ncr5380-isa"
++OBJECT_DECLARE_SIMPLE_TYPE(Ncr5380IsaState, NCR5380_ISA)
++
++struct Ncr5380IsaState {
++    ISADevice parent_obj;
++
++    uint32_t iobase;
++    uint32_t isairq;
++
++    NCR5380State chip;
++
++    MemoryRegion io;
++    qemu_irq irq;
++};
++
++static uint64_t ncr5380_isa_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Ncr5380IsaState *s = opaque;
++
++    return ncr5380_reg_read(&s->chip, addr & 7);
++}
++
++static void ncr5380_isa_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    Ncr5380IsaState *s = opaque;
++
++    ncr5380_reg_write(&s->chip, addr & 7, (uint8_t)val);
++}
++
++static const MemoryRegionOps ncr5380_isa_ops = {
++    .read = ncr5380_isa_read,
++    .write = ncr5380_isa_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void ncr5380_isa_realize(DeviceState *dev, Error **errp)
++{
++    ISADevice *isadev = ISA_DEVICE(dev);
++    Ncr5380IsaState *s = NCR5380_ISA(dev);
++
++    s->irq = isa_get_irq(isadev, s->isairq);
++
++    object_initialize_child(OBJECT(dev), "ncr5380", &s->chip, TYPE_NCR5380);
++    if (!qdev_realize(DEVICE(&s->chip), NULL, errp)) {
++        return;
++    }
++
++    /* The bus is initialised with the *board* as its parent, which is what
++     * esp.c does and is not an accident: a device realized with no parent bus
++     * is not reachable from the qdev tree, and neither is a bus hanging off
++     * one, so -device scsi-hd would answer "No 'SCSI' bus found" and be
++     * right. */
++    ncr5380_bus_init(&s->chip, dev);
++    qdev_connect_gpio_out(DEVICE(&s->chip), 0, s->irq);
++
++    memory_region_init_io(&s->io, OBJECT(dev), &ncr5380_isa_ops, s,
++                          TYPE_NCR5380_ISA, 8);
++    memory_region_add_subregion(isa_address_space_io(isadev), s->iobase,
++                                &s->io);
++
++    /* -drive if=scsi,... becomes an scsi-hd on the chip's bus.  The PC
++     * machine's default drive type is IF_IDE, so this one has to be asked
++     * for by name. */
++    scsi_bus_legacy_handle_cmdline(&s->chip.bus);
++}
++
++static const Property ncr5380_isa_properties[] = {
++    DEFINE_PROP_UINT32("iobase", Ncr5380IsaState, iobase, 0x350),
++    DEFINE_PROP_UINT32("irq", Ncr5380IsaState, isairq, 5),
++};
++
++static void ncr5380_isa_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = ncr5380_isa_realize;
++    dc->desc = "NCR 5380 SCSI on an ISA card";
++    device_class_set_props(dc, ncr5380_isa_properties);
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo ncr5380_isa_info = {
++    .name          = TYPE_NCR5380_ISA,
++    .parent        = TYPE_ISA_DEVICE,
++    .instance_size = sizeof(Ncr5380IsaState),
++    .class_init    = ncr5380_isa_class_init,
++};
++
++static void ncr5380_isa_register_types(void)
++{
++    type_register_static(&ncr5380_isa_info);
++}
++
++type_init(ncr5380_isa_register_types)
+-- 
+2.39.5
+

@@ -352,14 +352,22 @@ Am9516 Universal DMA Controller doing exactly that, and a boot PROM that uses
 it.
 
 Mainline QEMU has no Sun-3.  The machine model lives in a separate fork under
-separate ownership, which nothing here modifies; `cosim/patches/qemu/` holds
-what has to be added to it and `cosim/patches/README.md` explains the shape.
+separate ownership, which nothing here modifies; `cosim/patches/` holds what
+has to be added to it and `cosim/patches/README.md` explains the shape.
 
-That series carries the ISA card too.  Both boards model the same part behind
-different glue and load the same shared library to carry it, so building a
+There are two series and the split is the useful part.  `qemu/` adds the
+software 5380 and the two boards that carry it, and mentions neither Verilog
+nor this project - it is what could go to qemu-devel.  `qemu-rtl/` then
+teaches both boards to `dlopen` the Verilated chip instead, which is local to
+here and always will be.  `build-sun3-qemu.sh` applies them in that order and
+builds `qemu-system-m68k` and `qemu-system-i386` from one tree; `-s` stops
+after the first, so that "the software series stands on its own" is a thing
+that gets run rather than a thing that gets said.
+
+One tree carries the ISA card too.  Both boards model the same part behind
+different glue and can load the same shared library to carry it, so building a
 second QEMU to hold the second board bought nothing and cost a file that had
-to exist twice.  `build-sun3-qemu.sh` builds `qemu-system-m68k` and
-`qemu-system-i386` from one tree.
+to exist twice.
 
 ```sh
 make -C cosim/rtl                  # the shared library, as before
@@ -1243,9 +1251,11 @@ chip that NetBSD's `fsck` does on the Sun-3.
 * Hatari is treated the same way, and for the same reason plus one more: it is
   GPL-2+, so nothing of it may reach `src/` or `tb/`.  Its tree is cloned into
   `work/hatari-src` and the one commit is kept as a patch.
-* All QEMU changes are one series in `cosim/patches/qemu/`, against that one
+* All QEMU changes are two series under `cosim/patches/`, against that one
   clone, and they build both machines.  There is no second QEMU and no release
-  tarball: two trees meant two copies of anything both boards needed.
+  tarball: two trees meant two copies of anything both boards needed.  The
+  split is by what the change owes to this project - `qemu/` owes it nothing
+  and `qemu-rtl/` is all of it - and not by which machine it touches.
 * The guest is never patched.  If something only works with a modified guest,
   it does not work.
 * The scripts never install system packages; `check-deps.sh` reports and stops.

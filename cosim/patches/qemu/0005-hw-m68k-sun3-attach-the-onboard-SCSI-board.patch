@@ -1,0 +1,103 @@
+From ee4e0e8fdb9fe077b5b5b3e3bfe7436ad77b455b Mon Sep 17 00:00:00 2001
+From: Romain Dolbeau <romain@dolbeau.org>
+Date: Sun, 9 Aug 2026 08:37:25 +0200
+Subject: [PATCH 5/5] hw/m68k/sun3: attach the onboard SCSI board
+
+The si goes at obio 0x140000, one slot above the Lance, on interrupt
+level 2, with the MMU's DVMA IOMMU as the address space its Am9516
+masters.  That last link is the whole reason the board cannot simply be
+created and mapped: the UDC's addresses are DVMA addresses and mean
+nothing in system memory, so the board has to be handed the IOMMU
+region the MMU exports.
+
+It is created unconditionally, because every 3/60 shipped with onboard
+SCSI - as q800.c always creates its ESP.  A machine with no disk given
+to it is a machine with an empty bus, which is a real configuration:
+the PROM probes, finds nothing, and says "Device not found", which is
+the true answer rather than a stand-in for one.
+
+block_default_type becomes IF_SCSI, so a bare -drive file=x is a SCSI
+disk here as it is on every other machine whose only disk interface is
+SCSI.  no_cdrom goes with it, and that pairing is not cosmetic: the
+default CD-ROM drive would land on this bus at target 2, and an empty
+one answers TEST UNIT READY with CHECK CONDITION and then NOT READY,
+medium not present.  The 1.9 boot PROM auto-boots by walking the bus,
+so it finds that phantom drive, retries it five times, and starts over
+- for ever, never reaching the monitor prompt.  Suppressing the default
+restores the empty bus the machine really has; a CD can still be asked
+for by name with -device scsi-cd.
+
+Verified: all three 3/60 boot PROM revisions - 1.9, 2.8.3 and 3.0.1 -
+pass selftest and reach the ">" prompt with no disk attached, which is
+what tests/functional/m68k/test_sun3.py checks; the qtest passes; and
+with a disk the PROM reads a Sun label and loads a kernel through the
+board, NetBSD/sun3 attaches sd0 and mounts root, and SunOS 4.1.1 boots
+on the driver Sun wrote for this board.
+
+Signed-off-by: Romain Dolbeau <romain@dolbeau.org>
+---
+ hw/m68k/Kconfig |  1 +
+ hw/m68k/sun3.c  | 24 ++++++++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/hw/m68k/Kconfig b/hw/m68k/Kconfig
+index 59b36c75ee..14ea11c31c 100644
+--- a/hw/m68k/Kconfig
++++ b/hw/m68k/Kconfig
+@@ -54,3 +54,4 @@ config SUN3
+     select ESCC
+     select LANCE
+     select INTERSIL7170
++    select SUN3_SI
+diff --git a/hw/m68k/sun3.c b/hw/m68k/sun3.c
+index a60899b8c2..d13226c119 100644
+--- a/hw/m68k/sun3.c
++++ b/hw/m68k/sun3.c
+@@ -274,6 +274,7 @@ static void sun3_init(MachineState *machine)
+     DeviceState *sun3mmu;
+     DeviceState *dev;
+     DeviceState *lance_dev;
++    DeviceState *si_dev;
+     DeviceState *irqc_dev;
+     SysBusDevice *s;
+ 
+@@ -473,6 +474,19 @@ static void sun3_init(MachineState *machine)
+     sysbus_mmio_map(s, 0, 0x0FF20000);
+     sysbus_connect_irq(s, 0, qdev_get_gpio_in(irqc_dev, M68K_IRQC_LEVEL_3));
+ 
++    /* The onboard SCSI, obio 0x140000, one slot above the Lance.  Every 3/60
++     * shipped with it, so it is here whether or not a disk was given: an
++     * empty bus is a real machine, and the PROM's "Device not found" is the
++     * right answer to `b sd()` on one. */
++    si_dev = qdev_new("sun3-si");
++    object_property_set_link(OBJECT(si_dev), "dma_mr",
++                             OBJECT(&SUN3_MMU(sun3mmu)->dvma_iommu),
++                             &error_abort);
++    s = SYS_BUS_DEVICE(si_dev);
++    sysbus_realize_and_unref(s, &error_fatal);
++    sysbus_mmio_map(s, 0, 0x0FF40000);
++    sysbus_connect_irq(s, 0, qdev_get_gpio_in(irqc_dev, M68K_IRQC_LEVEL_2));
++
+     memory_region_init_ram(&s_mach->eeprom, NULL, "sun3.eeprom", 2048,
+                            &error_fatal);
+     memory_region_add_subregion(get_system_memory(), 0x0FE40000,
+@@ -497,6 +511,16 @@ static void sun3_machine_class_init(ObjectClass *oc, const void *data)
+     MachineClass *mc = MACHINE_CLASS(oc);
+ 
+     mc->desc = "Sun-3 (3/60)";
++    /* A bare -drive file=x is a SCSI disk here, as it is on every other
++     * machine whose only disk interface is SCSI.  But not an empty CD-ROM
++     * drive at target 2, which is what the default would otherwise put on the
++     * bus: a 3/60 with nothing attached had an empty bus, and the PROM's
++     * auto-boot walks the bus until it finds something bootable - so a
++     * phantom drive answering NOT READY leaves it retrying for ever instead
++     * of reporting "Device not found" and stopping.  A CD can still be asked
++     * for by name with -device scsi-cd. */
++    mc->block_default_type = IF_SCSI;
++    mc->no_cdrom = true;
+     mc->init = sun3_init;
+     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68020");
+     /* Minimum of 4MB for a 3/60, typical maximum ~24MB */
+-- 
+2.39.5
+

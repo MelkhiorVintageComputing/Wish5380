@@ -1,7 +1,7 @@
-From c127647f95e60ed9cc3e251c648ca0e3e82d10ef Mon Sep 17 00:00:00 2001
+From f74eaf0945ae38361893eeb88616fb6f5307eea0 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Mon, 3 Aug 2026 22:23:20 +0200
-Subject: [PATCH 1/9] hw/m68k/sun3mmu: let the MMU reach the SCSI registers
+Subject: [PATCH 3/5] hw/m68k/sun3mmu: let the MMU reach the SCSI registers
 
 sun3mmu_get_physical_address checks the translated physical address
 against a list of what exists on this machine, and turns anything else

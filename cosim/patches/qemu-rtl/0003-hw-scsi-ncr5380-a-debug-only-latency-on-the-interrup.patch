@@ -1,7 +1,7 @@
-From f54bce9f02e0f17516d8feda73bcea750cceb182 Mon Sep 17 00:00:00 2001
+From 7c7518310100989baa3481f9fc13fe62a9614e56 Mon Sep 17 00:00:00 2001
 From: Romain Dolbeau <romain@dolbeau.org>
 Date: Sat, 8 Aug 2026 18:21:55 +0200
-Subject: [PATCH 9/9] hw/scsi/ncr5380: a debug-only latency on the interrupt
+Subject: [PATCH 3/3] hw/scsi/ncr5380: a debug-only latency on the interrupt
  pin
 
 Off by default, and it must stay a question rather than become an
