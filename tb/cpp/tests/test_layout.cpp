@@ -32,6 +32,7 @@
 // turned out to be wrong.
 
 #include "test.h"
+#include "sd_card.h"
 
 using namespace wtb;
 
@@ -655,4 +656,36 @@ TEST(layout_phases) {
     CHECK_EQ(sci::csb_to_phase(sci::phase_to_csb(ph)), ph);
     CHECK_EQ(uint8_t(sci::phase_to_csb(ph) & ~sci::CSB_PHASE_MASK), uint8_t(0));
   }
+}
+
+// ---------------------------------------------------------------------------
+// The two SD command CRCs every driver writes down.
+//
+// `blk_sd` no longer carries these as constants - it computes CRC7 for every
+// command, as Linux's and U-Boot's SPI hosts do.  That leaves nothing pinning
+// the arithmetic to the outside world, because the RTL's CRC7 and this
+// testbench's are checked only against each other, and two implementations of
+// the same misreading agree perfectly.
+//
+// These two constants are the outside world.  They appear verbatim in every
+// small SPI-mode driver ever written - `doc/drivers/SD/FatFs/sdmm.c:346-347`
+// is the canonical pair - because CMD0 and CMD8 are the two the card checks
+// whatever its CRC setting, so a wrong constant stops a real card coming up.
+// A correct CRC7 must reproduce them; that is what makes computing it safe.
+// ---------------------------------------------------------------------------
+
+TEST(layout_the_two_known_command_crcs) {
+  // CMD0(0), the frame as it goes on the wire: 0x40 | 0, then four zero
+  // argument bytes.
+  const uint8_t cmd0[5] = {0x40, 0x00, 0x00, 0x00, 0x00};
+  CHECK_EQ(uint8_t((wtb::sd_crc7(cmd0, 5) << 1) | 1), uint8_t(0x95));
+
+  // CMD8(0x1AA) - 2.7-3.6 V, check pattern 0xAA.
+  const uint8_t cmd8[5] = {0x48, 0x00, 0x00, 0x01, 0xAA};
+  CHECK_EQ(uint8_t((wtb::sd_crc7(cmd8, 5) << 1) | 1), uint8_t(0x87));
+
+  // The stop bit is in the frame, not in the CRC: both constants are odd, and
+  // a host that forgot the shift would send an even byte and get nowhere.
+  CHECK_EQ(uint8_t(0x95 & 1), uint8_t(1));
+  CHECK_EQ(uint8_t(0x87 & 1), uint8_t(1));
 }

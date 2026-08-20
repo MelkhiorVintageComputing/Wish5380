@@ -13,8 +13,8 @@
 //
 //   * at least 74 clocks with the card deselected and the line held high, so
 //     it finishes its internal power-up;
-//   * CMD0 to put it into SPI mode - the one command whose CRC must be right,
-//     because the card is still checking CRCs when it arrives;
+//   * CMD0 to put it into SPI mode, which arrives while the card is still
+//     checking CRCs;
 //   * CMD8 to ask whether it understands the 2.00 spec.  A card that answers
 //     "illegal command" is a version 1 card and is addressed in bytes;
 //   * ACMD41 until it stops reporting idle, which is where the seconds go: a
@@ -25,13 +25,14 @@
 //     ignores because it has no other length;
 //   * CMD9 to read the CSD, which is where the capacity comes from.
 //
-// CRC is deliberately not computed for most commands.  In SPI mode the card
-// stops checking it after CMD0, so the two that matter - CMD0 and CMD8 - carry
-// their well-known constants and everything else carries a stop bit and
-// nothing else.  This is what every SPI-mode driver does, and it is why those
-// two constants appear in every one of them.  The CRC16 on read data *is*
-// checked, because it is the only thing standing between a marginal card and
-// a silently corrupt sector.
+// CRC7 is computed for every command.  A card in SPI mode does not check it
+// until CMD59 turns checking on, so the two constants every small driver
+// hard-codes - 0x95 for CMD0, 0x87 for CMD8 - would be enough for a card in
+// its default state; but Linux and U-Boot both compute it for every command
+// anyway, and a host that does not is a host that breaks the moment checking
+// is on.  doc/drivers/SD/README.md sets the three drivers side by side.  The
+// CRC16 on read data *is* checked, because it is the only thing standing
+// between a marginal card and a silently corrupt sector.
 
 module blk_sd #(
   parameter int CLK_PERIOD_PS = 20000
@@ -147,6 +148,34 @@ module blk_sd #(
   endfunction
 
   // ---------------------------------------------------------------------------
+  // CRC7, over the five bytes that precede it in a command.  x^7 + x^3 + 1,
+  // preset to zero, most significant bit first; the frame carries it shifted
+  // up by one with the stop bit underneath.
+  //
+  // It is computed for every command rather than written down for the two the
+  // card is still checking.  That is what Linux and U-Boot both do - "crc7
+  // (plus end bit) ... always computed, it's cheap"
+  // (doc/drivers/SD/Linux/mmc_spi.c:415) - and it is the only version that
+  // survives a card with CRC checking switched on by CMD59.  The two famous
+  // constants fall out of it: 0x95 for CMD0 and 0x87 for CMD8(0x1AA), which
+  // is what layout_the_two_known_command_crcs checks.
+  // ---------------------------------------------------------------------------
+
+  function automatic logic [6:0] crc7_byte(input logic [6:0] c,
+                                           input logic [7:0] d);
+    logic [6:0] r;
+    integer i;
+    begin
+      r = c;
+      for (i = 0; i < 8; i = i + 1) begin
+        if ((r[6] ^ d[7 - i]) == 1'b1) r = {r[5:0], 1'b0} ^ 7'h09;
+        else                           r = {r[5:0], 1'b0};
+      end
+      crc7_byte = r;
+    end
+  endfunction
+
+  // ---------------------------------------------------------------------------
   // States
   // ---------------------------------------------------------------------------
 
@@ -200,6 +229,7 @@ module blk_sd #(
   logic [5:0]  cmd_idx;
   logic [31:0] cmd_arg;
   logic [7:0]  cmd_crc;
+  logic [6:0]  cmd_crc7;
   logic        cmd_extra;      // the response carries four more bytes
   logic [7:0]  r1;
 
@@ -265,6 +295,18 @@ module blk_sd #(
   // The next byte of a command, by position.
   // ---------------------------------------------------------------------------
 
+  always_comb begin
+    logic [6:0] c;
+    c = 7'd0;
+    c = crc7_byte(c, {2'b01, cmd_idx});
+    c = crc7_byte(c, cmd_arg[31:24]);
+    c = crc7_byte(c, cmd_arg[23:16]);
+    c = crc7_byte(c, cmd_arg[15:8]);
+    c = crc7_byte(c, cmd_arg[7:0]);
+    cmd_crc7 = c;
+  end
+  assign cmd_crc = {cmd_crc7, 1'b1};
+
   logic [7:0] cmd_byte;
   always_comb begin
     unique case (bcnt[2:0])
@@ -306,7 +348,6 @@ module blk_sd #(
       spi_tx     <= 8'hff;
       cmd_idx    <= '0;
       cmd_arg    <= '0;
-      cmd_crc    <= 8'h01;
       cmd_extra  <= 1'b0;
       r1         <= 8'hff;
       r_extra    <= '0;
@@ -351,7 +392,6 @@ module blk_sd #(
         S_CMD0: begin
           cmd_idx   <= 6'd0;
           cmd_arg   <= 32'd0;
-          cmd_crc   <= 8'h95;   // the one CRC the card is still checking
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_CMD0_R;
@@ -373,7 +413,6 @@ module blk_sd #(
         S_CMD8: begin
           cmd_idx   <= 6'd8;
           cmd_arg   <= 32'h0000_01aa;   // 2.7-3.6 V, check pattern 0xAA
-          cmd_crc   <= 8'h87;
           cmd_extra <= 1'b1;
           bcnt      <= '0;
           ret       <= S_CMD8_R;
@@ -399,7 +438,6 @@ module blk_sd #(
         S_CMD55: begin
           cmd_idx   <= 6'd55;
           cmd_arg   <= 32'd0;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_CMD55_R;
@@ -413,7 +451,6 @@ module blk_sd #(
           // The host capacity support bit, which a version 2 card needs to see
           // before it will admit to being high capacity.
           cmd_arg   <= v2 ? 32'h4000_0000 : 32'd0;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_ACMD41_R;
@@ -435,7 +472,6 @@ module blk_sd #(
         S_CMD58: begin
           cmd_idx   <= 6'd58;
           cmd_arg   <= 32'd0;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b1;
           bcnt      <= '0;
           ret       <= S_CMD58_R;
@@ -454,7 +490,6 @@ module blk_sd #(
         S_CMD16: begin
           cmd_idx   <= 6'd16;
           cmd_arg   <= 32'd512;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_CMD16_R;
@@ -467,7 +502,6 @@ module blk_sd #(
         S_CMD9: begin
           cmd_idx   <= 6'd9;
           cmd_arg   <= 32'd0;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_CMD9_R;
@@ -535,7 +569,6 @@ module blk_sd #(
         // ---- read -----------------------------------------------------------
         S_RD_CMD: begin
           cmd_idx   <= 6'd17;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_RD_CMD_R;
@@ -612,7 +645,6 @@ module blk_sd #(
         // ---- write ----------------------------------------------------------
         S_WR_CMD: begin
           cmd_idx   <= 6'd24;
-          cmd_crc   <= 8'h01;
           cmd_extra <= 1'b0;
           bcnt      <= '0;
           ret       <= S_WR_CMD_R;

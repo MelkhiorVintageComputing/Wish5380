@@ -220,13 +220,16 @@ void SdCard::on_byte(uint8_t rx) {
   cmds_.push_back(was_acmd ? uint8_t(idx | 0x80) : idx);
   cmd_.clear();
 
-  // CMD0 and CMD8 arrive before the card stops checking CRCs, so a host that
-  // sends the wrong constant for either gets nowhere.  Everything after them
-  // may carry whatever it likes, and every SPI-mode driver sends a stop bit
-  // and nothing else - which is exactly what makes those two constants worth
-  // checking here.
-  if ((idx == 0 || idx == 8) && crc_rx != crc_want) {
-    push_r1(0x09);   // idle, with the CRC error bit
+  // Every command's CRC7 is checked, which is stricter than a card in its
+  // default state has to be - checking is off until CMD59 turns it on, and
+  // only CMD0 and CMD8 are checked whatever the setting.  The strictness is
+  // the point, and is the same bargain the rest of this model makes: Linux
+  // and U-Boot both compute a real CRC7 for every command
+  // (doc/drivers/SD/README.md), so a controller that does not is one that
+  // fails against a card with checking enabled, and against ZipCPU's card
+  // model, which asserts.  A lax model here would hide that.
+  if (crc_rx != crc_want) {
+    push_r1(idle_ ? 0x09 : 0x08);   // the CRC error bit
     return;
   }
 
