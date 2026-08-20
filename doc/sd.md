@@ -71,6 +71,37 @@ test failed.
   shape and the wrong size, which shows up only when a filesystem runs off the
   end of it.
 
+## How a command is framed
+
+Three things about the frame are not obvious from the command table, and all
+three were wrong here until `cosim/sdcheck` drove this back end against a card
+model written by somebody else.  Each is now what all three drivers in
+`doc/drivers/SD/` do.
+
+* **Seventy-four clocks means seventy-four, with the card deselected.**  The
+  power-up burst is ten bytes and the card is selected on a state of its own
+  *after* the tenth, because asserting /CS alongside the last transfer sends
+  that byte selected and leaves seventy-two - two short of what a card is
+  entitled to wait for.  Nothing counted them until the harness did; the RTL
+  comment said eighty and meant it, and the code did not.
+* **A byte of ones goes in front of every command.**  The specification calls
+  the gap N(RC) and gives it as eight clocks between a response and the next
+  command.  U-Boot writes it into the frame (`cmdo[0] = 0xff`,
+  `u-boot/mmc_spi.c:103`), Linux does the same and says why - "an all-ones
+  byte to ensure the card is ready" (`Linux/mmc_spi.c:412`) - and FatFs gets it
+  from clocking a dummy byte in `select()`.  This used to send the command
+  byte immediately after the response byte.
+* **/CS is released between commands.**  That gap byte goes out deselected, so
+  every command is framed the way U-Boot frames one with `SPI_XFER_BEGIN` and
+  `SPI_XFER_END`, Linux with a message that leaves chipselect active and then
+  ends, and FatFs with an explicit `deselect(); select();`.  Holding /CS low
+  for a whole session, which is what this did, is legal and unusual - and a
+  card that resynchronises when it is deselected never gets the chance.
+
+None of the three stopped the design working against our own card model,
+because our own card model was written from the same reading and did not care
+about any of them.  That is the whole argument for having a second opinion.
+
 ## CRC
 
 **CRC7 is computed for every command**, and the two famous constants - `0x95`

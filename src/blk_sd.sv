@@ -307,14 +307,27 @@ module blk_sd #(
   end
   assign cmd_crc = {cmd_crc7, 1'b1};
 
+  // The frame is seven bytes and not six: a byte of ones goes in front of
+  // every command.
+  //
+  // The specification calls the gap N(RC) and gives it as eight clocks
+  // between a response and the next command; all three of the drivers in
+  // doc/drivers/SD/ leave one.  U-Boot writes it into the frame - `cmdo[0] =
+  // 0xff` at u-boot/mmc_spi.c:103 - Linux does the same and says why, "an
+  // all-ones byte to ensure the card is ready" (Linux/mmc_spi.c:412), and
+  // FatFs gets it from deselecting and reselecting around every command
+  // (FatFs/sdmm.c:336-338, and select() clocks a dummy byte).  This sent the
+  // command byte immediately after the response byte until sdcheck ran it
+  // against a card model that counts.
   logic [7:0] cmd_byte;
   always_comb begin
     unique case (bcnt[2:0])
-      3'd0:    cmd_byte = {2'b01, cmd_idx};
-      3'd1:    cmd_byte = cmd_arg[31:24];
-      3'd2:    cmd_byte = cmd_arg[23:16];
-      3'd3:    cmd_byte = cmd_arg[15:8];
-      3'd4:    cmd_byte = cmd_arg[7:0];
+      3'd0:    cmd_byte = 8'hff;   // sent deselected: see C_SEND
+      3'd1:    cmd_byte = {2'b01, cmd_idx};
+      3'd2:    cmd_byte = cmd_arg[31:24];
+      3'd3:    cmd_byte = cmd_arg[23:16];
+      3'd4:    cmd_byte = cmd_arg[15:8];
+      3'd5:    cmd_byte = cmd_arg[7:0];
       default: cmd_byte = cmd_crc;
     endcase
   end
@@ -377,14 +390,22 @@ module blk_sd #(
 
         // Ten bytes with the card deselected is eighty clocks, which covers
         // the seventy-four the card asks for.
+        //
+        // The card is selected on a visit of its own, after the tenth byte
+        // has gone out, and that is the whole point of the extra state.
+        // Asserting it alongside the last `spi_go` - which is what this did
+        // until sdcheck counted the clocks - sends that byte *selected* and
+        // leaves only seventy-two, two short, against a card that is entitled
+        // to ignore everything until it has seen seventy-four.
         S_DUMMY: begin
-          spi_tx <= 8'hff;
-          spi_go <= 1'b1;
-          bcnt   <= bcnt + 10'd1;
-          if (bcnt == 10'd9) begin
+          if (bcnt == 10'd10) begin
             cs   <= 1'b1;
             ms   <= '0;
             st   <= S_CMD0;
+          end else begin
+            spi_tx <= 8'hff;
+            spi_go <= 1'b1;
+            bcnt   <= bcnt + 10'd1;
           end
         end
 
@@ -755,11 +776,21 @@ module blk_sd #(
         end
 
         // ---- the command helper ---------------------------------------------
+        // The gap byte goes out with the card deselected and the command
+        // with it selected, so every command is framed by /CS the way all
+        // three drivers in doc/drivers/SD/ frame theirs - U-Boot opens the
+        // command with SPI_XFER_BEGIN and closes the transaction with
+        // SPI_XFER_END, Linux sends the command "leaving chipselect active"
+        // and ends the message afterwards, and FatFs deselects and reselects
+        // around every one.  Holding /CS low for the whole session, which is
+        // what this did, is legal and unusual; a card that resynchronises on
+        // the deassertion has nothing to resynchronise to.
         C_SEND: begin
           spi_tx <= cmd_byte;
           spi_go <= 1'b1;
           bcnt   <= bcnt + 10'd1;
-          if (bcnt == 10'd5) begin
+          cs     <= (bcnt != 10'd0);
+          if (bcnt == 10'd6) begin
             bcnt <= '0;
             st   <= C_R1;
           end

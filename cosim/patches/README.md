@@ -95,6 +95,28 @@ would have had to exist twice, in two patch formats, with nothing to report
 when one copy was fixed and the other was not.  Rebasing the card onto the
 newer tree cost only QOM idioms.
 
+## `sdspi/`
+
+One patch against ZipCPU's sdspi, whose `bench/cpp/sdspisim.cpp` is an SD card
+in SPI mode written by someone else.  `cosim/scripts/build-sdspi.sh` clones the
+repository into `work/sdspi-src` at a pinned commit and applies it;
+`cosim/sdcheck` links the result.  It is GPLv3-or-later, which is why nothing
+of it is kept here and why `make test` cannot reach any of it.
+
+The patch is not about making our controller pass.  It is about the model
+reporting the size of the file it was given: `CSD()` runs in the constructor,
+before `load()` has opened the image, and is never called again, so every card
+describes itself as whatever a block count of zero encodes.  And C_SIZE in a
+version 2 CSD is a count of 512 KB units rather than of sectors, so writing the
+sector count into it overstates the card by a factor of 1024.  The patch's own
+message argues both.
+
+Everything else our controller needed, it needed to fix in itself.  Three
+things did: the power-up clocks were two short, there was no N(RC) gap before a
+command, and /CS was never released between commands.  `doc/sd.md` records all
+three.  They were found by the model refusing to talk to us, which is what a
+second opinion is for.
+
 ## `hatari/`
 
 An Atari TT whose SCSI controller is a Verilated wish5380 - the chip and the

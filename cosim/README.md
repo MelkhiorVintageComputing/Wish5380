@@ -1256,6 +1256,14 @@ chip that NetBSD's `fsck` does on the Sun-3.
   tarball: two trees meant two copies of anything both boards needed.  The
   split is by what the change owes to this project - `qemu/` owes it nothing
   and `qemu-rtl/` is all of it - and not by which machine it touches.
+* The SD side has a second opinion too, and it is not a guest.
+  `cosim/sdcheck` drives `blk_sd` over `sd_spi` against ZipCPU's SDSPISIM as
+  well as our own card model - `cosim/scripts/build-sdspi.sh` then
+  `make -C cosim/sdcheck check`.  Its blind spots are worth knowing: SDSPISIM
+  models a high-capacity card only, so the byte-addressed path and the version
+  1 CSD layout are still covered by our model alone; and it does not hold MISO
+  low after a write, where ours does deliberately, so substituting it *loses*
+  that check rather than corroborating it.  Both cards are run, always.
 * The guest is never patched.  If something only works with a modified guest,
   it does not work.
 * The scripts never install system packages; `check-deps.sh` reports and stops.

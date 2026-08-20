@@ -1,0 +1,62 @@
+sdspisim: size the card from the image it was given
+
+Two things stop SDSPISIM reporting the capacity of the file behind it,
+and both are visible the moment a host reads the CSD and believes it.
+
+CSD() is called from the constructor, before load() has opened the image
+and worked out how many sectors it holds, and it is never called again.
+So m_devblocks is zero when the CSD is built and every card reports what
+a block count of zero encodes, whatever image is loaded afterwards.
+
+And C_SIZE in a version 2 CSD is not a sector count.  The capacity is
+(C_SIZE + 1) * 512 KB - (C_SIZE + 1) * 1024 sectors - so writing the
+sector count into the field overstates the card by a factor of 1024.
+A host that reads it the way the specification defines it gets a disk
+1024 times too big, which is the kind of wrong that only shows up when a
+filesystem runs off the end.
+
+Found by driving this model and an independent SystemVerilog one through
+the same initialisation and comparing what each said its capacity was:
+the Verilog host computed 1024 sectors from this model's CSD and 2048
+from the other's, against a 2048-sector image.
+
+Not sent upstream: it is a fix to a simulation model this project only
+borrows, and the maintainer may have reasons for the shape it has.
+
+---
+diff --git a/bench/cpp/sdspisim.cpp b/bench/cpp/sdspisim.cpp
+index 8f2d492..6099030 100644
+--- a/bench/cpp/sdspisim.cpp
++++ b/bench/cpp/sdspisim.cpp
+@@ -94,6 +94,11 @@ void	SDSPISIM::load(const char *fname) {
+ 
+ 		m_devblocks = devln>>LGSECTOR_SIZE;
+ 
++		// The CSD is built in the constructor, before this is known, so
++		// without this every card reports whatever a block count of zero
++		// encodes - 512 KB - however big the image is.
++		CSD();
++
+ 		if (m_debug) printf("SDCARD: NBLOCKS = %ld\n", m_devblocks);
+ 	}
+ }
+@@ -169,9 +174,16 @@ void	SDSPISIM::CSD(void) {
+ 	// The following code works on high-capacity cards only
+ 	assert((DEFAULT_CSD[0] & 0x0c0)== 0x40);
+ 
+-	m_csd[7] = (m_devblocks >> 16) & 0x03f;
+-	m_csd[8] = (m_devblocks >>  8) & 0x0ff;
+-	m_csd[9] = (m_devblocks      ) & 0x0ff;
++	// C_SIZE in a version 2 CSD is a count of 512 KB units, not of
++	// sectors: the capacity is (C_SIZE + 1) * 512 KB, which is
++	// (C_SIZE + 1) * 1024 sectors of 512 bytes.  Writing the sector
++	// count here directly overstates the card by a factor of 1024.
++	unsigned long	c_size;
++
++	c_size = (m_devblocks >= 1024) ? (m_devblocks / 1024) - 1 : 0;
++	m_csd[7] = (c_size >> 16) & 0x03f;
++	m_csd[8] = (c_size >>  8) & 0x0ff;
++	m_csd[9] = (c_size      ) & 0x0ff;
+ 
+ 	//
+ 	// Now make the CRC match

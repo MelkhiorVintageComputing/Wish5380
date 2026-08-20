@@ -87,6 +87,10 @@ cosim/scripts/diff-5380.py  # the RTL and the software model, same stimulus,
                         # found a bug in each of them
 cosim/scripts/diff-sun3-dma.py  # the same, across the DMA acknowledge path,
                         # which the ISA card has no way to reach
+cosim/scripts/build-sdspi.sh && make -C cosim/sdcheck check
+                        # the SD side against a card model that is not ours.
+                        # Three framing bugs came out of this; doc/sd.md says
+                        # which and doc/drivers/SD/ is what settled them
 ```
 
 `make test` must stay green on **both boards**.  Green means 0 failed; pending
