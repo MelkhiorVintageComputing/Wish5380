@@ -138,10 +138,25 @@ module scsi_targ #(
     blk_o.buf_rdata = sbuf_rdata;
   end
 
+  // One always block per port, which is the shape a synthesiser looks for in a
+  // true dual-port RAM.  With all four accesses in a single block Quartus
+  // declines to infer one and builds the whole 512 bytes out of flip-flops -
+  // measured at 11,471 logic elements and 4,352 registers on a MAX 10, against
+  // 4,096 bits of an M9K that is otherwise idle, which is most of a fifth of
+  // the device for a sector buffer.
+  //
+  // The two ports never address the same byte at once: the target either fills
+  // the buffer from the media or drains it to the SCSI bus, never both.  So
+  // splitting the block changes nothing that can be observed, and the
+  // simultaneous-write case a single block resolves by assignment order does
+  // not arise.
   always_ff @(posedge clk_i) begin
     if (a_we) mem[a_addr] <= a_wdata;
+    a_rdata <= mem[a_addr];
+  end
+
+  always_ff @(posedge clk_i) begin
     if (blk_i.buf_we) mem[blk_i.buf_addr] <= blk_i.buf_wdata;
-    a_rdata    <= mem[a_addr];
     sbuf_rdata <= mem[blk_i.buf_addr];
   end
 
